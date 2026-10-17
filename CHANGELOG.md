@@ -64,6 +64,17 @@
   writer now makes them match their parity before it first lists a run
   (reading the run once). Writers also read as `--unclean-parity` says;
   1.2.2's refused whatever it said.
+* An attach that was cut off (killed, a crash, a timeout) left a running
+  server and devices that nothing recorded: the next attach failed (or
+  attached the space without its partitions) and `spaces detach` refused.
+  The state is now written before anything is set up, marked attaching,
+  and after each step; `attach` and `detach` undo such an attach first.
+  Every device-mapper device carries the UUID
+  `STORAGESPACES-<pool guid>-<space guid>[-p<n>]`, only devices with the
+  space's UUID are removed for it, and `spaces detach --leftovers` removes
+  those no state lists. Two spaces of one pool whose names give one device
+  name (`Фото` and `Игры`) get apart by their GUID's digits; 1.2.2 failed
+  to attach the second and removed the first one's device.
 
 ### Testing
 

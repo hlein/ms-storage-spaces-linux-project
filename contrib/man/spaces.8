@@ -24,6 +24,8 @@ spaces \- read, write and manage Microsoft Storage Spaces pools on Linux
 .RB [ \-\-outdated ]
 .RI [ space ]
 .br
+.B spaces detach \-\-leftovers
+.br
 .B spaces status
 .br
 .B spaces check
@@ -193,12 +195,22 @@ detaches only the spaces whose serving process runs an older copy of
 (replaced by an upgrade since it started), attached read-only as healthy
 and not in use, and names the others; the packages run it after an upgrade
 and then attach again, so that the new version serves them.
+.B \-\-leftovers
+removes instead the device-mapper devices with the UUID of a space
+.RB ( STORAGESPACES\- )
+that no state lists; those in use stay. Both
+.B attach
+and
+.B detach
+first undo an attach that was cut off (its state left attaching), or
+complete it where its devices are all there and in use.
 .TP
 .B status
 Lists attached spaces, their backends, partition devices and verdicts
-(with the report of those attached past it), and the spaces checked and
-not attached with the first line of their reports (also for users other
-than root).
+(with the report of those attached past it), attaches that were cut off,
+and the spaces checked and not attached with the first line of their
+reports (also for users other than root); for root also the
+device-mapper devices with the UUID of a space and no state.
 .TP
 .B check
 Checks the spaces of every pool found (or of the pool whose devices are

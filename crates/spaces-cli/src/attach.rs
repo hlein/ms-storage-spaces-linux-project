@@ -23,7 +23,16 @@
 //! failed ones not at all. The report goes to
 //! `/run/storage-spaces/reports/<space guid>.{txt,json}`.
 //!
-//! State lives in `/run/storage-spaces/<space guid>.state`.
+//! State lives in `/run/storage-spaces/<space guid>.state`. It is written
+//! before anything is set up, marked attaching, with the server unit and
+//! the device-mapper devices the attach makes, and again after each step;
+//! marked attached at the end. Every device-mapper device carries the UUID
+//! `STORAGESPACES-<pool guid>-<space guid>[-p<n>]`, and only devices with
+//! the UUID of the space are removed for it. An attach that was cut off
+//! (killed, a crash, a timeout) leaves its state attaching: `attach` and
+//! `detach` undo it first. Devices with such a UUID and no state (a state
+//! that was lost) are leftovers, reported by `status` and removed by
+//! `detach --leftovers`.
 
 use std::fs::{self, File};
 use std::io::Write;
@@ -65,9 +74,25 @@ impl Backend {
     }
 }
 
+/// How far the attach of a space got.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum Status {
+    /// Attached by 1.2, whose devices carry no UUID; all it lists are its.
+    #[default]
+    Legacy,
+    /// Being attached, or an attach that was cut off: of the devices it
+    /// lists, those that exist with the space's UUID are its.
+    Attaching,
+    Attached,
+}
+
+/// The prefix of the device-mapper UUIDs of attached spaces.
+pub const DM_UUID_PREFIX: &str = "STORAGESPACES-";
+
 /// What was set up for one space; removed in reverse order.
 #[derive(Debug, Default)]
 pub struct State {
+    pub status: Status,
     pub space_guid: String,
     pub pool_guid: String,
     pub backend: String,
@@ -94,12 +119,17 @@ impl State {
         Path::new(STATE_DIR).join(format!("{space_guid}.state"))
     }
 
-    fn save(&self) -> Result<()> {
-        ensure_state_dir()?;
+    /// What [`State::save`] writes.
+    fn text(&self) -> String {
         let mut text = format!(
             "space={}\npool={}\nbackend={}\n",
             self.space_guid, self.pool_guid, self.backend
         );
+        match self.status {
+            Status::Legacy => {}
+            Status::Attaching => text += "status=attaching\n",
+            Status::Attached => text += "status=attached\n",
+        }
         for (key, value) in [
             ("unit", &self.unit),
             ("device", &self.device),
@@ -120,10 +150,22 @@ impl State {
         if self.forced {
             text += "forced=1\n";
         }
+        text
+    }
+
+    /// Writes the state (a new file renamed over the old one, both synced).
+    fn save(&self) -> Result<()> {
+        ensure_state_dir()?;
+        let text = self.text();
         let tmp = Self::path(&self.space_guid).with_extension("tmp");
-        fs::write(&tmp, text)?;
-        fs::set_permissions(&tmp, std::os::unix::fs::PermissionsExt::from_mode(0o644))?;
+        {
+            let mut f = File::create(&tmp)?;
+            f.write_all(text.as_bytes())?;
+            f.set_permissions(std::os::unix::fs::PermissionsExt::from_mode(0o644))?;
+            f.sync_all()?;
+        }
         fs::rename(tmp, Self::path(&self.space_guid))?;
+        File::open(STATE_DIR)?.sync_all()?;
         Ok(())
     }
 
@@ -135,6 +177,8 @@ impl State {
             };
             let value = value.to_string();
             match key {
+                "status" if value == "attaching" => s.status = Status::Attaching,
+                "status" => s.status = Status::Attached,
                 "space" => s.space_guid = value,
                 "pool" => s.pool_guid = value,
                 "backend" => s.backend = value,
@@ -357,21 +401,44 @@ fn partition_devices(parts: Vec<Partition>, size: u64) -> std::result::Result<Ve
     Ok(parts)
 }
 
-/// The device-mapper name a space of the pool `pool_guid` gets: `base`
-/// (its `dm_name`), unless an attached space of another pool has it
-/// (pools of the same name, as Windows calls every pool "Storage pool" by
-/// default); then the first eight hex digits of this pool's GUID follow.
-/// A device of that name without an attached space's state stays an error
+/// The device-mapper name the space `space_guid` of the pool `pool_guid`
+/// gets: `base` (its `dm_name`), unless another attached space has it. Of
+/// another pool (pools of one name, as Windows calls every pool "Storage
+/// pool" by default), the first eight hex digits of this pool's GUID
+/// follow; of the same pool (two names `dm_name` makes alike, such as
+/// "Фото" and "Игры", or one name twice), those of the space's GUID. A
+/// device of that name without an attached space's state stays an error
 /// (left over from an interrupted run).
-fn unique_dm_name(base: String, pool_guid: &str, attached: &[State]) -> String {
-    let taken = attached
+fn unique_dm_name(base: String, pool_guid: &str, space_guid: &str, attached: &[State]) -> String {
+    let short = |guid: &str| -> String { guid.chars().filter(char::is_ascii_hexdigit).take(8).collect() };
+    let holder = attached
         .iter()
-        .any(|s| s.dm.first() == Some(&base) && !s.pool_guid.eq_ignore_ascii_case(pool_guid));
-    if !taken {
-        return base;
+        .find(|s| s.dm.first() == Some(&base) && !s.space_guid.eq_ignore_ascii_case(space_guid));
+    match holder {
+        None => base,
+        Some(s) if !s.pool_guid.eq_ignore_ascii_case(pool_guid) => format!("{base}-{}", short(pool_guid)),
+        Some(_) => format!("{base}-{}", short(space_guid)),
     }
-    let short: String = pool_guid.chars().filter(char::is_ascii_hexdigit).take(8).collect();
-    format!("{base}-{short}")
+}
+
+/// The device-mapper UUID of the device `name` of `state`: the space's,
+/// `STORAGESPACES-<pool guid>-<space guid>`, with `-p<n>` for a partition.
+pub fn dm_uuid(state: &State, name: &str) -> String {
+    let base = format!("{DM_UUID_PREFIX}{}-{}", state.pool_guid, state.space_guid);
+    match state.dm.first().and_then(|whole| name.strip_prefix(whole.as_str())) {
+        Some(part) => base + part,
+        None => base,
+    }
+}
+
+/// The UUID of the device-mapper device `name`, if it exists ("" for a
+/// device without one).
+fn dm_uuid_of(name: &str) -> Option<String> {
+    if !Path::new("/dev/mapper").join(name).exists() {
+        return None;
+    }
+    let out = run("dmsetup", &["info", "-c", "--noheadings", "-o", "uuid", name], None).ok()?;
+    Some(out.trim().to_string())
 }
 
 /// Whether the device-mapper name `dm` is that of a space named `space`:
@@ -453,25 +520,26 @@ fn run(program: &str, args: &[&str], stdin: Option<&str>) -> Result<String> {
 }
 
 /// Makes the device-mapper device `name` and waits for udev to take it in.
-fn dm_create(name: &str, table: &str, rw: bool) -> Result<()> {
-    dm_create_unsettled(name, table, rw)?;
+fn dm_create(name: &str, uuid: &str, table: &str, rw: bool) -> Result<()> {
+    dm_create_unsettled(name, uuid, table, rw)?;
     settle();
     Ok(())
 }
 
 /// [`dm_create`] without waiting for udev (several in a row, then one wait).
-fn dm_create_unsettled(name: &str, table: &str, rw: bool) -> Result<()> {
+fn dm_create_unsettled(name: &str, uuid: &str, table: &str, rw: bool) -> Result<()> {
     if Path::new("/dev/mapper").join(name).exists() {
         bail!(
-            "device-mapper device {name} already exists (left over from an interrupted run?); remove it with `dmsetup remove {name}`"
+            "device-mapper device {name} already exists (left over from an interrupted run?); spaces status names \
+             leftovers, and spaces detach --leftovers removes them"
         );
     }
-    let args: &[&str] = if rw {
-        &["create", name]
-    } else {
-        &["create", "--readonly", name]
-    };
-    run("dmsetup", args, Some(table))?;
+    let mut args = vec!["create", "--uuid", uuid];
+    if !rw {
+        args.push("--readonly");
+    }
+    args.push(name);
+    run("dmsetup", &args, Some(table))?;
     Ok(())
 }
 
@@ -744,14 +812,31 @@ pub fn lock() -> Result<File> {
     Ok(file)
 }
 
-/// Whether a space is attached already.
-pub fn is_attached(space: &Space) -> bool {
-    State::path(&space.info.guid.to_string()).exists()
+/// How far a space is attached: `None` when it is not.
+pub fn attached(space: &Space) -> Option<Status> {
+    let text = fs::read_to_string(State::path(&space.info.guid.to_string())).ok()?;
+    Some(State::parse(&text).status)
+}
+
+/// Test builds (the feature test-hooks) stop as a crash would after the
+/// attach step SPACES_ATTACH_STOP_AFTER names: state, props, server, dm,
+/// partition (the first one), partitions (all, udev settled).
+fn step(name: &str) {
+    #[cfg(feature = "test-hooks")]
+    if std::env::var("SPACES_ATTACH_STOP_AFTER").is_ok_and(|s| s == name) {
+        eprintln!("stopped after the attach step {name} (SPACES_ATTACH_STOP_AFTER)");
+        std::process::exit(99);
+    }
+    let _ = name;
 }
 
 /// Attaches one space (read-write with `rw`) that the checks gave
 /// `verdict` (their report at `report`). Returns the state describing
-/// what was created.
+/// what was created. The state comes first, marked attaching, with the
+/// server unit and the devices the attach makes; it is written again as
+/// each device appears, and marked attached at the end. What fails is
+/// undone; what cannot be undone stays in the state, for `spaces detach`
+/// and the next attach.
 pub fn attach_space(
     pool: &Pool<File>,
     space: &Space,
@@ -774,19 +859,38 @@ pub fn attach_space(
     let name = unique_dm_name(
         dm_name(&pool.name, space.name()),
         &pool.guid.to_string(),
+        &guid,
         &State::load_all()?,
     );
+    // Partitions become devices only when they lie inside the space and
+    // apart, and are not too many (an attach forced past the partition
+    // check gets the whole space only).
+    let parts = storage_spaces::guard::partitions(&reader, reader.size(), sector as u64);
+    let parts = partition_devices(parts, reader.size()).unwrap_or_else(|why| {
+        eprintln!("{:?}: no devices for its partitions: {why}", space.name());
+        Vec::new()
+    });
     let unit = format!("storage-spaces-{guid}");
+    let served = !matches!(backend, Backend::Dm | Backend::Auto);
+    let mount = Path::new(STATE_DIR).join(format!("{unit}.fuse"));
     let mut state = State {
+        status: Status::Attaching,
         space_guid: guid.clone(),
         pool_guid: pool.guid.to_string(),
         backend: backend.name().into(),
+        unit: served.then(|| unit.clone()),
+        fuse_mount: (backend == Backend::Fuse).then(|| mount.display().to_string()),
+        dm: std::iter::once(name.clone())
+            .chain(parts.iter().map(|p| format!("{name}-p{}", p.number)))
+            .collect(),
         rw,
         verdict: Some(verdict.as_str().into()),
         forced: verdict != Verdict::Healthy,
         report: report.map(|p| p.display().to_string()),
         ..Default::default()
     };
+    state.save()?;
+    step("state");
     // The server checks the space too, and needs the same flag to read
     // one that is not healthy.
     let mut flags: Vec<&str> = if rw { vec!["--rw"] } else { Vec::new() };
@@ -796,19 +900,22 @@ pub fn attach_space(
     let result = (|| -> Result<()> {
         // udev learns whose each device is before it appears (the backend
         // device right after: it appears when its server starts).
-        state.dm.push(name.clone());
-        write_props(&name, &state, false)?;
+        for d in &state.dm {
+            write_props(d, &state, false)?;
+        }
+        step("props");
+        let uuid = dm_uuid(&state, &name);
         match backend {
-            Backend::Dm | Backend::Auto => dm_create(&name, &dm_table(&reader, paths)?, rw)?,
+            Backend::Dm | Backend::Auto => dm_create(&name, &uuid, &dm_table(&reader, paths)?, rw)?,
             Backend::Ublk => {
-                state.unit = Some(unit.clone());
                 let dev = start_server(&unit, "ublk", paths, &guid, rw_arg)?;
                 state.device = Some(dev.clone());
+                state.save()?;
+                step("server");
                 mark_backend(&dev, &state)?;
-                dm_create(&name, &format!("0 {sectors} linear {dev} 0\n"), rw)?;
+                dm_create(&name, &uuid, &format!("0 {sectors} linear {dev} 0\n"), rw)?;
             }
             Backend::Nbd => {
-                state.unit = Some(unit.clone());
                 let socket = Path::new(STATE_DIR).join(format!("{unit}.sock"));
                 let _ = fs::remove_file(&socket);
                 let socket_arg = socket.display().to_string();
@@ -816,6 +923,9 @@ pub fn attach_space(
                 extra.extend(rw_arg);
                 start_server(&unit, "nbd", paths, &guid, &extra)?;
                 let dev = free_nbd()?;
+                state.device = Some(dev.clone());
+                state.save()?;
+                step("server");
                 let bs = sector.to_string();
                 let mut args = vec![
                     "-N",
@@ -830,15 +940,11 @@ pub fn attach_space(
                     args.push("-R");
                 }
                 run("nbd-client", &args, None)?;
-                state.device = Some(dev.clone());
                 mark_backend(&dev, &state)?;
-                dm_create(&name, &format!("0 {sectors} linear {dev} 0\n"), rw)?;
+                dm_create(&name, &uuid, &format!("0 {sectors} linear {dev} 0\n"), rw)?;
             }
             Backend::Fuse => {
-                state.unit = Some(unit.clone());
-                let mount = Path::new(STATE_DIR).join(format!("{unit}.fuse"));
                 fs::create_dir_all(&mount)?;
-                state.fuse_mount = Some(mount.display().to_string());
                 let mountpoint = mount.display().to_string();
                 let mut extra = vec!["--mountpoint", mountpoint.as_str()];
                 extra.extend(verdict.flag());
@@ -848,30 +954,24 @@ pub fn attach_space(
                     .trim()
                     .to_string();
                 state.device = Some(dev.clone());
+                state.save()?;
+                step("server");
                 mark_backend(&dev, &state)?;
-                dm_create(&name, &format!("0 {sectors} linear {dev} 0\n"), false)?;
+                dm_create(&name, &uuid, &format!("0 {sectors} linear {dev} 0\n"), false)?;
             }
         }
-        // Partitions become devices only when they lie inside the space
-        // and apart, and are not too many (an attach forced past the
-        // partition check gets the whole space only); udev is waited for
-        // once for them all.
-        let parts = storage_spaces::guard::partitions(&reader, reader.size(), sector as u64);
-        match partition_devices(parts, reader.size()) {
-            Err(why) => eprintln!("{:?}: no devices for its partitions: {why}", space.name()),
-            Ok(parts) => {
-                for p in &parts {
-                    let part = format!("{name}-p{}", p.number);
-                    let table = format!("0 {} linear /dev/mapper/{name} {}\n", p.length / 512, p.offset / 512);
-                    state.dm.push(part.clone());
-                    write_props(&part, &state, false)?;
-                    dm_create_unsettled(&part, &table, rw)?;
-                }
-                if !parts.is_empty() {
-                    settle();
-                }
-            }
+        step("dm");
+        // udev is waited for once for all partitions.
+        for p in &parts {
+            let part = format!("{name}-p{}", p.number);
+            let table = format!("0 {} linear /dev/mapper/{name} {}\n", p.length / 512, p.offset / 512);
+            dm_create_unsettled(&part, &dm_uuid(&state, &part), &table, rw)?;
+            step("partition");
         }
+        if !parts.is_empty() {
+            settle();
+        }
+        step("partitions");
         Ok(())
     })();
     if let Err(e) = result {
@@ -881,6 +981,7 @@ pub fn attach_space(
         }
         return Err(e);
     }
+    state.status = Status::Attached;
     state.save()?;
     Ok(state)
 }
@@ -919,9 +1020,9 @@ fn unescape_mount(field: &str) -> String {
 /// pull the space out from under them.
 pub fn users(state: &State) -> Vec<String> {
     let mapper = |d: &String| Path::new("/dev/mapper").join(d);
-    let ours: Vec<String> = state.dm.iter().filter_map(|d| kernel_of(&mapper(d))).collect();
-    let mut devices: Vec<(String, String)> = state
-        .dm
+    let own = own_devices(state);
+    let ours: Vec<String> = own.iter().filter_map(|d| kernel_of(&mapper(d))).collect();
+    let mut devices: Vec<(String, String)> = own
         .iter()
         .filter_map(|d| Some((mapper(d).display().to_string(), kernel_of(&mapper(d))?)))
         .collect();
@@ -985,12 +1086,31 @@ pub fn teardown(state: &State) -> Result<()> {
     if !users.is_empty() {
         bail!("in use: {}; unmount it first (it stays attached)", users.join("; "));
     }
-    let mut errors = Vec::new();
-    for name in state.dm.iter().rev() {
-        match dm_remove(name) {
-            Ok(()) => remove_props(name),
-            Err(e) => errors.push(e.to_string()),
+    let mapper = |name: &String| Path::new("/dev/mapper").join(name);
+    for name in state.dm.iter().filter(|n| mapper(n).exists()) {
+        if !own_devices(state).contains(name) {
+            eprintln!("device-mapper device {name} is not this space's (another UUID): left alone");
         }
+    }
+    // Partitions first. An attach that was cut off may still make a device
+    // (a dmsetup it ran goes on): the next pass finds it.
+    let mut errors = Vec::new();
+    for _ in 0..3 {
+        let own = own_devices(state);
+        errors.clear();
+        if own.is_empty() {
+            break;
+        }
+        for name in own.iter().rev() {
+            match dm_remove(name) {
+                Ok(()) => remove_props(name),
+                Err(e) => errors.push(e.to_string()),
+            }
+        }
+        settle();
+    }
+    for name in state.dm.iter().filter(|n| !mapper(n).exists()) {
+        remove_props(name);
     }
     if !errors.is_empty() {
         bail!("{}; its server keeps running", errors.join("; "));
@@ -1026,6 +1146,89 @@ pub fn teardown(state: &State) -> Result<()> {
     let _ = fs::remove_file(State::path(&state.space_guid));
     remove_report(&state.space_guid);
     Ok(())
+}
+
+/// The device-mapper devices of `state` that exist and are the space's: of
+/// a state 1.2 wrote, all it lists; else those with the space's UUID (a
+/// name an attach meant to use may be another device's).
+fn own_devices(state: &State) -> Vec<String> {
+    state
+        .dm
+        .iter()
+        .filter(|name| {
+            dm_uuid_of(name).is_some_and(|uuid| state.status == Status::Legacy || uuid == dm_uuid(state, name))
+        })
+        .cloned()
+        .collect()
+}
+
+/// Undoes the attaches that were cut off (a state left attaching), so that
+/// their spaces can be attached again: their server and backend device,
+/// those of their devices that carry the space's UUID, their state. One
+/// whose devices are in use and all there is completed instead. Run under
+/// [`lock`]; what it does goes to standard error.
+pub fn reconcile() {
+    let Ok(states) = State::load_all() else {
+        return;
+    };
+    let cut: Vec<State> = states.into_iter().filter(|s| s.status == Status::Attaching).collect();
+    if !cut.is_empty() {
+        // What the attach that was cut off left udev to do comes first.
+        settle();
+    }
+    for mut state in cut {
+        let name = state.dm.first().cloned().unwrap_or_else(|| state.space_guid.clone());
+        match teardown(&state) {
+            Ok(()) => eprintln!("{name}: undid an attach that was cut off"),
+            Err(e) if own_devices(&state).len() == state.dm.len() => {
+                state.status = Status::Attached;
+                match state.save() {
+                    Ok(()) => eprintln!("{name}: completed an attach that was cut off ({e:#})"),
+                    Err(e) => eprintln!("{name}: an attach was cut off, and completing it failed: {e:#}"),
+                }
+            }
+            Err(e) => eprintln!("{name}: an attach was cut off, and undoing it failed: {e:#}"),
+        }
+    }
+}
+
+/// Device-mapper devices with the UUID of a space and no state that lists
+/// them (a state that was lost): their names, partitions first.
+pub fn leftovers(states: &[State]) -> Vec<String> {
+    let listed: std::collections::HashSet<&str> = states.iter().flat_map(|s| s.dm.iter().map(String::as_str)).collect();
+    let out = run(
+        "dmsetup",
+        &["info", "-c", "--noheadings", "-o", "name,uuid", "--separator", " "],
+        None,
+    )
+    .unwrap_or_default();
+    let mut found: Vec<String> = out
+        .lines()
+        .filter_map(|l| l.trim().rsplit_once(' '))
+        .filter(|(name, uuid)| uuid.starts_with(DM_UUID_PREFIX) && !listed.contains(name))
+        .map(|(name, _)| name.to_string())
+        .collect();
+    found.sort_by_key(|n| std::cmp::Reverse(n.len()));
+    found
+}
+
+/// Removes the device-mapper devices `names` ([`leftovers`]); those in use
+/// stay, with the reason. The number that stayed.
+pub fn remove_leftovers(names: &[String]) -> usize {
+    let mut failed = 0;
+    for name in names {
+        match run("dmsetup", &["remove", "--retry", name], None) {
+            Ok(_) => {
+                remove_props(name);
+                println!("removed {name}");
+            }
+            Err(e) => {
+                eprintln!("{name} stays: {e:#}");
+                failed += 1;
+            }
+        }
+    }
+    failed
 }
 
 #[cfg(test)]
@@ -1247,26 +1450,76 @@ mod name_tests {
     }
 
     /// Two pools of the same name with a space of the same name: the second
-    /// gets the first eight hex digits of its pool's GUID after the name;
-    /// the same pool keeps its name, and other names are left alone.
+    /// gets the first eight hex digits of its pool's GUID after the name.
+    /// Two spaces of one pool whose names dm_name makes alike ("Фото" and
+    /// "Игры": one name for both in 1.2.2, whose attach of the second
+    /// failed and removed the first one's device) get those of the space's
+    /// GUID; the space itself keeps its name, other names are left alone.
     #[test]
-    fn spaces_of_pools_of_the_same_name_get_apart() {
+    fn spaces_whose_names_are_alike_get_apart() {
         let base = dm_name("Storage pool", "data");
         assert_eq!(base, "ss-Storage_pool-data");
         let first = "249b3eb3-30f0-4b3c-8261-cd3732f7f7ae";
         let other = "0735434C-B460-4A90-A3BA-B04FCE198982";
+        let (space, again) = (
+            "c6f8e8a1-0000-4000-8000-000000000001",
+            "5d0e2b77-0000-4000-8000-000000000002",
+        );
+        let held = [State {
+            space_guid: space.into(),
+            ..attached(&base, first)
+        }];
         assert_eq!(
-            unique_dm_name(base.clone(), other, &[attached(&base, first)]),
+            unique_dm_name(base.clone(), other, again, &held),
             "ss-Storage_pool-data-0735434C"
         );
         assert_eq!(
-            unique_dm_name(base.clone(), &first.to_uppercase(), &[attached(&base, first)]),
-            base
+            unique_dm_name(base.clone(), &first.to_uppercase(), again, &held),
+            "ss-Storage_pool-data-5d0e2b77"
         );
-        assert_eq!(unique_dm_name(base.clone(), other, &[]), base);
+        assert_eq!(unique_dm_name(base.clone(), first, &space.to_uppercase(), &held), base);
+        assert_eq!(unique_dm_name(base.clone(), other, again, &[]), base);
         assert_eq!(
-            unique_dm_name("ss-Storage_pool-games".into(), other, &[attached(&base, first)]),
+            unique_dm_name("ss-Storage_pool-games".into(), other, again, &held),
             "ss-Storage_pool-games"
+        );
+        assert_eq!(dm_name("p", "Фото"), dm_name("p", "Игры"));
+    }
+
+    /// Every device of a space carries its UUID, a partition's with its
+    /// number.
+    #[test]
+    fn devices_carry_the_uuid_of_their_space() {
+        let s = State {
+            pool_guid: "p".into(),
+            space_guid: "s".into(),
+            dm: vec!["ss-a-b".into(), "ss-a-b-p1".into(), "ss-a-b-p12".into()],
+            ..Default::default()
+        };
+        assert_eq!(dm_uuid(&s, "ss-a-b"), "STORAGESPACES-p-s");
+        assert_eq!(dm_uuid(&s, "ss-a-b-p1"), "STORAGESPACES-p-s-p1");
+        assert_eq!(dm_uuid(&s, "ss-a-b-p12"), "STORAGESPACES-p-s-p12");
+    }
+
+    /// A state says how far its attach got; one 1.2 wrote, without, is
+    /// attached and its devices are all its own.
+    #[test]
+    fn states_say_how_far_their_attach_got() {
+        for status in [Status::Attaching, Status::Attached] {
+            let s = State {
+                status,
+                dm: vec!["ss-a-b".into(), "ss-a-b-p1".into()],
+                unit: Some("storage-spaces-s".into()),
+                ..attached("ss-a-b", "p")
+            };
+            let back = State::parse(&s.text());
+            assert_eq!(back.status, status);
+            assert_eq!(back.dm, s.dm);
+            assert_eq!(back.unit, s.unit);
+        }
+        assert_eq!(
+            State::parse("space=s\npool=p\nbackend=dm\ndm=ss-a-b\n").status,
+            Status::Legacy
         );
     }
 

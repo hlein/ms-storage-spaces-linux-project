@@ -130,12 +130,27 @@ digits, `_ . +` become `_`). Pools can share a name (Windows calls every new
 pool "Storage pool"): when a space of another pool has the name already,
 the first eight hex digits of the pool's GUID follow,
 `ss-<pool>-<space>-<guid>` (and `-p<N>` after that); `spaces detach
-<space>` finds both. Partition devices are created from the partitions
+<space>` finds both. Two spaces of one pool whose names give one device
+name (`Фото` and `Игры` both give `____`) get the first eight hex digits of
+the space's GUID after the second (1.2.2 gave both one name, failed to
+attach the second and removed the first one's device). Every device
+carries the device-mapper UUID `STORAGESPACES-<pool guid>-<space guid>`
+(`-p<N>` for a partition, `dmsetup info -c -o name,uuid`), and only
+devices with the UUID of a space are removed for it. Partition devices are created from the partitions
 the checks read (`space.partitions`: the space's own GPT, from its backup
 when the primary header is lost, or its MBR), so they exist even when
 Windows left out the protective MBR;
 none are made when the partitions overlap or leave the space, or when there
 are more than 128 (the whole space is attached all the same).
+
+An attach that is cut off (killed, a crash, a timeout) leaves nothing
+unknown: `spaces attach` writes the space's state before it sets anything
+up, marked attaching, with the server and the devices it will make, and
+again after each step. The next `spaces attach` or `spaces detach` undoes
+such an attach first (or completes it, where its devices are all there and
+in use); `spaces status` lists it meanwhile. Devices with the UUID of a
+space and no state (a state that was lost) are listed by `spaces status`
+and removed by `sudo spaces detach --leftovers`.
 
 For `/etc/fstab`, use the partition device and `nofail`:
 
@@ -913,7 +928,9 @@ overflow checks, and its parsers are fuzzed (`docs/security.md`).
 * `no Storage Spaces pool members found`: the disks are not visible
   (`lsblk`), or they are not pool members (Windows 11 pools only).
 * `device-mapper device ... already exists`: an interrupted run left a device
-  behind; remove it with `dmsetup remove <name>`.
+  behind; `spaces status` lists those with the UUID of a space and no
+  state, and `sudo spaces detach --leftovers` removes them. Others (made by
+  1.2, without a UUID): remove them with `dmsetup remove <name>`.
 * `backend ublk is not available`: load the module (`modprobe ublk_drv`) or
   use `--backend nbd`.
 * `... is in use by device-mapper ss-...` or `... by the kernel`: the disk is

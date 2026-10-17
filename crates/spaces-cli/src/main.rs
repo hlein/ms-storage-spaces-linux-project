@@ -110,6 +110,10 @@ enum Command {
         /// packages run it after an upgrade, before attaching again.
         #[arg(long)]
         outdated: bool,
+        /// Instead, remove the device-mapper devices of spaces that no
+        /// state lists (spaces status names them); those in use stay.
+        #[arg(long, conflicts_with_all = ["space", "outdated"])]
+        leftovers: bool,
     },
     /// List attached spaces.
     #[cfg(target_os = "linux")]
@@ -502,7 +506,11 @@ fn main() -> Result<()> {
             &devices,
         ),
         #[cfg(target_os = "linux")]
-        Command::Detach { space, outdated } => cmd_detach(space.as_deref(), outdated),
+        Command::Detach {
+            space,
+            outdated,
+            leftovers,
+        } => cmd_detach(space.as_deref(), outdated, leftovers),
         #[cfg(target_os = "linux")]
         Command::Status => cmd_status(),
         Command::Check {
@@ -1359,6 +1367,7 @@ fn cmd_attach(
 ) -> Result<()> {
     use std::io::IsTerminal;
     let _lock = attach::lock()?;
+    attach::reconcile();
     let groups: Vec<Vec<PathBuf>> = if devices.is_empty() {
         scan::scan()
             .pools
@@ -1421,9 +1430,21 @@ fn cmd_attach(
                 continue;
             }
             matched += 1;
-            if attach::is_attached(space) {
-                println!("{:?} is already attached", space.name());
-                continue;
+            match attach::attached(space) {
+                // Left so when undoing it failed (said above).
+                Some(attach::Status::Attaching) => {
+                    eprintln!(
+                        "{:?}: an attach of it was cut off and is not undone (spaces detach removes what it left)",
+                        space.name()
+                    );
+                    failures += 1;
+                    continue;
+                }
+                Some(_) => {
+                    println!("{:?} is already attached", space.name());
+                    continue;
+                }
+                None => {}
             }
             let mut report = check::space_report(&pool, &health, &paths, space);
             let verdict = report.verdict();
@@ -1525,8 +1546,20 @@ fn cmd_attach(
 }
 
 #[cfg(target_os = "linux")]
-fn cmd_detach(sel: Option<&str>, outdated: bool) -> Result<()> {
+fn cmd_detach(sel: Option<&str>, outdated: bool, leftovers: bool) -> Result<()> {
     let _lock = attach::lock()?;
+    attach::reconcile();
+    if leftovers {
+        let names = attach::leftovers(&attach::State::load_all()?);
+        if names.is_empty() {
+            println!("no leftover devices");
+        }
+        let stayed = attach::remove_leftovers(&names);
+        if stayed > 0 {
+            bail!("{stayed} leftover device(s) not removed");
+        }
+        return Ok(());
+    }
     let program = std::env::current_exe()?;
     let (mut failures, mut matched) = (0, 0);
     for state in attach::select_attached(attach::State::load_all()?, sel)? {
@@ -1582,6 +1615,9 @@ fn cmd_status() -> Result<()> {
             "/dev/mapper/{main}  space {}  backend {}  {mode}",
             s.space_guid, s.backend
         );
+        if s.status == attach::Status::Attaching {
+            println!("  attaching, or an attach that was cut off (spaces attach or detach undoes it)");
+        }
         if let Some(v) = &s.verdict {
             let forced = if s.forced { ", attached read-only past it" } else { "" };
             println!("  verdict {v}{forced}");
@@ -1602,6 +1638,13 @@ fn cmd_status() -> Result<()> {
     for (path, first) in refused {
         println!("not attached: {first}");
         println!("  report {}", path.display());
+    }
+    let leftovers = attach::leftovers(&states);
+    if !leftovers.is_empty() {
+        println!("device-mapper devices of spaces no state lists (spaces detach --leftovers removes them):");
+        for name in leftovers {
+            println!("  /dev/mapper/{name}");
+        }
     }
     Ok(())
 }

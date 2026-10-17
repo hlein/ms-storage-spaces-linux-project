@@ -116,6 +116,15 @@ likewise, naming them by their GUIDs. `spaces detach <space>` naming no
 attached space fails, and one naming attached spaces of two pools (pools
 of one name) is refused, naming them: give the GUID or device-mapper name.
 
+`spaces detach` removes nothing of a space while anything uses one of its
+devices, and names what does: a mount (in any mount namespace: a container
+or a service with its own counts), another device built on it (LVM,
+dm-crypt, a loop device), a swap, or a process that holds it open; what
+none of these shows, the kernel's count of the device's openers still
+does. 1.2.2 removed the devices it could and stopped at the busy one. A step
+that fails (a device that stays, a server that does not stop) keeps the
+state with what is left, and the next detach goes on from there.
+
 `attach` checks every space first, as `spaces check` does, and attaches
 only healthy spaces without being asked; a space that is not healthy is
 refused with its report (see "Health checks and forced attach"), which

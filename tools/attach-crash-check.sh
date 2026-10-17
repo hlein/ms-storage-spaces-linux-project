@@ -19,6 +19,12 @@
 #             removed the first one's device)
 #   leftovers a device-mapper device with the UUID prefix of spaces and no
 #             state is named by status and removed by detach --leftovers
+#   busy      detach refuses, removing nothing, while a device of the space
+#             is held open by a process, mounted in another mount namespace,
+#             used as swap, or set up as a loop device (which only the
+#             kernel's count of openers shows), and detaches once released
+#             (1.2.2 removed the devices it could and stopped at the busy
+#             one)
 # Build: cargo build --release --target x86_64-unknown-linux-musl -p spaces-cli --features test-hooks
 # Usage: [LINUX_VM_HOST=user@address] tools/attach-crash-check.sh SPACES [CASE...]
 # Pools: wc4k in ~/sstest/pools on the VM (tools/guard-check.sh copies it
@@ -28,7 +34,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 binary=${1:?usage: tools/attach-crash-check.sh SPACES [CASE...]}
 shift
-cases=${*:-steps kill names leftovers}
+cases=${*:-steps kill names leftovers busy}
 host=${LINUX_VM_HOST:-claude@192.168.189.143}
 [[ $host == *@* ]] || host=codex@$host
 ssh_opts=(-o BatchMode=yes -o ConnectTimeout=10 -o IdentitiesOnly=yes -i "$HOME/.ssh/rustadmin_vm_ed25519")
@@ -70,6 +76,10 @@ left() { # what is left of space $1 (GUID): devices with its UUID, its unit, its
 }
 cleanup() {
   local g
+  # What the busy case may have left holding a device.
+  [[ -s $scratch/holder.pid ]] && sudo kill -9 "$(cat "$scratch/holder.pid")" 2>/dev/null
+  sudo swapoff /dev/mapper/ss-ss_crash-crash-p1 2>/dev/null
+  [[ -n ${busy_loop:-} ]] && sudo losetup -d "$busy_loop" 2>/dev/null
   for g in "${guids[@]}"; do
     sudo "$spaces" detach "$g" >/dev/null 2>&1 || true
     sudo systemctl stop "storage-spaces-$g" >/dev/null 2>&1 || true
@@ -103,9 +113,13 @@ crash_loop=$LOOP
 crash=$(guid crash "$crash_loop")
 guids+=("$crash")
 sudo "$spaces" attach --rw --space "$crash" "$crash_loop" >/dev/null 2>&1 &&
-  sudo sgdisk -o -n 1:2048:+100M -t 1:0700 /dev/mapper/ss-ss_crash-crash >/dev/null 2>&1 &&
+  sudo sgdisk -o -n 1:2048:+50M -t 1:8200 -n 2:0:+100M -t 2:8300 /dev/mapper/ss-ss_crash-crash >/dev/null 2>&1 &&
+  sudo "$spaces" detach "$crash" >/dev/null 2>&1 &&
+  sudo "$spaces" attach --rw --space "$crash" "$crash_loop" >/dev/null 2>&1 &&
+  sudo mkswap /dev/mapper/ss-ss_crash-crash-p1 >/dev/null 2>&1 &&
+  sudo mkfs.ext4 -q /dev/mapper/ss-ss_crash-crash-p2 >/dev/null 2>&1 &&
   sudo "$spaces" detach "$crash" >/dev/null 2>&1 ||
-  { echo "FAIL cannot give ss_crash a partition"; exit 1; }
+  { echo "FAIL cannot give ss_crash its partitions"; exit 1; }
 newloop "$scratch/wc4k.img" -r
 wc4k_loop=$LOOP
 wc4k=$(guid wc4k "$wc4k_loop")
@@ -115,7 +129,7 @@ guids+=("$wc4k")
 space_of() {
   case $1 in
   wc4k) g=$wc4k loop=$wc4k_loop name=ss-ss_wc4k-wc4k parts="p1 p2" ;;
-  crash) g=$crash loop=$crash_loop name=ss-ss_crash-crash parts="p1" ;;
+  crash) g=$crash loop=$crash_loop name=ss-ss_crash-crash parts="p1 p2" ;;
   esac
 }
 # Attaches the space again, checks its devices, detaches it, and checks that
@@ -136,8 +150,69 @@ recover() {
   [[ -z $l ]] || printf 'left after detach:%s' "$l"
 }
 
+# holdon PIDFILE COMMAND...: COMMAND as root in the background, its pid
+# in PIDFILE once it runs.
+holdon() {
+  local pidfile=$1
+  shift
+  rm -f "$pidfile"
+  sudo bash -c 'echo $$ > "$1"; shift; exec "$@"' _ "$pidfile" "$@" >/dev/null 2>&1 &
+  for _ in $(seq 100); do [[ -s $pidfile ]] && break; sleep 0.05; done
+  sleep 0.5
+}
+release() { sudo kill -9 "$(cat "$1")" 2>/dev/null; wait 2>/dev/null; }
+# refused CASE WORDS: detach of space $g fails saying WORDS, and every device
+# and the state of the space are still there.
+refused() {
+  local out rc missing= p
+  out=$(sudo "$spaces" detach "$g" 2>&1)
+  rc=$?
+  [[ -e /dev/mapper/$name ]] || missing+=" $name"
+  for p in $parts; do [[ -e /dev/mapper/$name-$p ]] || missing+=" $name-$p"; done
+  [[ -e /run/storage-spaces/$g.state ]] || missing+=" state"
+  if [[ $rc != 0 && $out == *"$2"* && -z $missing ]]; then
+    result ok "$1" "$(one "$out" | sed 's/.*in use: //' | cut -c1-110)"
+  else
+    result fail "$1" "exit $rc, gone:${missing:- nothing}: $(one "$out")"
+  fi
+}
+# detached CASE: detach of space $g now succeeds and leaves nothing.
+detached() {
+  local out rc l
+  out=$(sudo "$spaces" detach "$g" 2>&1)
+  rc=$?
+  l=$(left "$g")
+  if [[ $rc == 0 && -z $l ]]; then result ok "$1"; else result fail "$1" "exit $rc, left:$l: $(one "$out")"; fi
+}
+
 for c in $CASES; do
   case $c in
+  busy)
+    pidfile=$scratch/holder.pid
+    space_of wc4k
+    sudo "$spaces" attach --space "$g" "$loop" >/dev/null 2>&1
+    holdon "$pidfile" bash -c 'exec 3<"$0"; exec sleep 600' "/dev/mapper/$name"
+    refused "busy fd" "is open in pid"
+    release "$pidfile"
+    detached "busy fd released"
+    space_of crash
+    sudo "$spaces" attach --rw --space "$g" "$loop" >/dev/null 2>&1
+    sudo mkdir -p /mnt/attach-check
+    holdon "$pidfile" unshare -m sh -c "mount -o ro /dev/mapper/$name-p2 /mnt/attach-check && exec sleep 600"
+    refused "busy mount namespace" "in the mount namespace of pid"
+    release "$pidfile"
+    detached "busy mount namespace released"
+    sudo "$spaces" attach --rw --space "$g" "$loop" >/dev/null 2>&1
+    sudo swapon "/dev/mapper/$name-p1"
+    refused "busy swap" "is used as swap"
+    sudo swapoff "/dev/mapper/$name-p1"
+    detached "busy swap released"
+    sudo "$spaces" attach --rw --space "$g" "$loop" >/dev/null 2>&1
+    busy_loop=$(sudo losetup -f --show -r "/dev/mapper/$name-p2")
+    refused "busy loop" "is open"
+    sudo losetup -d "$busy_loop"
+    busy_loop=
+    detached "busy loop released" ;;
   steps)
     out=$(sudo env SPACES_ATTACH_STOP_AFTER=state "$spaces" attach --space "$crash" "$crash_loop" 2>&1)
     rc=$?

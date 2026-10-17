@@ -186,9 +186,12 @@ or
 Removes the devices of the given space (name, GUID or device-mapper name) or
 of all attached spaces, and stops their serving processes; a name that
 matches no attached space fails, and one that matches attached spaces of
-two pools is refused, naming them. A space whose
-devices are mounted or held by another device (LVM, dm-crypt) stays
-attached, with what uses it named: unmount it first.
+two pools is refused, naming them. A space whose devices are in use stays
+attached, nothing of it removed, with what uses it named: a mount (in any
+mount namespace), another device built on it (LVM, dm-crypt), a swap, a
+process that holds it open, or else the kernel's count of its openers. A
+step that fails (a device that stays, a server that does not stop) keeps
+the state with what is left, for the next detach.
 .B \-\-outdated
 detaches only the spaces whose serving process runs an older copy of
 .B spaces

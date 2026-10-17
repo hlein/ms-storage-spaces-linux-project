@@ -75,6 +75,14 @@
   those no state lists. Two spaces of one pool whose names give one device
   name (`Фото` and `Игры`) get apart by their GUID's digits; 1.2.2 failed
   to attach the second and removed the first one's device.
+* `spaces detach` removed the devices of a space it could and stopped at a
+  busy one, when what used the space was not a mount in its own mount
+  namespace or a device-mapper holder: a mount in another mount namespace,
+  a swap, a process holding a device open, a loop device. It now finds
+  those too (and what it cannot name by the kernel's count of openers) and
+  removes nothing while there are any. A step that fails (a device that
+  stays, a server that does not stop, nbd-client or losetup) keeps the
+  state with what is left; 1.2.2 removed the state anyway.
 
 ### Testing
 

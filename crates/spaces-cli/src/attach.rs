@@ -90,7 +90,7 @@ pub enum Status {
 pub const DM_UUID_PREFIX: &str = "STORAGESPACES-";
 
 /// What was set up for one space; removed in reverse order.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct State {
     pub status: Status,
     pub space_guid: String,
@@ -117,6 +117,28 @@ pub struct State {
 impl State {
     fn path(space_guid: &str) -> PathBuf {
         Path::new(STATE_DIR).join(format!("{space_guid}.state"))
+    }
+
+    /// What the state lists, for a message.
+    fn what(&self) -> String {
+        let mut parts = Vec::new();
+        if !self.dm.is_empty() {
+            parts.push(format!("device-mapper {}", self.dm.join(", ")));
+        }
+        if let Some(d) = &self.device {
+            parts.push(format!("device {d}"));
+        }
+        if let Some(u) = &self.unit {
+            parts.push(format!("server {u}"));
+        }
+        if let Some(m) = self.fuse_mount.as_ref().filter(|m| is_mount_point(m)) {
+            parts.push(format!("mount {m}"));
+        }
+        if parts.is_empty() {
+            "its state".into()
+        } else {
+            parts.join("; ")
+        }
     }
 
     /// What [`State::save`] writes.
@@ -1014,40 +1036,99 @@ fn unescape_mount(field: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
+/// The process ids in /proc.
+fn processes() -> Vec<u32> {
+    fs::read_dir("/proc")
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| e.file_name().to_str()?.parse().ok())
+        .collect()
+}
+
+/// The device number in /sys/class/block/`kernel`/dev.
+fn device_number(kernel: &str) -> Option<(String, libc::dev_t)> {
+    let text = fs::read_to_string(Path::new("/sys/class/block").join(kernel).join("dev")).ok()?;
+    let text = text.trim().to_string();
+    let (major, minor) = text.split_once(':')?;
+    let number = libc::makedev(major.parse().ok()?, minor.parse().ok()?);
+    Some((text, number))
+}
+
+/// How many openers the kernel counts for the device-mapper device `name`.
+fn dm_open_count(name: &str) -> Option<u64> {
+    run("dmsetup", &["info", "-c", "--noheadings", "-o", "open", name], None)
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
+}
+
 /// What uses the devices of `state` besides the space's own: mounts of its
 /// device-mapper devices or of the backend device and its kernel
-/// partitions, and devices built on them (LVM, dm-crypt). Detaching would
-/// pull the space out from under them.
+/// partitions, in any mount namespace; devices built on them (LVM,
+/// dm-crypt); swaps on them; processes that hold one of the space's
+/// devices open; and, where none of that shows, the openers the kernel
+/// counts beyond the space's own partitions. Detaching would pull the space
+/// out from under them, and it removes nothing while there are any.
 pub fn users(state: &State) -> Vec<String> {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
     let mapper = |d: &String| Path::new("/dev/mapper").join(d);
     let own = own_devices(state);
     let ours: Vec<String> = own.iter().filter_map(|d| kernel_of(&mapper(d))).collect();
-    let mut devices: Vec<(String, String)> = own
+    // (shown, kernel name, whether a process holding it open counts: not
+    // for the backend device, which the helpers of its server may keep
+    // open, nbd-client among them)
+    let mut devices: Vec<(String, String, bool)> = own
         .iter()
-        .filter_map(|d| Some((mapper(d).display().to_string(), kernel_of(&mapper(d))?)))
+        .filter_map(|d| Some((mapper(d).display().to_string(), kernel_of(&mapper(d))?, true)))
         .collect();
     if let Some(kernel) = state.device.as_deref().and_then(|d| kernel_of(Path::new(d))) {
         let sys = Path::new("/sys/class/block").join(&kernel);
         for entry in fs::read_dir(&sys).into_iter().flatten().flatten() {
             let name = entry.file_name().to_string_lossy().into_owned();
             if name.starts_with(&kernel) && entry.path().join("partition").exists() {
-                devices.push((format!("/dev/{name}"), name));
+                devices.push((format!("/dev/{name}"), name, true));
             }
         }
-        devices.push((format!("/dev/{kernel}"), kernel));
+        devices.push((format!("/dev/{kernel}"), kernel, false));
     }
-    let mountinfo = fs::read_to_string("/proc/self/mountinfo").unwrap_or_default();
+    let numbers: Vec<Option<(String, libc::dev_t)>> = devices.iter().map(|d| device_number(&d.1)).collect();
+    let index_of = |text: &str| numbers.iter().position(|n| n.as_ref().is_some_and(|(t, _)| t == text));
     let mut found = Vec::new();
-    for (shown, kernel) in &devices {
-        let sys = Path::new("/sys/class/block").join(kernel);
-        if let Ok(numbers) = fs::read_to_string(sys.join("dev")) {
-            for line in mountinfo.lines() {
-                let f: Vec<&str> = line.split(' ').collect();
-                if f.len() > 4 && f[2] == numbers.trim() {
-                    found.push(format!("{shown} is mounted on {}", unescape_mount(f[4])));
-                }
+    // Mounts, in every mount namespace (one process's view of each).
+    let own_ns = fs::read_link("/proc/self/ns/mnt").ok();
+    let mut namespaces = std::collections::HashSet::new();
+    for pid in processes() {
+        let Ok(ns) = fs::read_link(format!("/proc/{pid}/ns/mnt")) else {
+            continue;
+        };
+        if !namespaces.insert(ns.clone()) {
+            continue;
+        }
+        let Ok(info) = fs::read_to_string(format!("/proc/{pid}/mountinfo")) else {
+            continue;
+        };
+        let whose = if Some(&ns) == own_ns.as_ref() {
+            String::new()
+        } else {
+            format!(" in the mount namespace of pid {pid}")
+        };
+        for line in info.lines() {
+            let f: Vec<&str> = line.split(' ').collect();
+            if f.len() > 4
+                && let Some(i) = index_of(f[2])
+            {
+                found.push(format!(
+                    "{} is mounted on {}{whose}",
+                    devices[i].0,
+                    unescape_mount(f[4])
+                ));
             }
         }
+    }
+    for (shown, kernel, _) in &devices {
+        let sys = Path::new("/sys/class/block").join(kernel);
         for holder in fs::read_dir(sys.join("holders")).into_iter().flatten().flatten() {
             let holder = holder.file_name().to_string_lossy().into_owned();
             if !ours.contains(&holder) {
@@ -1055,6 +1136,58 @@ pub fn users(state: &State) -> Vec<String> {
                     .map(|n| format!("/dev/mapper/{}", n.trim()))
                     .unwrap_or(format!("/dev/{holder}"));
                 found.push(format!("{shown} is held by {name}"));
+            }
+        }
+    }
+    for line in fs::read_to_string("/proc/swaps").unwrap_or_default().lines().skip(1) {
+        let Some(path) = line.split_whitespace().next() else {
+            continue;
+        };
+        if let Some(kernel) = kernel_of(Path::new(&unescape_mount(path)))
+            && let Some(d) = devices.iter().find(|d| d.1 == kernel)
+        {
+            found.push(format!("{} is used as swap", d.0));
+        }
+    }
+    let watched: Vec<(libc::dev_t, &str)> = devices
+        .iter()
+        .zip(&numbers)
+        .filter(|(d, _)| d.2)
+        .filter_map(|(d, n)| Some((n.as_ref()?.1, d.0.as_str())))
+        .collect();
+    let me = std::process::id();
+    for pid in processes().into_iter().filter(|&p| p != me) {
+        let mut held = std::collections::BTreeSet::new();
+        for fd in fs::read_dir(format!("/proc/{pid}/fd")).into_iter().flatten().flatten() {
+            if let Ok(meta) = fs::metadata(fd.path())
+                && meta.file_type().is_block_device()
+                && let Some((_, shown)) = watched.iter().find(|(n, _)| *n == meta.rdev() as libc::dev_t)
+            {
+                held.insert(*shown);
+            }
+        }
+        if !held.is_empty() {
+            let comm = fs::read_to_string(format!("/proc/{pid}/comm")).unwrap_or_default();
+            for shown in held {
+                found.push(format!("{shown} is open in pid {pid} ({})", comm.trim()));
+            }
+        }
+    }
+    if found.is_empty() {
+        // What none of that shows (a file system spanning devices, a
+        // process this one cannot see): the openers the kernel counts. The
+        // space's partition devices hold the whole one.
+        for (i, name) in own.iter().enumerate() {
+            let expected = if i == 0 && state.dm.first() == Some(name) {
+                own.len() as u64 - 1
+            } else {
+                0
+            };
+            if let Some(n) = dm_open_count(name).filter(|&n| n > expected) {
+                found.push(format!(
+                    "{} is open {n} time(s), by something not found",
+                    mapper(name).display()
+                ));
             }
         }
     }
@@ -1076,15 +1209,29 @@ pub fn outdated(state: &State, program: &Path) -> bool {
         .is_ok_and(|exe| exe.as_os_str() == format!("{} (deleted)", program.display()).as_str())
 }
 
+/// Whether `path` is a mount point (in this mount namespace).
+fn is_mount_point(path: &str) -> bool {
+    fs::read_to_string("/proc/self/mountinfo")
+        .unwrap_or_default()
+        .lines()
+        .any(|l| l.split(' ').nth(4).is_some_and(|m| unescape_mount(m) == path))
+}
+
 /// Removes what `state` describes, most dependent parts first. Refuses,
-/// changing nothing, while something uses the space ([`users`]); and keeps
-/// the server when a device-mapper device cannot be removed (something
-/// still has it open), as stopping it would pull the space out from under
-/// that.
+/// changing nothing, while something uses the space ([`users`]). A step
+/// that fails (a device-mapper device that stays, a backend device that
+/// stays connected, a server that does not stop, a mount that stays) ends
+/// it: the state then lists what is left, which the error names, for the
+/// next detach.
 pub fn teardown(state: &State) -> Result<()> {
+    // udev's probes of the devices (it opens them) come first.
+    settle();
     let users = users(state);
     if !users.is_empty() {
-        bail!("in use: {}; unmount it first (it stays attached)", users.join("; "));
+        bail!(
+            "in use: {}; it stays attached, nothing removed (unmount, swapoff or close what uses it first)",
+            users.join("; ")
+        );
     }
     let mapper = |name: &String| Path::new("/dev/mapper").join(name);
     for name in state.dm.iter().filter(|n| mapper(n).exists()) {
@@ -1092,6 +1239,14 @@ pub fn teardown(state: &State) -> Result<()> {
             eprintln!("device-mapper device {name} is not this space's (another UUID): left alone");
         }
     }
+    let mut left = state.clone();
+    let stop = |left: &State, why: String| -> anyhow::Error {
+        let kept = match left.save() {
+            Ok(()) => String::new(),
+            Err(e) => format!(" (and its state could not be written: {e:#})"),
+        };
+        anyhow::anyhow!("{why}; left: {}{kept}", left.what())
+    };
     // Partitions first. An attach that was cut off may still make a device
     // (a dmsetup it ran goes on): the next pass finds it.
     let mut errors = Vec::new();
@@ -1113,29 +1268,45 @@ pub fn teardown(state: &State) -> Result<()> {
         remove_props(name);
     }
     if !errors.is_empty() {
-        bail!("{}; its server keeps running", errors.join("; "));
+        left.dm.retain(|n| mapper(n).exists());
+        return Err(stop(&left, format!("{}; its server keeps running", errors.join("; "))));
     }
-    match state.backend.as_str() {
-        "nbd" => {
-            if let Some(dev) = &state.device {
-                let _ = run("nbd-client", &["-d", dev], None);
-            }
-        }
-        "fuse" => {
-            if let Some(dev) = &state.device {
-                let _ = run("losetup", &["-d", dev], None);
-            }
-            if let Some(mount) = &state.fuse_mount {
-                let _ = run("umount", &[mount], None);
-            }
-        }
-        _ => {}
-    }
+    left.dm.clear();
     if let Some(dev) = &state.device {
+        let sys = Path::new("/sys/block").join(kernel_name(dev));
+        match state.backend.as_str() {
+            "nbd" => {
+                let _ = run("nbd-client", &["-d", dev], None);
+                if sys.join("pid").exists() {
+                    return Err(stop(&left, format!("{dev} stays connected (nbd-client -d)")));
+                }
+            }
+            "fuse" => {
+                let _ = run("losetup", &["-d", dev], None);
+                if sys.join("loop/backing_file").exists() {
+                    return Err(stop(&left, format!("{dev} stays set up (losetup -d)")));
+                }
+            }
+            _ => {}
+        }
         remove_props(kernel_name(dev));
+        left.device = None;
+    }
+    if let Some(mount) = &state.fuse_mount
+        && is_mount_point(mount)
+    {
+        // Before its server stops, which would leave the mount dead.
+        let _ = run("umount", &[mount], None);
+        if is_mount_point(mount) {
+            return Err(stop(&left, format!("{mount} stays mounted")));
+        }
     }
     if let Some(unit) = &state.unit {
         let _ = run("systemctl", &["stop", unit], None);
+        if run("systemctl", &["is-active", "--quiet", unit], None).is_ok() {
+            return Err(stop(&left, format!("its server {unit} does not stop")));
+        }
+        left.unit = None;
     }
     if let Some(mount) = &state.fuse_mount {
         let _ = fs::remove_dir(mount);
@@ -1499,6 +1670,25 @@ mod name_tests {
         assert_eq!(dm_uuid(&s, "ss-a-b"), "STORAGESPACES-p-s");
         assert_eq!(dm_uuid(&s, "ss-a-b-p1"), "STORAGESPACES-p-s-p1");
         assert_eq!(dm_uuid(&s, "ss-a-b-p12"), "STORAGESPACES-p-s-p12");
+    }
+
+    /// What a detach that stopped leaves is named, as its state keeps it.
+    #[test]
+    fn what_a_state_lists_is_named() {
+        let s = State {
+            device: Some("/dev/ublkb3".into()),
+            unit: Some("storage-spaces-s".into()),
+            ..attached("ss-a-b", "p")
+        };
+        let what = s.what();
+        for part in [
+            "device-mapper ss-a-b, ss-a-b-p1",
+            "device /dev/ublkb3",
+            "server storage-spaces-s",
+        ] {
+            assert!(what.contains(part), "{what}");
+        }
+        assert_eq!(State::default().what(), "its state");
     }
 
     /// A state says how far its attach got; one 1.2 wrote, without, is

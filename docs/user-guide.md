@@ -107,6 +107,14 @@ sudo spaces detach                   # or: spaces detach <space>
 it could not open. `spaces status` works for every user (the state in
 `/run/storage-spaces` is readable).
 
+`--space` takes a space's GUID, its numeric id (`spaces info` lists them)
+or its name, the same for every command. A key that names several spaces
+of a pool (a name two spaces share, or a name that is another space's GUID
+or id) is refused, with the spaces it names; give the id of the one meant.
+`--pool` takes a pool's GUID or name; a name two pools share is refused
+likewise, naming them by their GUIDs. `spaces detach <space>` naming no
+attached space fails.
+
 `attach` checks every space first, as `spaces check` does, and attaches
 only healthy spaces without being asked; a space that is not healthy is
 refused with its report (see "Health checks and forced attach"), which
@@ -277,6 +285,10 @@ Sizes (`10G`, `500M`, `2T`) are rounded up to whole rows (fixed spaces:
 only its first sector (a parity space: its first stripe) is, so that no old
 partition table shows up. Create a partition table and a file system as on
 any disk, through `spaces attach --rw`.
+
+`--space` names the space as for every command (its GUID, numeric id or
+name); a new name that is the name, GUID or id of a space already there is
+refused.
 
 ```sh
 sudo spaces space rename --space Files --name Archive --yes DISKS...
@@ -472,8 +484,11 @@ volume in a space attached with `--degraded` or `--force` mounts only with
   none). Either way the other pools and spaces are checked and attached
   as usual.
 * With `spaces check --deep`: every listed parity stripe, `deep.scrub`
-  (every copy compared, as `spaces pool scrub` does) and `deep.refs`
-  (ReFS volumes checked whole, as `refs check` does).
+  (every copy compared, as `spaces pool scrub` does; a scrub that cannot
+  run, as on a pool that is not clean, makes the space suspect) and
+  `deep.refs` (ReFS volumes checked whole, as `refs check` does).
+* `pool.quorum` also: a pool database that names no disk keeping a copy of
+  it, read from devices that keep one, is suspect.
 
 ### The report
 

@@ -385,6 +385,36 @@ pub fn names_space(dm: &str, space: &str) -> bool {
     dm.ends_with(&suffix) || unsuffixed.ends_with(&suffix)
 }
 
+/// The attached spaces `key` names (all without one): by space GUID (in
+/// any case), device-mapper name, or space name as the device-mapper name
+/// ends ([`names_space`]). A key that names several (spaces of one name in
+/// two pools) is an error that lists them: `spaces detach` takes no space
+/// for another.
+pub fn select_attached(states: Vec<State>, key: Option<&str>) -> Result<Vec<State>> {
+    let Some(key) = key else {
+        return Ok(states);
+    };
+    let found: Vec<State> = states
+        .into_iter()
+        .filter(|s| {
+            key.eq_ignore_ascii_case(&s.space_guid) || s.dm.first().is_some_and(|d| d == key || names_space(d, key))
+        })
+        .collect();
+    if found.len() > 1 {
+        bail!(
+            "{key:?} names {} attached spaces: {}; name the one meant by its GUID or device-mapper name \
+             (spaces status lists them)",
+            found.len(),
+            found
+                .iter()
+                .map(|s| format!("{} ({})", s.dm.first().map_or("-", |d| d.as_str()), s.space_guid))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    Ok(found)
+}
+
 /// Device-mapper name for a space: `ss-<pool>-<space>` with unsafe characters replaced.
 pub fn dm_name(pool: &str, space: &str) -> String {
     let clean = |s: &str| -> String {
@@ -1249,6 +1279,48 @@ mod name_tests {
         assert!(!names_space("ss-Storage_pool-metadata", "data"));
         assert!(!names_space("ss-Storage_pool-data2-0735434c", "data"));
         assert!(names_space("ss-p-backup-2024abcd", "backup-2024abcd"));
+    }
+
+    /// A space name that two attached spaces share (pools of one name)
+    /// names neither: `spaces detach data` refuses, listing both (1.2.2
+    /// detached both; audit M12). Each is named by its GUID or device.
+    #[test]
+    fn a_name_two_attached_spaces_share_names_neither() {
+        let (one, two) = (
+            "249b3eb3-30f0-4b3c-8261-cd3732f7f7ae",
+            "0735434c-b460-4a90-a3ba-b04fce198982",
+        );
+        let states = || {
+            vec![
+                State {
+                    space_guid: one.into(),
+                    ..attached("ss-Storage_pool-data", "p1")
+                },
+                State {
+                    space_guid: two.into(),
+                    ..attached("ss-Storage_pool-data-0735434c", "p2")
+                },
+                State {
+                    space_guid: "3".into(),
+                    ..attached("ss-Storage_pool-logs", "p1")
+                },
+            ]
+        };
+        let e = select_attached(states(), Some("data")).unwrap_err().to_string();
+        assert!(e.contains(one) && e.contains(two), "{e}");
+        let pick = |key: &str| -> Vec<String> {
+            select_attached(states(), Some(key))
+                .unwrap()
+                .into_iter()
+                .map(|s| s.space_guid)
+                .collect()
+        };
+        assert_eq!(pick(&two.to_uppercase()), [two]);
+        assert_eq!(pick("ss-Storage_pool-data"), [one]);
+        assert_eq!(pick("ss-Storage_pool-data-0735434c"), [two]);
+        assert_eq!(pick("logs"), ["3"]);
+        assert!(pick("nothing").is_empty());
+        assert_eq!(select_attached(states(), None).unwrap().len(), 3);
     }
 }
 

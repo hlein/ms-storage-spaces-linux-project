@@ -76,6 +76,25 @@ fn quorum_check<D>(pool: &Pool<D>, names: &[String]) -> Check {
     let copies: Vec<_> = pool.disks.values().filter(|d| d.database_copy).collect();
     let at_hand: Vec<_> = copies.iter().filter(|d| d.member.is_some()).collect();
     if copies.is_empty() {
+        // Read from a device that keeps a copy, it contradicts itself.
+        let holding = pool.members.iter().filter(|m| m.db_sequence.is_some()).count();
+        if holding > 0 {
+            return Check::new(
+                ID,
+                Status::Suspect,
+                format!("the pool database names no disk that keeps a copy of it, yet {holding} device(s) hold one"),
+            )
+            .evidence(
+                Evidence::new("the disks the pool database lists")
+                    .expected("those keeping a copy of it marked so")
+                    .found("none marked"),
+            )
+            .truth(Truth::Format)
+            .advice(
+                "The pool's metadata contradicts itself: whether the pool has its quorum is not known. \
+                 Attach the pool to Windows to see what it makes of it.",
+            );
+        }
         return Check::skipped(ID, "the pool database names no disk that keeps a copy of it");
     }
     if at_hand.len() * 2 > copies.len() {
@@ -1784,6 +1803,21 @@ mod tests {
                 .iter()
                 .any(|e| e.found.as_deref().unwrap().contains("no pool record"))
         );
+        assert_eq!(r.verdict(), Verdict::Suspect);
+    }
+
+    /// A pool database that names no disk keeping a copy of it, read from
+    /// devices that keep one, contradicts itself: suspect, not a quorum
+    /// skipped (1.2.2; audit M11).
+    #[test]
+    fn a_database_that_names_no_copy_of_itself_is_suspect() {
+        let disks = images("fixtures/mirror3");
+        let mut pool = Pool::open(disks.iter().collect::<Vec<_>>()).unwrap();
+        for d in pool.disks.values_mut() {
+            d.database_copy = false;
+        }
+        let r = &reports(&pool, &Options::default())[0];
+        assert_eq!(check(r, "pool.quorum").status, Status::Suspect, "{}", r.to_text());
         assert_eq!(r.verdict(), Verdict::Suspect);
     }
 

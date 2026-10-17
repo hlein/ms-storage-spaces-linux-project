@@ -716,3 +716,84 @@ fn a_pool_without_disks_or_a_name_is_refused() {
     let (_, disks) = blank(1);
     assert!(plan_create_pool(&disks, "", None, &mut new_guid).is_err());
 }
+
+/// The pool "names" with the thin simple spaces "a" and "b", made on
+/// overlays of the blank disks `images`.
+fn two_spaces<'i>(images: &'i [SparseImage], disks: &[BlankDisk]) -> Vec<Overlay<&'i SparseImage>> {
+    let mut new_guid = guids();
+    let base: Vec<Overlay<&SparseImage>> = images.iter().map(Overlay::new).collect();
+    let members = || base.iter().collect::<Vec<_>>();
+    let (plan, _) = plan_create_pool(disks, "names", None, &mut new_guid).unwrap();
+    plan.apply::<&Overlay<&SparseImage>, _>(&[], &members()).unwrap();
+    for name in ["a", "b"] {
+        let pool = Pool::open(members()).unwrap();
+        let (plan, _) = plan_create_space(&pool, &spec(name, 1, 1024, true), &mut new_guid).unwrap();
+        drop(pool);
+        plan.apply::<_, &Overlay<&SparseImage>>(&members(), &[]).unwrap();
+    }
+    let pool = Pool::open(members()).unwrap();
+    assert!(pool.warnings.is_empty(), "{:?}", pool.warnings);
+    drop(pool);
+    base
+}
+
+/// The planners choose a space as every command does: a key that names
+/// two spaces changes neither. 1.2.2 took the first space named, numbered
+/// or of that GUID, so that a space named like another's GUID was deleted
+/// in its place (audit 2026-10-16, M12).
+#[test]
+fn a_key_that_names_two_spaces_changes_neither() {
+    use storage_spaces::ops::{plan_delete_space, plan_rename_space, plan_resize_space};
+    let (images, disks) = blank(2);
+    let base = two_spaces(&images, &disks);
+    let mut pool = Pool::open(base.iter().collect::<Vec<_>>()).unwrap();
+    let (a, b) = (pool.find_space("a").unwrap().id(), pool.find_space("b").unwrap().id());
+    assert!(a < b);
+    let (guid_a, guid_b) = (
+        pool.spaces[&a].info.guid.to_string(),
+        pool.spaces[&b].info.guid.to_string(),
+    );
+    // "a" named like b's GUID: that GUID names both.
+    pool.spaces.get_mut(&a).unwrap().info.name = guid_b.clone();
+    let e = plan_delete_space(&pool, &guid_b).unwrap_err().to_string();
+    assert!(e.contains(&guid_a) && e.contains(&guid_b), "{e}");
+    assert!(plan_rename_space(&pool, &guid_b, "c").is_err());
+    assert!(plan_resize_space(&pool, &guid_b, 2 << 30).is_err());
+    // A name two spaces share, and a name that is the other's id.
+    pool.spaces.get_mut(&a).unwrap().info.name = "b".into();
+    assert!(plan_delete_space(&pool, "b").is_err());
+    pool.spaces.get_mut(&a).unwrap().info.name = b.to_string();
+    assert!(plan_delete_space(&pool, &b.to_string()).is_err());
+    // By its GUID (in any case) the first is still deleted, and only it.
+    let plan = plan_delete_space(&pool, &guid_a.to_uppercase()).unwrap();
+    drop(pool);
+    plan.apply::<_, &Overlay<&SparseImage>>(&base.iter().collect::<Vec<_>>(), &[])
+        .unwrap();
+    let after = Pool::open(base.iter().collect::<Vec<_>>()).unwrap();
+    let left: Vec<String> = after.user_spaces().map(|s| s.info.guid.to_string()).collect();
+    assert_eq!(left, [guid_b]);
+}
+
+/// A new name that names a space already (its name, its GUID, its numeric
+/// id) is refused: commands choose spaces by each. 1.2.2 let a new space,
+/// or a renamed one, take another's id for its name.
+#[test]
+fn a_new_name_that_names_a_space_is_refused() {
+    use storage_spaces::ops::plan_rename_space;
+    let (images, disks) = blank(2);
+    let base = two_spaces(&images, &disks);
+    let pool = Pool::open(base.iter().collect::<Vec<_>>()).unwrap();
+    let b = pool.find_space("b").unwrap();
+    let guid_b = b.info.guid.to_string();
+    let mut new_guid = guids();
+    for name in [b.id().to_string(), guid_b.clone(), guid_b.to_uppercase(), "b".into()] {
+        let e = plan_create_space(&pool, &spec(&name, 1, 1024, true), &mut new_guid).unwrap_err();
+        assert!(
+            e.to_string().contains("exists") || e.to_string().contains(&guid_b),
+            "{name}: {e}"
+        );
+        assert!(plan_rename_space(&pool, "a", &name).is_err(), "{name}");
+    }
+    assert!(plan_create_space(&pool, &spec("c", 1, 1024, true), &mut new_guid).is_ok());
+    assert!(plan_rename_space(&pool, "a", "c").is_ok());
+}

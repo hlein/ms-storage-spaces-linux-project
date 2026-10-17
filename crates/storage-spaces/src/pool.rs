@@ -616,10 +616,37 @@ impl<D: ReadAt> Pool<D> {
         self.spaces.values().filter(|s| s.is_user())
     }
 
-    /// Finds a user space by name or GUID.
+    /// The user space `key` names ([`Pool::select_space`]), none when it
+    /// names several.
     pub fn find_space(&self, key: &str) -> Option<&Space> {
-        self.user_spaces()
-            .find(|s| s.name() == key || s.info.guid.to_string().eq_ignore_ascii_case(key))
+        self.select_space(key).ok().flatten()
+    }
+
+    /// The user space `key` names: by its GUID (in any case), its numeric id
+    /// or its name; `None` when none does. A key that names several (a name
+    /// that is another space's GUID or id, a name two spaces share) is an
+    /// error that lists them: no command takes one space for another.
+    pub fn select_space(&self, key: &str) -> Result<Option<&Space>> {
+        let id = key.parse::<u64>().ok();
+        let found: Vec<&Space> = self
+            .user_spaces()
+            .filter(|s| s.name() == key || s.info.guid.to_string().eq_ignore_ascii_case(key) || id == Some(s.id()))
+            .collect();
+        match found.as_slice() {
+            [] => Ok(None),
+            [s] => Ok(Some(s)),
+            several => Err(Error::Pool(format!(
+                "{key:?} names {} spaces of pool {:?}: {}; name the one meant by its numeric id (spaces info \
+                 lists them)",
+                several.len(),
+                self.name,
+                several
+                    .iter()
+                    .map(|s| format!("{} {:?} ({})", s.id(), s.name(), s.info.guid))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ))),
+        }
     }
 
     /// A space and every hidden space under it (tiers, write-back cache,

@@ -23,7 +23,15 @@
 #            the refusal and not a crash, where the package's unit runs
 #   nomatch  attach --space or --pool naming no space found fails and says
 #            so, and check --json --space prints [] and fails (1.2.1 exited
-#            0 and printed a sentence)
+#            0 and printed a sentence); so does detach naming no attached
+#            space (1.2.2 exited 0)
+#   dupname  beside wc4k a pool made here under its name, with a space of
+#            its name: attach --pool NAME refuses naming both pools' GUIDs
+#            and attaches neither (1.2.2 took the name for both), --pool
+#            GUID attaches each; detach NAME refuses naming both spaces
+#            (1.2.2 detached both), detach GUID detaches the one meant;
+#            attach scans every device, so not beside an install.sh
+#            installation's pool
 # Usage: [LINUX_VM_HOST=user@address] tools/guard-check.sh DEB [CASE...]
 # Pools: testdata/pools/{wc4k,ntfstier} and testdata/refs/{r314integ,
 # r314mirror}, copied to the VM when missing (to /srv/spaces where the VM
@@ -37,7 +45,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 deb=${1:?usage: tools/guard-check.sh DEB [CASE...]}
 shift
-cases=${*:-auto force refs inherit hostile nomatch}
+cases=${*:-auto force refs inherit hostile nomatch dupname}
 host=${LINUX_VM_HOST:-192.168.189.142}
 [[ $host == *@* ]] || host=codex@$host
 ssh_opts=(-o BatchMode=yes -o ConnectTimeout=10 -o IdentitiesOnly=yes -i "$HOME/.ssh/rustadmin_vm_ed25519")
@@ -95,7 +103,7 @@ newloop() { # newloop IMAGE [losetup options]: LOOP = a read-only loop device
 }
 ours() { # dm names of the spaces of the test pools
   sudo sh -c 'cat /run/storage-spaces/*.state' 2>/dev/null |
-    sed -n 's/^dm=\(ss-ss_\(wc4k\|ntfstier\|r314mirror\|hostile\)-[^-]*\)$/\1/p' | sort -u
+    sed -n 's/^dm=\(ss-ss_\(wc4k\|ntfstier\|r314mirror\|hostile\)-[^-]*\(-[0-9a-f]\{8\}\)\?\)$/\1/p' | sort -u
 }
 umount_all() {
   for m in /mnt/gc-*; do
@@ -378,6 +386,61 @@ PY
     out=$(sudo "$spaces" check --json --space nonexistent "$LOOP" 2>/dev/null)
     rc=$?
     if [[ $rc != 0 && $out == "[]" ]]; then result ok "nomatch check" "[] and exit $rc"; else result fail "nomatch check" "exit $rc: $(one "$out")"; fi
+    out=$(sudo "$spaces" detach nonexistent 2>&1)
+    rc=$?
+    if [[ $rc != 0 && $out == *'no attached space named "nonexistent"'* ]]; then
+      result ok "nomatch detach" "exit $rc"
+    else
+      result fail "nomatch detach" "exit $rc: $(one "$out")"
+    fi
+    cleanup ;;
+  dupname)
+    if ((explicit)); then
+      result skip dupname "attach scans every device, and an install.sh installation's pool is here"
+      continue
+    fi
+    d=$scratch/dupname
+    mkdir -p "$d" && truncate -s 3G "$d/disk0.img"
+    if ! "$spaces" pool create --name ss-wc4k --yes "$d/disk0.img" >/dev/null 2>&1 ||
+      ! "$spaces" space create --name wc4k --resiliency simple --size 1G --yes "$d/disk0.img" >/dev/null 2>&1; then
+      result fail dupname "cannot make the pool"
+      continue
+    fi
+    pool_guid() { "$spaces" info "$1" 2>/dev/null | sed -n 's/^Pool ".*" \([0-9a-f-]*\)$/\1/p'; }
+    wc_pool=$(pool_guid $pools/wc4k/disk0.img) dup_pool=$(pool_guid "$d/disk0.img")
+    dup_space=$(guid wc4k "$d/disk0.img")
+    newloop $pools/wc4k/disk0.img
+    newloop "$d/disk0.img"
+    out=$(sudo "$spaces" attach --pool ss-wc4k 2>&1)
+    rc=$?
+    if [[ $rc != 0 && -n $wc_pool && -n $dup_pool && $out == *"names 2 pools"*"$wc_pool"* &&
+      $out == *"$dup_pool"* && -z $(ours | grep wc4k) ]]; then
+      result ok "dupname pool" "exit $rc"
+    else
+      result fail "dupname pool" "exit $rc: $(one "$out")"
+    fi
+    out=$(sudo "$spaces" attach --pool "$wc_pool" 2>&1 && sudo "$spaces" attach --pool "$dup_pool" 2>&1)
+    rc=$?
+    if [[ $rc == 0 && $(ours | grep -c wc4k) == 2 ]]; then
+      result ok "dupname attach" "$(ours | grep wc4k | tr '\n' ' ')"
+    else
+      result fail "dupname attach" "exit $rc: $(one "$out")"
+    fi
+    out=$(sudo "$spaces" detach wc4k 2>&1)
+    rc=$?
+    if [[ $rc != 0 && $out == *"names 2 attached spaces"* && $(ours | grep -c wc4k) == 2 ]]; then
+      result ok "dupname detach" "exit $rc"
+    else
+      result fail "dupname detach" "exit $rc: $(one "$out"), left: $(ours | grep wc4k | tr '\n' ' ')"
+    fi
+    out=$(sudo "$spaces" detach "$dup_space" 2>&1)
+    rc=$?
+    left=$(ours | grep wc4k | tr '\n' ' ')
+    if [[ $rc == 0 && -n $dup_space && $left == "ss-ss_wc4k-wc4k " ]]; then
+      result ok "dupname detach GUID" "left: $left"
+    else
+      result fail "dupname detach GUID" "exit $rc: $(one "$out"), left: $left"
+    fi
     cleanup ;;
   *) result fail "$c" "unknown case" ;;
   esac

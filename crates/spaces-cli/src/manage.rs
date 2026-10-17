@@ -266,7 +266,7 @@ pub enum SpaceCommand {
     },
     /// Delete a space and everything on it.
     Delete {
-        /// The space's name.
+        /// The space: its GUID, numeric id or name.
         #[arg(long)]
         space: String,
         /// Write; without it the plan is only printed.
@@ -278,7 +278,7 @@ pub enum SpaceCommand {
     },
     /// Rename a space.
     Rename {
-        /// The space's name.
+        /// The space: its GUID, numeric id or name.
         #[arg(long)]
         space: String,
         /// The new name.
@@ -293,7 +293,7 @@ pub enum SpaceCommand {
     },
     /// Grow a space (the file system inside is not grown).
     Resize {
-        /// The space's name.
+        /// The space: its GUID, numeric id or name.
         #[arg(long)]
         space: String,
         /// The new size, e.g. 20G (rounded up to whole rows; only growing).

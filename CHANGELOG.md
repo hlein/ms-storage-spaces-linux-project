@@ -39,6 +39,21 @@
 * An NTFS volume smaller than its partition was suspect: its boot sector
   copy was looked for in the partition's last sector, not after the volume,
   where Windows writes it.
+* `--space` names a space the same way for every command: its GUID, its
+  numeric id or its name. A key that names several spaces of a pool (a name
+  two spaces share, a name that is another space's GUID or id) picked one
+  of them, the first for most commands and the last for `spaces check`, so
+  that a space named like another's GUID was checked or read in its place,
+  and `spaces space delete`, `rename` and `resize` could change it in the
+  other's place; it is refused now, naming the spaces. `space create` and
+  `space rename` refuse a new name that is the name, GUID or id of a space
+  already there. `--pool` likewise: a name two pools share is refused,
+  naming their GUIDs (`attach` took both).
+* `spaces check --deep` passed a space whose deep check could not run (a
+  pool the scrub refuses: a warning, a record not understood): it is
+  suspect now. A pool database that names no disk keeping a copy of it,
+  read from devices that keep one, is suspect, not skipped.
+* `spaces detach NAME` naming no attached space exited 0; it fails now.
 
 ### Testing
 

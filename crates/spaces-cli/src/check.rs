@@ -58,6 +58,29 @@ pub fn open_pool(paths: &[PathBuf]) -> Result<Pool<File>> {
     opened.unwrap_or_else(|stopped| Err(anyhow::anyhow!("reading its metadata {stopped}")))
 }
 
+/// Which of `pools` (their names and GUIDs) `key` names: the one of that
+/// GUID (in any case) or name; `None` when none is. A key that names
+/// several (a name two pools share, a name that is another pool's GUID) is
+/// an error that lists them: no command takes one pool for another.
+pub fn select_pool(pools: &[(&str, storage_spaces::Guid)], key: &str) -> Result<Option<usize>> {
+    let found: Vec<usize> = (0..pools.len())
+        .filter(|&i| pools[i].0 == key || pools[i].1.to_string().eq_ignore_ascii_case(key))
+        .collect();
+    match found[..] {
+        [] => Ok(None),
+        [i] => Ok(Some(i)),
+        _ => bail!(
+            "{key:?} names {} pools: {}; name the one meant by its GUID",
+            found.len(),
+            found
+                .iter()
+                .map(|&i| format!("{:?} ({})", pools[i].0, pools[i].1))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    }
+}
+
 /// What may be done with a space of a verdict, given the flags (attach,
 /// the servers and export ask the same).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -284,7 +307,20 @@ fn deep_scrub<D: ReadAt>(pool: &Pool<D>, space: &Space) -> Check {
     const ID: &str = "deep.scrub";
     let scrub = match storage_spaces::ops::scrub_spaces(pool, Some(space.id())) {
         Ok(s) => s,
-        Err(e) => return Check::skipped(ID, format!("not scrubbed: {e}")),
+        // Asked for, and not made: no pass.
+        Err(e) => {
+            return Check::new(ID, Status::Suspect, "the copies of the space cannot be compared")
+                .evidence(
+                    Evidence::new("every copy of the space")
+                        .expected("read and compared")
+                        .found(e.to_string()),
+                )
+                .truth(Truth::CrossCheck)
+                .advice(
+                    "The deep check did not run: what it would have found is not known. The scrub needs a \
+                     clean pool (every disk, no copy out of date, every record understood).",
+                );
+        }
     };
     let line = scrub.lines.first().cloned().unwrap_or_default();
     if line.ends_with("not scrubbed") {
@@ -316,25 +352,28 @@ pub fn environment<D>(pool: &Pool<D>) -> Vec<(String, String)> {
     env
 }
 
-/// Whether `key` (a name or GUID) names space `space`.
-pub fn names_space(space: &Space, key: &str) -> bool {
-    key == space.name() || key.eq_ignore_ascii_case(&space.info.guid.to_string())
-}
-
-/// The reports on the user spaces of `pool` (or on space `only`).
+/// The reports on the user spaces of `pool`, or on the space `only` names
+/// ([`Pool::select_space`]: none when it names none here, an error when it
+/// names several).
 pub fn reports<D: ReadAt + 'static>(
     pool: &Arc<Pool<D>>,
     paths: &[PathBuf],
     only: Option<&str>,
     deep: bool,
-) -> Vec<Report> {
+) -> Result<Vec<Report>> {
+    let chosen = match only.map(|key| pool.select_space(key)).transpose()? {
+        Some(None) => return Ok(Vec::new()),
+        Some(Some(space)) => Some(space.id()),
+        None => None,
+    };
     // The deep checks read every copy: no time limit.
     let limit = if deep { None } else { deadline() };
     let health = pool_health(pool, deadline());
-    pool.user_spaces()
-        .filter(|s| only.is_none_or(|key| names_space(s, key)))
+    Ok(pool
+        .user_spaces()
+        .filter(|s| chosen.is_none_or(|id| s.id() == id))
         .map(|space| report(pool, &health, paths, space, deep, limit, fs_checks))
-        .collect()
+        .collect())
 }
 
 /// The report on devices that do not open as a pool.
@@ -414,7 +453,7 @@ pub fn run(
             Ok(pool) => {
                 pools += 1;
                 let pool = Arc::new(pool);
-                let reports = reports(&pool, &paths, only, deep);
+                let reports = reports(&pool, &paths, only, deep)?;
                 if bundle_path.is_some()
                     && let Err(stopped) = isolate::caught(|| bundle_files(&pool, &reports, &mut files))
                 {
@@ -534,7 +573,7 @@ mod tests {
         let offset = (1u128 << 36) * u128::from(storage_spaces::format::SLAB_SIZE);
         assert!(text.contains(&format!("{offset:#x}")), "{text}");
         assert_eq!(space.allocated(), u64::MAX);
-        let reports = reports(&pool, &[], None, false);
+        let reports = reports(&pool, &[], None, false).unwrap();
         let mut files = bundle::Files::new();
         bundle_files(&pool, &reports, &mut files);
         assert!(files.iter().any(|(path, _)| path.contains("/extents/")));
@@ -613,6 +652,50 @@ mod tests {
         }
         assert!(refusal_note(Verdict::Suspect, false, "spaces attach").ends_with("spaces attach --force"));
         assert!(refusal_note(Verdict::Failed, false, "spaces attach").contains("--bundle"));
+    }
+
+    /// `--pool` names a pool by its GUID (in any case) or name; a name two
+    /// pools share, or one that is another pool's GUID, names neither
+    /// (1.2.2: attach took both; audit M12).
+    #[test]
+    fn a_pool_key_that_names_two_pools_is_refused() {
+        use storage_spaces::Guid;
+        let (g1, g2) = (Guid([1; 16]), Guid([2; 16]));
+        let pools = [("Storage pool", g1), ("Storage pool", g2)];
+        let e = select_pool(&pools, "Storage pool").unwrap_err().to_string();
+        assert!(e.contains(&g1.to_string()) && e.contains(&g2.to_string()), "{e}");
+        assert_eq!(select_pool(&pools, &g2.to_string().to_uppercase()).unwrap(), Some(1));
+        assert_eq!(select_pool(&pools, "other").unwrap(), None);
+        let named = g1.to_string();
+        let pools = [("data", g1), (named.as_str(), g2)];
+        assert!(select_pool(&pools, &named).is_err());
+        assert_eq!(select_pool(&pools, "data").unwrap(), Some(0));
+        assert_eq!(select_pool(&pools, &g2.to_string()).unwrap(), Some(1));
+    }
+
+    /// A deep check that cannot run (here the scrub refuses a pool with a
+    /// warning, an out-of-date database copy) is no pass: the space is
+    /// suspect, and `spaces check --deep` fails (1.2.2: skipped, healthy,
+    /// exit 0; audit M11).
+    #[test]
+    fn a_deep_check_that_cannot_run_is_no_pass() {
+        use storage_spaces::io::SparseImage;
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../storage-spaces/tests/fixtures/mirror3");
+        let disks: Vec<SparseImage> = (0..)
+            .map_while(|i| File::open(dir.join(format!("disk{i}.fixture"))).ok())
+            .map(|f| SparseImage::read_from(f).unwrap())
+            .collect();
+        let mut pool = Pool::open(disks).unwrap();
+        pool.warnings.push("a copy of the pool database is out of date".into());
+        let pool = Arc::new(pool);
+        let space = pool.user_spaces().next().unwrap();
+        let health = pool_health(&pool, None);
+        let quick = report(&pool, &health, &[], space, false, None, |_, _, _, _| Vec::new());
+        assert_eq!(quick.verdict(), Verdict::Healthy, "{}", quick.to_text());
+        let deep = report(&pool, &health, &[], space, true, None, |_, _, _, _| Vec::new());
+        let scrub = deep.checks.iter().find(|c| c.id == "deep.scrub").unwrap();
+        assert_ne!(scrub.status, Status::Skipped, "{}", deep.to_text());
+        assert_eq!(deep.verdict(), Verdict::Suspect, "{}", deep.to_text());
     }
 
     /// Checks that panic fail their space, checks that hang past the limit

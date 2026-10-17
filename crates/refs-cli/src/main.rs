@@ -556,7 +556,7 @@ fn open_device(source: &Source) -> Result<Device> {
         Some(name) => {
             let pool: &'static storage_spaces::Pool<File> = Box::leak(Box::new(storage_spaces::Pool::open(files)?));
             let space = pool
-                .find_space(name)
+                .select_space(name)?
                 .with_context(|| format!("no space {name:?} in pool {:?}", pool.name))?;
             Ok(Box::new(pool.open_space(space.id())?))
         }

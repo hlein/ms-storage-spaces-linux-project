@@ -73,7 +73,7 @@ enum Command {
         /// Only this pool (name or GUID).
         #[arg(long)]
         pool: Option<String>,
-        /// Only this space (name or GUID).
+        /// Only this space (its GUID, numeric id or name).
         #[arg(short, long)]
         space: Option<String>,
         #[arg(long, value_enum, default_value = "auto")]
@@ -121,7 +121,7 @@ enum Command {
         /// scrub of mirror and parity spaces, ReFS volumes checked whole.
         #[arg(long)]
         deep: bool,
-        /// Only this space (name or GUID).
+        /// Only this space (its GUID, numeric id or name).
         #[arg(short, long)]
         space: Option<String>,
         /// Also write a .tar.gz of the reports and the pools' metadata
@@ -855,9 +855,10 @@ fn write_pattern_with<D: storage_spaces::io::WriteAt>(
 }
 
 fn find_space<'p>(pool: &'p Pool<File>, key: &str) -> Result<&'p Space> {
-    if let Some(s) = pool.find_space(key) {
+    if let Some(s) = pool.select_space(key)? {
         return Ok(s);
     }
+    // A hidden space by its id (`spaces info --all` lists them).
     if let Some(s) = key.parse().ok().and_then(|id: u64| pool.spaces.get(&id)) {
         return Ok(s);
     }
@@ -1366,9 +1367,10 @@ fn cmd_attach(
     // unit (the journal) a line for the space and one per failing check.
     let interactive = std::io::stderr().is_terminal();
     let (mut failures, mut matched) = (0, 0);
+    let mut pools = Vec::new();
     for paths in groups {
-        let pool = match check::open_pool(&paths) {
-            Ok(pool) => Arc::new(pool),
+        match check::open_pool(&paths) {
+            Ok(pool) => pools.push((paths, Arc::new(pool))),
             Err(e) => {
                 eprintln!(
                     "the pool on {}: {e:#}",
@@ -1379,15 +1381,38 @@ fn cmd_attach(
                         .join(", ")
                 );
                 failures += 1;
+            }
+        }
+    }
+    // The pool --pool names among them all (a name two pools share names
+    // neither).
+    if let Some(key) = pool_sel {
+        let keys: Vec<_> = pools.iter().map(|(_, p)| (p.name.as_str(), p.guid)).collect();
+        match check::select_pool(&keys, key) {
+            Ok(Some(i)) => pools = vec![pools.swap_remove(i)],
+            Ok(None) => pools.clear(),
+            Err(e) => {
+                eprintln!("{e:#}");
+                failures += 1;
+                pools.clear();
+            }
+        }
+    }
+    for (paths, pool) in pools {
+        // The space --space names in this pool, as every command reads it.
+        let chosen = match space_sel.map(|s| pool.select_space(s)) {
+            None => None,
+            Some(Ok(Some(space))) => Some(space.id()),
+            Some(Ok(None)) => continue,
+            Some(Err(e)) => {
+                eprintln!("{e}");
+                failures += 1;
                 continue;
             }
         };
-        if pool_sel.is_some_and(|p| p != pool.name && !p.eq_ignore_ascii_case(&pool.guid.to_string())) {
-            continue;
-        }
         let health = check::pool_health(&pool, check::deadline());
         for space in pool.user_spaces() {
-            if space_sel.is_some_and(|s| s != space.name() && !s.eq_ignore_ascii_case(&space.info.guid.to_string())) {
+            if chosen.is_some_and(|id| id != space.id()) {
                 continue;
             }
             matched += 1;
@@ -1498,15 +1523,9 @@ fn cmd_attach(
 fn cmd_detach(sel: Option<&str>, outdated: bool) -> Result<()> {
     let _lock = attach::lock()?;
     let program = std::env::current_exe()?;
-    let mut failures = 0;
-    for state in attach::State::load_all()? {
-        let matches = sel.is_none_or(|s| {
-            s.eq_ignore_ascii_case(&state.space_guid)
-                || state.dm.first().is_some_and(|d| d == s || attach::names_space(d, s))
-        });
-        if !matches {
-            continue;
-        }
+    let (mut failures, mut matched) = (0, 0);
+    for state in attach::select_attached(attach::State::load_all()?, sel)? {
+        matched += 1;
         let name = state.dm.first().map_or(state.space_guid.as_str(), |d| d);
         if outdated {
             // An upgrade replaced the program the server runs: what nothing
@@ -1537,6 +1556,9 @@ fn cmd_detach(sel: Option<&str>, outdated: bool) -> Result<()> {
     }
     if failures > 0 {
         bail!("{failures} space(s) not detached");
+    }
+    if let Some(s) = sel.filter(|_| matched == 0) {
+        bail!("no attached space named {s:?} (spaces status lists them)");
     }
     Ok(())
 }

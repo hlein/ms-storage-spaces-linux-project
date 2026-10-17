@@ -182,7 +182,8 @@ or
 .TP
 .B detach
 Removes the devices of the given space (name, GUID or device-mapper name) or
-of all attached spaces, and stops their serving processes. A space whose
+of all attached spaces, and stops their serving processes; a name that
+matches no attached space fails. A space whose
 devices are mounted or held by another device (LVM, dm-crypt) stays
 attached, with what uses it named: unmount it first.
 .B \-\-outdated
@@ -225,7 +226,8 @@ also compares every copy (deep.scrub, as
 does), checks ReFS volumes whole (deep.refs, as
 .B refs check
 does) and every stripe the parity journal does not record as consistent
-(otherwise up to 1 GiB is read);
+(otherwise up to 1 GiB is read); a scrub that cannot run makes the space
+suspect;
 .B \-\-bundle
 .I file
 also writes a .tar.gz with the reports,
@@ -349,6 +351,21 @@ Change a disk's media type or usage.
 Move everything off a disk; remove a disk that holds nothing any more, or a
 missing one after a repair.
 .SH OPTIONS
+.TP
+.BR \-\-space " " \fIkey\fR
+A space by its GUID, its numeric id (as
+.B spaces info
+lists them) or its name, for every command. A key that names several
+spaces of a pool (a name two spaces share, or a name that is another
+space's GUID or id) is refused, naming them;
+.B space create
+and
+.B space rename
+refuse a new name that is the name, GUID or id of a space already there.
+.TP
+.BR \-\-pool " " \fIkey\fR
+A pool by its GUID or its name. A name two pools share, or a name that is
+another pool's GUID, is refused, naming them by their GUIDs.
 .TP
 .BR \-\-unclean\-parity " " refuse | data
 After an unclean shutdown (crash, power loss, disks pulled), parity

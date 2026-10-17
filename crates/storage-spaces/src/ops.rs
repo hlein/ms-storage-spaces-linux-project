@@ -345,9 +345,7 @@ pub fn plan_create_space<D: ReadAt>(pool: &Pool<D>, spec: &SpaceSpec, guids: Gui
         )));
     }
     check_name("the space", &spec.name)?;
-    if pool.find_space(&spec.name).is_some() {
-        return Err(Error::Pool(format!("a space named \"{}\" exists", spec.name)));
-    }
+    check_free_name(pool, &spec.name)?;
     let mut slabs = Slabs::of(&db)?;
     let n = slabs.disks() as u64;
     let interleave = spec.interleave.unwrap_or(256 << 10);
@@ -556,11 +554,29 @@ fn database_plan<D: ReadAt>(pool: &Pool<D>, summary: String, db: &Database) -> P
     plan
 }
 
+/// The space a command names ([`Pool::select_space`]): a key that names
+/// several is refused, not taken for the first.
 fn space_id<D: ReadAt>(pool: &Pool<D>, name: &str) -> Result<u64> {
-    pool.user_spaces()
-        .find(|s| s.name() == name || s.id().to_string() == name || s.info.guid.to_string() == name)
+    pool.select_space(name)?
         .map(|s| s.id())
         .ok_or_else(|| Error::Pool(format!("no space \"{name}\"")))
+}
+
+/// Refuses `name` for a new or renamed space when it names a space
+/// already: as the name of one, or as the GUID or numeric id of one, by
+/// which commands choose spaces too.
+fn check_free_name<D: ReadAt>(pool: &Pool<D>, name: &str) -> Result<()> {
+    if pool.user_spaces().any(|s| s.name() == name) {
+        return Err(Error::Pool(format!("a space named \"{name}\" exists")));
+    }
+    if let Some(s) = pool.select_space(name)? {
+        return Err(Error::Pool(format!(
+            "\"{name}\" is the GUID or the id of space {} ({}), by which commands choose it",
+            s.id(),
+            s.info.guid
+        )));
+    }
+    Ok(())
 }
 
 /// The names the planners give pools, spaces and tiers: 1 to 256
@@ -591,9 +607,7 @@ pub fn plan_rename_space<D: ReadAt>(pool: &Pool<D>, space: &str, name: &str) -> 
     let db = check_pool(pool)?;
     let id = space_id(pool, space)?;
     check_name("the space", name)?;
-    if pool.find_space(name).is_some() {
-        return Err(Error::Pool(format!("a space named \"{name}\" exists")));
-    }
+    check_free_name(pool, name)?;
     let next = crate::manage::rename_space(&db, id, name, filetime_now())?;
     Ok(database_plan(
         pool,
@@ -1668,9 +1682,7 @@ pub fn plan_create_tiered_space<D: ReadAt>(
         )));
     }
     check_name("the space", name)?;
-    if pool.find_space(name).is_some() {
-        return Err(Error::Pool(format!("a space named \"{name}\" exists")));
-    }
+    check_free_name(pool, name)?;
     if tiers.len() != 2 {
         return Err(Error::Pool(
             "a tiered space has two tiers: an SSD tier, then an HDD tier".into(),

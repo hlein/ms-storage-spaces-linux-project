@@ -8,7 +8,7 @@ use std::fs::File;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use storage_spaces::format::ExtentRecord;
+use storage_spaces::format::{ExtentRecord, Provisioning};
 use storage_spaces::guard::{self, Options};
 use storage_spaces::io::SparseImage;
 use storage_spaces::isolate::isolated;
@@ -35,7 +35,8 @@ fn timed<T: Send + 'static>(what: &str, limit: u64, work: impl FnOnce() -> T + S
 /// A parity space's extent run grown to 2^20 rows on a disk not at hand,
 /// whose journal entry covers only the stripes the run had: every stripe
 /// after them counts as not recorded consistent. The check counts them as
-/// a range and reads within its budget.
+/// a range and reads within its budget. The space is made thin: the other
+/// columns keep their short runs, rows a fixed space would have to map.
 #[test]
 fn a_journal_listing_billions_of_stripes_is_counted_not_walked() {
     let mut pool = load("scenarios/m5pj2/s5");
@@ -48,6 +49,7 @@ fn a_journal_listing_billions_of_stripes_is_counted_not_walked() {
         .unwrap();
     let (disk, columns, interleave) = {
         let space = pool.spaces.get_mut(&id).unwrap();
+        space.info.provisioning = Provisioning::Thin;
         let columns = space.info.policy.unwrap().columns;
         let interleave = space.info.policy.unwrap().interleave;
         let data = columns - space.info.policy.unwrap().redundancy;

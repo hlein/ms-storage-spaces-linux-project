@@ -121,8 +121,10 @@ digits, `_ . +` become `_`). Pools can share a name (Windows calls every new
 pool "Storage pool"): when a space of another pool has the name already,
 the first eight hex digits of the pool's GUID follow,
 `ss-<pool>-<space>-<guid>` (and `-p<N>` after that); `spaces detach
-<space>` finds both. Partition devices are created from the space's
-own GPT or MBR, so they exist even when Windows left out the protective MBR;
+<space>` finds both. Partition devices are created from the partitions
+the checks read (`space.partitions`: the space's own GPT, from its backup
+when the primary header is lost, or its MBR), so they exist even when
+Windows left out the protective MBR;
 none are made when the partitions overlap or leave the space, or when there
 are more than 128 (the whole space is attached all the same).
 
@@ -425,21 +427,30 @@ volume in a space attached with `--degraded` or `--force` mounts only with
 * `space.state`: the state Windows would show (Healthy, Warning /
   Degraded, Unhealthy).
 * `space.layout`: the slab map parses; no slab is mapped twice, no extent
-  lies outside its space or beyond its disk's partition.
+  lies outside its space or beyond its disk's partition; a fixed space maps
+  every row of its size (one with rows left without an extent lost extent
+  records, and fails).
 * `space.cache`: the write-back cache loads and its copies agree (cached
   chunks are a note).
 * `space.journal`: the stripes the parity journal does not record as
   consistent match their parity (Windows lists stripes never written and
   those its cache holds too; up to 1 GiB is read, the rest is checked when
   read).
-* `space.drl`: the extent runs the mirror's dirty region log lists (a
-  note: their copies are compared when read).
+* `space.drl`: the extent runs the mirror's dirty region log lists: their
+  copies are compared, up to the same 1 GiB of each (what the write-back
+  cache holds is read from the cache and not compared); copies that differ
+  (a crash or a pulled disk while Windows wrote, a disk back after it
+  missed writes, before Windows repaired the space) make the space
+  suspect, and reads of those places fail (`--unclean-parity data` reads
+  the highest copy).
 * For all three, the header on every copy of its mirror: a damaged copy
   (another valid) is degraded, copies that disagree suspect, none valid
   failed; a header zero everywhere is a structure never written (a note).
 * `space.partitions`: the protective MBR, both GPT headers with their
   CRCs and positions, both copies of the partition entries the same, the
-  partitions inside the space and apart.
+  partitions inside the space and apart; a primary header lost with the backup
+  valid is suspect, and the partitions are read from the backup (their
+  file systems are checked); a protective MBR without a GPT is suspect.
 * `fs.ntfs`: the NTFS boot sector and its copy in the partition's last
   sector agree.
 * `fs.refs.boot`, `fs.refs.superblock`, `fs.refs.checkpoint`,
@@ -477,14 +488,14 @@ space "data" (6af700fc-207e-4c13-ab93-4123223e1d17) of pool "Storage pool" (78bb
   ok       space.layout      Mirror, 1 column(s), 2 copies, interleave 256 KiB, 2 extent(s) on 2 disk(s)
   skipped  space.cache       no write-back cache
   skipped  space.journal     no parity journal (not a parity space)
-  info     space.drl         1 extent run(s) written since the space was last disconnected: their copies are compared when read
+  info     space.drl         1 extent run(s) written since the space was last disconnected: compared, the copies agree
   SUSPECT  space.partitions  the backup GPT header is not valid
            what      the backup GPT header
            where     LBA 2097151 (space byte 0x3ffffe00 (virtual slab 3), column 0 row 3: copy 0: disk 3 slab 4 -> /dev/sdd at 0x70fffe00, copy 1: disk 1 slab 5 -> /dev/sdb at 0x80fffe00)
            expected  "EFI PART" (the primary at LBA 1 names LBA 2097151 as its backup)
            found     00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 ... (all zero)
            truth     our cross-check of copies Windows keeps or of checksums
-  ok       fs.ntfs           p1: the NTFS boot sector and its copy in the last sector agree
+  ok       fs.ntfs           p1: the NTFS boot sector and its copy after the volume agree
   what to do:
     - space.partitions: Windows keeps two copies of the partition table, and
       they disagree here (or one is not valid). If Windows shows this space as

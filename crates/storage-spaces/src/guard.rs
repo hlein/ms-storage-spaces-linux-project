@@ -28,7 +28,8 @@ use crate::report::{Check, Evidence, Report, Status, Truth, hex, signature};
 #[derive(Debug, Clone, Copy)]
 pub struct Options {
     /// Bytes `space.journal` may read to check stripes against their
-    /// parity (`None`: every listed stripe, as `spaces check --deep`).
+    /// parity, and `space.drl` of each copy to compare the runs its log
+    /// lists (`None`: everything listed, as `spaces check --deep`).
     pub journal_budget: Option<u64>,
 }
 
@@ -580,7 +581,7 @@ fn space_checks<D: ReadAt>(
     let mut checks = vec![layout_check(space, &reader)];
     checks.push(cache_check(&reader, names));
     checks.push(journal_check(&reader, names, options));
-    checks.push(drl_check(&reader, names));
+    checks.push(drl_check(&reader, names, options));
     let sector = u64::from(pool.logical_sector_size);
     // A partition table can name any LBA: those beyond the space are said so.
     let at = |lba: u64| match lba.checked_mul(sector).filter(|&o| o < reader.size()) {
@@ -856,7 +857,7 @@ fn journal_contents_check<D: ReadAt>(reader: &SpaceReader<'_, D>, names: &[Strin
     .truth(Truth::CrossCheck)
 }
 
-fn drl_check<D: ReadAt>(reader: &SpaceReader<'_, D>, names: &[String]) -> Check {
+fn drl_check<D: ReadAt>(reader: &SpaceReader<'_, D>, names: &[String], options: &Options) -> Check {
     const ID: &str = "space.drl";
     let header = header_check(ID, Part::DirtyRegions, reader, names);
     let mirror = reader.layout().resiliency == crate::format::Resiliency::Mirror;
@@ -864,18 +865,76 @@ fn drl_check<D: ReadAt>(reader: &SpaceReader<'_, D>, names: &[String]) -> Check 
         None if mirror => Check::skipped(ID, "no dirty region log"),
         None => Check::skipped(ID, "no dirty region log (not a mirror space)"),
         Some(d) if d.dirty_runs() == 0 => Check::ok(ID, "no extent runs listed").truth(Truth::Windows),
-        Some(d) => Check::new(
-            ID,
-            Status::Info,
-            format!(
-                "{} extent run(s) written since the space was last disconnected: their copies are \
-                 compared when read",
-                d.dirty_runs()
-            ),
-        )
-        .truth(Truth::Windows),
+        Some(d) => listed_runs_check(reader, names, options, d.dirty_runs()),
     };
     with_header(base, header)
+}
+
+/// `space.drl` for the `runs` extent runs the dirty region log lists: their
+/// copies compared within the read budget.
+fn listed_runs_check<D: ReadAt>(
+    reader: &SpaceReader<'_, D>,
+    names: &[String],
+    options: &Options,
+    runs: usize,
+) -> Check {
+    const ID: &str = "space.drl";
+    let written = format!("{runs} extent run(s) written since the space was last disconnected");
+    let c = match reader.check_dirty_regions(options.journal_budget) {
+        Ok(Some(c)) => c,
+        Ok(None) => {
+            return Check::new(
+                ID,
+                Status::Info,
+                format!("{written}: their copies are compared when read"),
+            )
+            .truth(Truth::Windows);
+        }
+        Err(e) => {
+            return Check::new(ID, Status::Failed, "the listed extent runs cannot be read")
+                .evidence(
+                    Evidence::new("extent runs the dirty region log lists")
+                        .expected("readable")
+                        .found(e.to_string()),
+                )
+                .truth(Truth::CrossCheck);
+        }
+    };
+    if !c.differ.is_empty() {
+        let mut check = Check::new(
+            ID,
+            Status::Suspect,
+            format!(
+                "{written}: their copies differ (writes in flight when the pool was last in use, or a \
+                 disk that missed writes)"
+            ),
+        )
+        .truth(Truth::CrossCheck)
+        .advice(
+            "A write reached only some copies of the mirror: which one Windows keeps is not known. \
+             Windows settles it when it next attaches the pool. Reads of those places fail \
+             (--unclean-parity data reads the highest copy).",
+        );
+        for &offset in &c.differ {
+            check = check.evidence(
+                Evidence::new("a place of an extent run the dirty region log lists")
+                    .at(reader.describe(offset, names))
+                    .expected("the same on every copy of the mirror")
+                    .found("different"),
+            );
+        }
+        return check;
+    }
+    let compared = c.compared >> 20;
+    let summary = match options.journal_budget {
+        Some(b) if c.incomplete => format!(
+            "{written}: {compared} MiB compared, the copies agree; the rest left to the read budget of {} MiB \
+             (compared when read; spaces check --deep compares more)",
+            b >> 20
+        ),
+        _ => format!("{written}: compared, the copies agree"),
+    };
+    Check::new(ID, Status::Info, summary).truth(Truth::CrossCheck)
 }
 
 /// A GPT header as found.
@@ -937,6 +996,85 @@ impl GptHeader {
     }
 }
 
+/// The partitions a device or space of `size` bytes in `sector`-byte
+/// sectors holds, as `space.partitions` reads them: the GPT (from its
+/// backup when the primary header is lost) or the MBR's. What `spaces
+/// attach` makes devices for and where `refs` looks for volumes, so that
+/// they are the ones the checks read.
+pub fn partitions(dev: &dyn ReadAt, size: u64, sector: u64) -> Vec<Partition> {
+    partition_check(dev, size, sector, &|lba| format!("LBA {lba}"))
+        .1
+        .unwrap_or_default()
+}
+
+/// The partitions of GPT `header`'s entries `table`, in a space of `lbas`
+/// sectors of `sector` bytes; what is wrong with them goes to `problems`.
+fn gpt_partitions(
+    header: &GptHeader,
+    table: &[u8],
+    lbas: u64,
+    sector: u64,
+    at: &dyn Fn(u64) -> String,
+    problems: &mut Vec<Evidence>,
+) -> Vec<Partition> {
+    let last = lbas - 1;
+    let mut parts = Vec::new();
+    for (i, e) in table.chunks_exact(header.entry_size).enumerate() {
+        if e[0..16].iter().all(|&b| b == 0) {
+            continue;
+        }
+        let first = u64::from_le_bytes(e[32..40].try_into().unwrap());
+        let end = u64::from_le_bytes(e[40..48].try_into().unwrap());
+        let name: Vec<u16> = e[56..128.min(e.len())]
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|&c| u16::from_le_bytes(c))
+            .collect();
+        if end < first {
+            problems.push(
+                Evidence::new(format!("partition {}", i + 1))
+                    .at(at(header.entries_lba))
+                    .expected("its first LBA not after its last")
+                    .found(format!("{first}..{end}")),
+            );
+            continue;
+        }
+        // A partition whose bytes cannot be counted lies beyond any
+        // space: reported, and not read.
+        let bytes = first
+            .checked_mul(sector)
+            .zip((end - first).checked_add(1).and_then(|n| n.checked_mul(sector)));
+        match bytes.filter(|&(offset, length)| offset.checked_add(length).is_some()) {
+            Some((offset, length)) => parts.push(Partition {
+                number: i as u32 + 1,
+                offset,
+                length,
+                kind: crate::Guid::from_mixed_endian(e[0..16].try_into().unwrap()).to_string(),
+                name: String::from_utf16_lossy(&name).trim_end_matches('\0').to_string(),
+            }),
+            None => problems.push(
+                Evidence::new(format!("partition {}", i + 1))
+                    .at(at(header.entries_lba))
+                    .expected(format!(
+                        "inside LBAs {}..={}",
+                        header.first_usable,
+                        header.last_usable.min(last)
+                    ))
+                    .found(format!("LBAs {first}..={end}")),
+            ),
+        }
+    }
+    problems.extend(bounds_problems(
+        &parts,
+        header.first_usable,
+        header.last_usable.min(last),
+        sector,
+        at,
+    ));
+    parts
+}
+
 /// `space.partitions`: the protective MBR, both GPT headers with their
 /// CRCs and positions, both entry arrays the same, and the partitions
 /// inside the space without overlapping; or an MBR's partitions. Returns
@@ -985,11 +1123,103 @@ fn partition_check(
         Vec::new()
     };
     let protective = mbr_entries.iter().any(|&(kind, ..)| kind == 0xee);
-    let primary = match read(1, sector as usize) {
-        Ok(b) => GptHeader::parse(b, 1),
+    let lba1 = match read(1, sector as usize) {
+        Ok(b) => b,
         Err(e) => return (unreadable(e), Some(Vec::new())),
     };
-    let Some(primary) = primary else {
+    let entries_of = |h: &GptHeader| -> Result<Vec<u8>, String> {
+        if !h.table_ok(lbas) {
+            return Err(format!(
+                "{} entries of {} bytes from LBA {} (not plausible)",
+                h.count, h.entry_size, h.entries_lba
+            ));
+        }
+        read(h.entries_lba, h.count * h.entry_size)
+    };
+    let Some(primary) = GptHeader::parse(lba1.clone(), 1) else {
+        let last = lbas - 1;
+        let held = if lba1[..8].iter().all(|&b| b == 0) {
+            hex(&lba1, 16)
+        } else {
+            signature(&lba1[..8])
+        };
+        // The primary header lost: Windows and the kernel read the backup
+        // at the last LBA, and so do these checks.
+        let backup = read(last, sector as usize)
+            .ok()
+            .and_then(|raw| GptHeader::parse(raw, last))
+            .filter(|b| b.crc_ok() && b.my_lba == last);
+        if let Some(b) = backup {
+            let mut problems = vec![
+                Evidence::new("the primary GPT header")
+                    .at(at(1))
+                    .expected(format!(
+                        "\"EFI PART\" (the backup at LBA {last} names LBA {})",
+                        b.alternate
+                    ))
+                    .found(held),
+            ];
+            let parts = match entries_of(&b) {
+                Ok(t) => {
+                    if crc32(&t) != b.entries_crc {
+                        problems.push(
+                            Evidence::new("the backup partition entries' CRC32")
+                                .at(at(b.entries_lba))
+                                .expected(format!("{:08x} (the header's)", b.entries_crc))
+                                .found(format!("{:08x}", crc32(&t))),
+                        );
+                    }
+                    gpt_partitions(&b, &t, lbas, sector, at, &mut problems)
+                }
+                Err(e) => {
+                    problems.push(
+                        Evidence::new("the backup partition entries")
+                            .at(at(b.entries_lba))
+                            .expected("readable")
+                            .found(e),
+                    );
+                    Vec::new()
+                }
+            };
+            let mut check = Check::new(
+                ID,
+                Status::Suspect,
+                format!(
+                    "the primary GPT header is lost; the backup at LBA {last} holds {} partition(s)",
+                    parts.len()
+                ),
+            )
+            .truth(Truth::CrossCheck)
+            .advice(
+                "The first copy of the partition table does not check out, the second does: the \
+                 partitions are read from it, as Windows and Linux read them. Windows writes the \
+                 first copy again from the second when it next attaches the pool.",
+            );
+            for e in problems {
+                check = check.evidence(e);
+            }
+            return (check, Some(parts));
+        }
+        if protective {
+            // A protective MBR says the space holds a GPT.
+            let check = Check::new(
+                ID,
+                Status::Suspect,
+                "a protective MBR, but no valid GPT header at LBA 1 or at the last LBA",
+            )
+            .evidence(
+                Evidence::new("the primary GPT header")
+                    .at(at(1))
+                    .expected("\"EFI PART\" (the MBR holds a protective entry of type 0xee)")
+                    .found(held),
+            )
+            .truth(Truth::CrossCheck)
+            .advice(
+                "The MBR says the space holds a GPT, but neither copy of its header checks out: the \
+                 partition table is lost, and the file systems in the space are not checked.",
+            );
+            return (check, Some(Vec::new()));
+        }
         // No GPT: an MBR's partitions, or none.
         if mbr_entries.is_empty() {
             return (
@@ -1047,15 +1277,6 @@ fn partition_check(
                 .found(primary.my_lba.to_string()),
         );
     }
-    let entries_of = |h: &GptHeader| -> Result<Vec<u8>, String> {
-        if !h.table_ok(lbas) {
-            return Err(format!(
-                "{} entries of {} bytes from LBA {} (not plausible)",
-                h.count, h.entry_size, h.entries_lba
-            ));
-        }
-        read(h.entries_lba, h.count * h.entry_size)
-    };
     let primary_entries = match entries_of(&primary) {
         Ok(t) => {
             if crc32(&t) != primary.entries_crc {
@@ -1200,62 +1421,9 @@ fn partition_check(
             _ => {}
         }
     }
-    let mut parts = Vec::new();
-    if let Some(table) = &primary_entries {
-        for (i, e) in table.chunks_exact(primary.entry_size).enumerate() {
-            if e[0..16].iter().all(|&b| b == 0) {
-                continue;
-            }
-            let first = u64::from_le_bytes(e[32..40].try_into().unwrap());
-            let end = u64::from_le_bytes(e[40..48].try_into().unwrap());
-            let name: Vec<u16> = e[56..128.min(e.len())]
-                .as_chunks::<2>()
-                .0
-                .iter()
-                .map(|&c| u16::from_le_bytes(c))
-                .collect();
-            if end < first {
-                problems.push(
-                    Evidence::new(format!("partition {}", i + 1))
-                        .at(at(primary.entries_lba))
-                        .expected("its first LBA not after its last")
-                        .found(format!("{first}..{end}")),
-                );
-                continue;
-            }
-            // A partition whose bytes cannot be counted lies beyond any
-            // space: reported, and not read.
-            let bytes = first
-                .checked_mul(sector)
-                .zip((end - first).checked_add(1).and_then(|n| n.checked_mul(sector)));
-            match bytes.filter(|&(offset, length)| offset.checked_add(length).is_some()) {
-                Some((offset, length)) => parts.push(Partition {
-                    number: i as u32 + 1,
-                    offset,
-                    length,
-                    kind: crate::Guid::from_mixed_endian(e[0..16].try_into().unwrap()).to_string(),
-                    name: String::from_utf16_lossy(&name).trim_end_matches('\0').to_string(),
-                }),
-                None => problems.push(
-                    Evidence::new(format!("partition {}", i + 1))
-                        .at(at(primary.entries_lba))
-                        .expected(format!(
-                            "inside LBAs {}..={}",
-                            primary.first_usable,
-                            primary.last_usable.min(last)
-                        ))
-                        .found(format!("LBAs {first}..={end}")),
-                ),
-            }
-        }
-        problems.extend(bounds_problems(
-            &parts,
-            primary.first_usable,
-            primary.last_usable.min(last),
-            sector,
-            at,
-        ));
-    }
+    let parts = primary_entries.as_ref().map_or(Vec::new(), |table| {
+        gpt_partitions(&primary, table, lbas, sector, at, &mut problems)
+    });
     let mbr_note = if protective {
         ""
     } else {
@@ -1388,13 +1556,24 @@ pub fn ntfs_check<R: ReadAt + ?Sized>(
         .checked_add(length)
         .and_then(|end| end.checked_sub(bps))
         .filter(|&c| c >= offset)
+        .map(|last| {
+            // Windows writes the copy in the sector after the volume's
+            // last, which is the partition's last when the volume fills it;
+            // a copy in the partition's last sector is taken too.
+            let after = offset + total * bps;
+            if after <= last && read_vec(dev, last, 512).ok().as_ref() != Some(&boot) {
+                after
+            } else {
+                last
+            }
+        })
     {
         match read_vec(dev, copy_at, 512) {
             Ok(copy) if copy == boot => {}
             Ok(copy) => {
                 let first = copy.iter().zip(&boot).position(|(a, b)| a != b).unwrap_or(0);
                 problems.push(
-                    Evidence::new("the copy of the NTFS boot sector in the partition's last sector")
+                    Evidence::new("the copy of the NTFS boot sector after the volume's last sector")
                         .at(locate(copy_at))
                         .expected(format!(
                             "the same as the boot sector: {} at byte {first:#x}",
@@ -1423,7 +1602,7 @@ pub fn ntfs_check<R: ReadAt + ?Sized>(
         return Some(
             Check::ok(
                 ID,
-                format!("{label}: the NTFS boot sector and its copy in the last sector agree"),
+                format!("{label}: the NTFS boot sector and its copy after the volume agree"),
             )
             .truth(Truth::CrossCheck),
         );
@@ -1435,7 +1614,8 @@ pub fn ntfs_check<R: ReadAt + ?Sized>(
     )
     .truth(Truth::CrossCheck)
     .advice(
-        "NTFS keeps a copy of its boot sector in the last sector of the partition. If Windows \
+        "NTFS keeps a copy of its boot sector after the last sector of the volume (the partition's \
+         last when the volume fills it). If Windows \
          shows this volume as healthy, the end of the space is probably read wrongly: please \
          report it with the bundle of spaces check --bundle. chkdsk repairs a damaged boot sector.",
     );
@@ -1620,6 +1800,50 @@ mod tests {
         assert_eq!(clean.status, Status::Suspect, "{}", r.to_text());
         assert_eq!(clean.evidence[0].what, "an extent of space 99");
         assert_eq!(clean.truth, Some(Truth::Format));
+    }
+
+    /// A fixed space maps every row of its size: one whose extent records
+    /// are gone from every copy (or some of them) is not a space that reads
+    /// zeros there but one whose slab map is not whole. (1.2.2: healthy,
+    /// "survives 18446744073709551615 more disk failures", and `export`
+    /// wrote zeros; audit M7.)
+    #[test]
+    fn a_fixed_space_without_its_extents_fails() {
+        use crate::format::Provisioning;
+        // frag: a fixed space of three extent records per column.
+        let disks = images("fixtures/frag");
+        for keep in [false, true] {
+            let mut pool = Pool::open(disks.iter().collect::<Vec<_>>()).unwrap();
+            let id = pool.user_spaces().find(|s| s.name() == "frag").unwrap().id();
+            let space = pool.spaces.get_mut(&id).unwrap();
+            assert_eq!(space.info.provisioning, Provisioning::Fixed);
+            // None of its extents, or those of its first slab alone.
+            let first = space.extents.iter().map(|e| e.virtual_slab).min().unwrap();
+            let before = space.extents.len();
+            space.extents.retain(|e| keep && e.virtual_slab == first);
+            assert!(space.extents.len() < before);
+            let r = &space_report(&pool, &pool.spaces[&id], &[], &Options::default(), &mut ntfs_hook);
+            assert_eq!(r.verdict(), Verdict::Failed, "{}", r.to_text());
+            assert_eq!(check(r, "space.layout").status, Status::Failed, "{}", r.to_text());
+            assert!(!r.to_text().contains("18446744073709551615"), "{}", r.to_text());
+            assert!(pool.open_space(id).is_err());
+        }
+    }
+
+    /// A thin space of no extent at all, its hidden spaces empty too,
+    /// survives what its policy says, not 2^64 - 1 disk failures (1.2.2).
+    #[test]
+    fn a_thin_space_of_no_extent_survives_what_its_policy_says() {
+        let disks = images("fixtures/mirrorthin");
+        let mut pool = Pool::open(disks.iter().collect::<Vec<_>>()).unwrap();
+        let id = pool.user_spaces().next().unwrap().id();
+        let family: Vec<u64> = pool.family(id).iter().map(|s| s.id()).collect();
+        for member in family {
+            pool.spaces.get_mut(&member).unwrap().extents.clear();
+        }
+        let h = crate::health::health(&pool).unwrap();
+        let space = h.spaces.iter().find(|s| s.id == id).unwrap();
+        assert_eq!(space.failures_left, Some(1));
     }
 
     #[test]
@@ -1889,6 +2113,41 @@ mod tests {
         assert_eq!(r.verdict(), Verdict::Suspect);
     }
 
+    /// Copies of a run the dirty region log lists that differ (a crash while
+    /// Windows wrote it) make the space suspect: reads of them fail. (1.2.2
+    /// said "their copies are compared when read", healthy, as for the
+    /// corpus pools crashmirror and crashmirrorwc; audit M14.)
+    #[test]
+    fn listed_mirror_runs_whose_copies_differ_are_suspect() {
+        use crate::format::SLAB_SIZE;
+        let mut disks = images("fixtures/drtdism");
+        let (device, at) = {
+            let pool = Pool::open(disks.iter().collect::<Vec<_>>()).unwrap();
+            let space = pool.user_spaces().next().unwrap();
+            let reader = pool.open_space(space.id()).unwrap();
+            let drt = reader.dirty_regions().unwrap();
+            let run = (0..1 << 20).find(|&v| drt.is_dirty(v)).unwrap();
+            let l = Layout::new(space.info.policy.as_ref().unwrap(), &space.extents).unwrap();
+            let loc = l.locate(run * SLAB_SIZE);
+            let (disk, slab) = l.physical(loc.column, 1, loc.row).unwrap();
+            let (device, start) = pool.slab_location(disk, slab).unwrap().unwrap();
+            (device, start + loc.offset_in_slab + 4096)
+        };
+        disks[device].insert(at, &[0x5a; 4096]);
+        let pool = Pool::open(disks.iter().collect::<Vec<_>>()).unwrap();
+        let r = &reports(&pool, &Options::default())[0];
+        let c = check(r, "space.drl");
+        assert_eq!(c.status, Status::Suspect, "{}", r.to_text());
+        assert!(
+            c.evidence[0]
+                .location
+                .as_deref()
+                .is_some_and(|l| l.starts_with("space byte")),
+            "{c:?}"
+        );
+        assert_eq!(r.verdict(), Verdict::Suspect);
+    }
+
     #[test]
     fn listed_mirror_runs_are_information() {
         let disks = images("fixtures/drtdism");
@@ -2003,6 +2262,47 @@ mod tests {
         assert_eq!(check.truth, Some(Truth::CrossCheck));
         // The primary's partitions are still checked.
         assert_eq!(parts.unwrap().len(), 1);
+    }
+
+    /// A GPT whose primary header is lost and whose backup is whole is a
+    /// damaged table, not none: suspect, its partitions read from the
+    /// backup, so that their file systems are checked. (1.2.2 checked the
+    /// space as one without partitions, healthy, when the MBR went with the
+    /// header, and took the protective MBR entry for a partition when it
+    /// stayed; Windows and the kernel read the backup.)
+    #[test]
+    fn a_lost_primary_gpt_header_is_suspect_and_the_backup_read() {
+        // The first 4 KiB overwritten (the MBR, the primary header and the
+        // first entries), as by a block of another disk.
+        let mut d = gpt_disk(LBAS, &[(34, 2047), (2048, 8000)]);
+        d.0[..4096].fill(0x5a);
+        let (check, parts) = table(&d);
+        assert_eq!(check.status, Status::Suspect, "{check:?}");
+        assert!(check.summary.contains("primary GPT header"), "{}", check.summary);
+        let parts = parts.unwrap();
+        assert_eq!(parts.len(), 2, "{parts:?}");
+        assert_eq!((parts[1].offset, parts[1].length), (2048 * 512, 5953 * 512));
+        // The primary header alone lost, the protective MBR left.
+        let mut d = gpt_disk(LBAS, &[(34, 8000)]);
+        d.0[512..1024].fill(0);
+        let (check, parts) = table(&d);
+        assert_eq!(check.status, Status::Suspect, "{check:?}");
+        assert!(check.summary.contains("primary GPT header"), "{}", check.summary);
+        assert_eq!(parts.unwrap()[0].offset, 34 * 512);
+    }
+
+    /// A protective MBR with no GPT header at either end is a lost table,
+    /// not an MBR partition of type 0xee.
+    #[test]
+    fn a_protective_mbr_without_a_gpt_is_suspect() {
+        let mut d = gpt_disk(LBAS, &[(34, 8000)]);
+        d.0[512..1024].fill(0);
+        let last = (LBAS - 1) as usize;
+        d.0[last * 512..].fill(0);
+        let (check, parts) = table(&d);
+        assert_eq!(check.status, Status::Suspect, "{check:?}");
+        assert!(check.summary.contains("protective MBR"), "{}", check.summary);
+        assert!(parts.unwrap_or_default().iter().all(|p| p.kind != "mbr:0xee"));
     }
 
     #[test]
@@ -2191,6 +2491,22 @@ mod tests {
         ntfs_check(d, 0, d.0.len() as u64, "p2", &|o| format!("byte {o:#x}"))
     }
 
+    /// An NTFS volume smaller than its partition keeps the copy of its boot
+    /// sector after its own last sector, where Windows writes it, not in the
+    /// partition's last (1.2.2: suspect; audit M14).
+    #[test]
+    fn an_ntfs_volume_smaller_than_its_partition_has_its_copy_after_it() {
+        let mut d = ntfs_partition(4096).0;
+        d.resize(8192 * 512, 0);
+        let check = ntfs(&MemDevice(d.clone())).unwrap();
+        assert_eq!(check.status, Status::Ok, "{check:?}");
+        // A damaged copy there is still seen.
+        d[4095 * 512 + 0x30] ^= 1;
+        let check = ntfs(&MemDevice(d)).unwrap();
+        assert_eq!(check.status, Status::Suspect, "{check:?}");
+        assert_eq!(check.evidence[0].location.as_deref(), Some("byte 0x1ffe00"));
+    }
+
     #[test]
     fn the_ntfs_boot_sector_and_its_copy() {
         let d = ntfs_partition(4096);
@@ -2198,7 +2514,7 @@ mod tests {
         assert_eq!(check.status, Status::Ok, "{check:?}");
         assert_eq!(
             check.summary,
-            "p2: the NTFS boot sector and its copy in the last sector agree"
+            "p2: the NTFS boot sector and its copy after the volume agree"
         );
         let mut other = d.clone();
         other.0[4095 * 512 + 0x30] ^= 1;

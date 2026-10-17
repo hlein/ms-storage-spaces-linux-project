@@ -137,6 +137,11 @@ impl DirtyRegions {
         self.runs.len()
     }
 
+    /// The listed extent runs: the virtual slabs where they start, in order.
+    pub fn runs(&self) -> impl Iterator<Item = u64> + '_ {
+        self.runs.iter().copied()
+    }
+
     /// Both header copies as found on disk.
     pub fn copies(&self) -> &[DrtCopy] {
         &self.copies

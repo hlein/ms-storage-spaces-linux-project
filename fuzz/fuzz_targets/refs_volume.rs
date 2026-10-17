@@ -41,7 +41,8 @@ fn volumes(dev: &SparseImage) -> Vec<u64> {
     if dev.read_exact_at(&mut sector, 0).is_ok() && refs::boot::BootSector::is_refs(&sector) {
         found.push(0);
     }
-    for p in storage_spaces::gpt::read_partitions(dev, 512).unwrap_or_default() {
+    let length = dev.size().unwrap_or(0);
+    for p in storage_spaces::guard::partitions(dev, length, 512) {
         if dev.read_exact_at(&mut sector, p.offset).is_ok() && refs::boot::BootSector::is_refs(&sector) {
             found.push(p.offset);
         }

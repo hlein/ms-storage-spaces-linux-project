@@ -412,6 +412,20 @@ impl Layout {
         self.base + self.run_first_row(row) * SLAB_SIZE * self.data_columns
     }
 
+    /// Owner offset where the extent run holding `row` ends (where the row
+    /// ends, if unallocated).
+    pub fn run_end_offset(&self, row: u64) -> u64 {
+        let end = self
+            .runs
+            .get(&(0, 0))
+            .and_then(|runs| {
+                let i = runs.partition_point(|r| r.first_row + r.rows <= row);
+                runs.get(i).filter(|r| r.first_row <= row)
+            })
+            .map_or(row + 1, |r| r.first_row + r.rows);
+        self.base + end * SLAB_SIZE * self.data_columns
+    }
+
     /// The copy numbers of a column (a moved copy may be numbered beyond the
     /// policy's copies).
     pub fn copies_of(&self, column: u64) -> Vec<u64> {
@@ -424,6 +438,38 @@ impl Layout {
         let i = runs.partition_point(|r| r.first_row + r.rows <= row);
         let run = runs.get(i).filter(|r| r.first_row <= row)?;
         Some((run.disk_id, run.physical_slab + (row - run.first_row)))
+    }
+
+    /// The first of rows `0..rows` that a column has no extent for,
+    /// current or out of date: a row a fixed space maps (a thin one reads
+    /// zeros there).
+    pub fn unmapped_row(&self, rows: u64) -> Option<u64> {
+        (0..self.columns)
+            .filter_map(|column| {
+                let stale = self.stale.get(&column).into_iter().flat_map(|c| {
+                    c.starts
+                        .windows(2)
+                        .zip(&c.disks)
+                        .filter(|(_, disks)| !disks.is_empty())
+                        .map(|(w, _)| (w[0], w[1]))
+                });
+                let mut covered: Vec<(u64, u64)> = self
+                    .runs
+                    .range((column, 0)..=(column, u64::MAX))
+                    .flat_map(|(_, runs)| runs.iter().map(|r| (r.first_row, r.first_row.saturating_add(r.rows))))
+                    .chain(stale)
+                    .collect();
+                covered.sort_unstable();
+                let mut next = 0;
+                for (start, end) in covered {
+                    if start > next {
+                        break;
+                    }
+                    next = next.max(end);
+                }
+                (next < rows).then_some(next)
+            })
+            .min()
     }
 
     /// Whether the row of a column has an out-of-date copy only.

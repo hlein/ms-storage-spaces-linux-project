@@ -32,7 +32,7 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
-use storage_spaces::gpt::{Partition, read_partitions};
+use storage_spaces::gpt::Partition;
 use storage_spaces::report::{Report, Verdict};
 use storage_spaces::segments::SegmentKind;
 use storage_spaces::{Pool, Space, SpaceReader};
@@ -826,7 +826,8 @@ pub fn attach_space(
         // and apart, and are not too many (an attach forced past the
         // partition check gets the whole space only); udev is waited for
         // once for them all.
-        match partition_devices(read_partitions(&reader, sector as u64)?, reader.size()) {
+        let parts = storage_spaces::guard::partitions(&reader, reader.size(), sector as u64);
+        match partition_devices(parts, reader.size()) {
             Err(why) => eprintln!("{:?}: no devices for its partitions: {why}", space.name()),
             Ok(parts) => {
                 for p in &parts {

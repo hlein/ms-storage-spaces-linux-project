@@ -585,7 +585,13 @@ the space was written in two runs, attached again, repaired):
   database to the other members.
 * Between the return and the repair nothing on disk says which copy of a
   listed run is current (the log's copies are equal again), so `spaces`
-  refuses rows whose copies differ.
+  refuses rows whose copies differ, and `space.drl`, which compares the
+  copies of the listed runs, calls the space suspect (snapshot `m5stale`
+  s4). So it does after a crash or a pulled disk while Windows wrote
+  (`crashmirror`, and snapshots taken while a write was in flight,
+  `m5thinm` s1-s3). What the write-back cache holds is read from it: there
+  the copies may still differ without harm (`mirrorthin`: the second copy
+  lacks data the cache holds), and they are not compared.
 
 A run of `slab_count` consecutive physical slabs backs column `column`, copy
 `copy`, rows `virtual_slab / data_columns ...` (**verified**).
@@ -1106,7 +1112,13 @@ scenario state of the corpus.
   it is not known (suspect). Of the two header pages of a dirty region log,
   one lost on every copy is degraded; both, failed.
 * Partitions that become device-mapper devices lie inside the space and
-  do not overlap.
+  do not overlap; they are the ones the guard checks: the GPT, from its
+  backup header at the last LBA when the primary is lost (suspect), or the
+  MBR's (a protective MBR without a GPT is suspect).
+* A fixed space maps every row of its size, its own or its tiers' (Windows
+  allocates them at creation, an extension adds rows): a row without an
+  extent means extent records went missing, and the space is refused
+  (`space.layout`); a thin space reads zeros there.
 
 ### Plausible values
 

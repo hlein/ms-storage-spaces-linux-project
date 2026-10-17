@@ -19,6 +19,27 @@
   such a record (10 of the oracle's mutants did). Such a space now fails
   (`space.layout`), as for the other implausible numbers.
 
+* A space whose partition table lost its first copy was called healthy:
+  with its MBR and primary GPT header overwritten, "no partition table"
+  (the whole space checked for a file system); with the MBR left, the
+  protective entry was taken for an MBR partition. Now a lost primary
+  header with a valid backup is suspect and the partitions are read from
+  the backup, so that their file systems are checked; a protective MBR
+  without a GPT is suspect. `spaces attach` makes partition devices for,
+  and `refs` looks for volumes in, the partitions the checks read.
+* A fixed space whose rows are not all mapped (extent records missing) was
+  called healthy and read zeros there; it now fails (`space.layout`), and
+  `spaces info` no longer says a space without extents survives
+  18446744073709551615 more disk failures.
+* `space.drl` compares the copies of the extent runs the dirty region log
+  lists (up to the read budget; what the write-back cache holds is read
+  from it): where they differ, after a crash or while a returned disk
+  waits for its repair, reads fail, and the space is now suspect instead of
+  healthy.
+* An NTFS volume smaller than its partition was suspect: its boot sector
+  copy was looked for in the partition's last sector, not after the volume,
+  where Windows writes it.
+
 ### Testing
 
 * The boundary values of the plausibility limits are tried in every field

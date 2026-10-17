@@ -572,8 +572,9 @@ fn find_volumes(dev: &dyn ReadAt) -> Result<Vec<u64>> {
         return Ok(vec![0]);
     }
     let mut found = Vec::new();
+    let length = dev.size()?;
     for size in [512u64, 4096] {
-        for p in storage_spaces::gpt::read_partitions(dev, size).unwrap_or_default() {
+        for p in storage_spaces::guard::partitions(dev, length, size) {
             if dev.read_exact_at(&mut sector, p.offset).is_ok() && refs::boot::BootSector::is_refs(&sector) {
                 found.push(p.offset);
             }

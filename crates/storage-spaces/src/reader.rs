@@ -6,7 +6,7 @@ use crate::cache::{CacheHeader, CacheIndex, Lookup, SlotSource};
 use crate::crc::crc32_excluding;
 use crate::drt::{DirtyRegions, SPACEDRT_SIGNATURE};
 use crate::error::{Error, Result, format_err};
-use crate::format::{Resiliency, SLAB_SIZE, SpaceRole};
+use crate::format::{Provisioning, Resiliency, SLAB_SIZE, SpaceRole};
 use crate::gf16;
 use crate::io::ReadAt;
 use crate::journal::{ParityJournal, SPVDT_SIGNATURE};
@@ -75,6 +75,20 @@ pub struct HeaderNote {
 
 /// Where a byte of a copy is: (disk, physical slab, byte in the slab).
 pub type Place = (u64, u64, u64);
+
+/// What comparing the copies of the extent runs a dirty region log lists
+/// found ([`SpaceReader::check_dirty_regions`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MirrorCheck {
+    /// Extent runs the log lists.
+    pub listed: u64,
+    /// Bytes of them whose copies were read and compared.
+    pub compared: u64,
+    /// Space offsets where the copies differ (the first few).
+    pub differ: Vec<u64>,
+    /// The budget ran out before every listed run was compared.
+    pub incomplete: bool,
+}
 
 /// What checking the stripes a parity journal does not record as
 /// consistent found ([`SpaceReader::check_unclean_parity`]).
@@ -273,6 +287,33 @@ impl<D: ReadAt> Mapped<'_, D> {
             )));
         }
         Ok(true)
+    }
+
+    /// Whether the present copies of `len` bytes at mirror offset `offset`
+    /// (within one unit) differ; `None` when fewer than two can be read.
+    fn copies_differ(&self, offset: u64, len: usize) -> Result<Option<bool>> {
+        let l = &self.layout;
+        let loc = l.locate(offset);
+        let n = len.min(loc.contiguous as usize);
+        let (mut first, mut other) = (vec![0u8; n], vec![0u8; n]);
+        let mut read = 0;
+        for copy in 0..l.copies {
+            let Some((disk, slab)) = l.physical(loc.column, copy, loc.row) else {
+                continue;
+            };
+            let target = if read == 0 { &mut first } else { &mut other };
+            match self.pool.read_slab(disk, slab, loc.offset_in_slab, target) {
+                Ok(true) => {
+                    if read > 0 && other != first {
+                        return Ok(Some(true));
+                    }
+                    read += 1;
+                }
+                Ok(false) | Err(Error::Io(_)) => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Ok((read >= 2).then_some(false))
     }
 
     /// Whether the XOR parity of the stripe holding `loc` matches its data
@@ -631,6 +672,44 @@ impl<D: ReadAt> Mapped<'_, D> {
     }
 }
 
+/// Why fixed space `space` leaves a row of its size without data, if it
+/// does: Windows allocates every slab of a fixed space when it makes it, so
+/// that a row without an extent means extent records went missing (a thin
+/// space reads zeros there). Its own slab map, or that of each of its
+/// storage tiers over the tier's range; layouts that do not parse are
+/// reported where they are built.
+pub(crate) fn unmapped<D: ReadAt>(pool: &Pool<D>, space: &Space) -> Option<String> {
+    if space.info.provisioning != Provisioning::Fixed {
+        return None;
+    }
+    let gap = |s: &Space, bytes: u64| -> Option<String> {
+        let policy = s.info.policy.as_ref()?;
+        let base = s.info.range.map_or(0, |(start, _)| start);
+        let l = Layout::with_base(policy, &s.extents, base).ok()?;
+        let rows = bytes.div_ceil(SLAB_SIZE.saturating_mul(l.data_columns.max(1)));
+        let row = l.unmapped_row(rows)?;
+        Some(format!(
+            "the fixed space {:?} has no extent for row {row} of the {rows} of {} (a fixed space maps every \
+             row: its extent records are not all there)",
+            space.name(),
+            if s.id() == space.id() {
+                "its slab map".to_string()
+            } else {
+                format!("its tier {:?}", s.name())
+            }
+        ))
+    };
+    let tiers: Vec<&Space> = pool
+        .children(space.id())
+        .filter(|c| c.info.is_child && !c.extents.is_empty())
+        .collect();
+    if tiers.is_empty() {
+        gap(space, space.info.size?)
+    } else {
+        tiers.iter().find_map(|t| gap(t, t.info.range?.1))
+    }
+}
+
 impl<D: ReadAt> Mapped<'_, D> {
     /// A cache or journal whose header is zero on every copy was never
     /// written, unless its slot area (where Windows puts it, 8 KiB in)
@@ -775,6 +854,9 @@ impl<'p, D: ReadAt> SpaceReader<'p, D> {
             .map(|c| Mapped::new(pool, c))
             .collect::<Result<Vec<_>>>()
             .map_err(|e| (Part::Tiers, e))?;
+        if let Some(why) = unmapped(pool, space) {
+            return Err((Part::Layout, Error::Pool(why)));
+        }
         let journal = Self::open_journal(pool, space, &children, &mut notes)
             .map_err(|e| (Part::Journal, e))?
             .map(Arc::new);
@@ -1027,6 +1109,62 @@ impl<'p, D: ReadAt> SpaceReader<'p, D> {
     /// Dirty region tracking of a mirror space.
     pub fn dirty_regions(&self) -> Option<&DirtyRegions> {
         self.base.drt.as_deref()
+    }
+
+    /// Compares the copies of the extent runs the dirty region log lists
+    /// (written since the space was last disconnected; after a crash a
+    /// write may have reached some copies only), reading at most `budget`
+    /// bytes of each copy (`None`: no limit), the runs in the log's order;
+    /// what the write-back cache holds is read from the cache and not
+    /// compared. Where they differ, reads fail (see [`UncleanParity`]).
+    /// `None` for a space without a dirty region log, or a tiered one (its
+    /// listed runs are compared when read).
+    pub fn check_dirty_regions(&self, budget: Option<u64>) -> Result<Option<MirrorCheck>> {
+        let Some(drt) = self.base.drt.as_deref() else {
+            return Ok(None);
+        };
+        let l = &self.base.layout;
+        if self.is_tiered() || l.resiliency != Resiliency::Mirror {
+            return Ok(None);
+        }
+        let mut out = MirrorCheck {
+            listed: drt.dirty_runs() as u64,
+            ..MirrorCheck::default()
+        };
+        let mut left = budget.unwrap_or(u64::MAX);
+        const CHUNK: u64 = 1 << 20;
+        for slab in drt.runs() {
+            let Some(start) = slab.checked_mul(SLAB_SIZE).filter(|&s| s >= l.base && s < self.size) else {
+                continue;
+            };
+            let end = l.run_end_offset(l.locate(start).row).min(self.size);
+            let mut at = start;
+            while at < end {
+                if left == 0 {
+                    out.incomplete = true;
+                    return Ok(Some(out));
+                }
+                let mut n = (end - at).min(CHUNK).min(left).min(l.locate(at).contiguous);
+                // What the write-back cache holds is read from it, not from
+                // the copies (which may lack it yet).
+                if let Some((_, index)) = &self.cache {
+                    match index.lookup(at) {
+                        Lookup::Hit { len, .. } => {
+                            at += len.clamp(1, end - at);
+                            continue;
+                        }
+                        Lookup::Miss { len } => n = n.min(len.max(1)),
+                    }
+                }
+                if self.base.copies_differ(at, n as usize)? == Some(true) && out.differ.len() < 5 {
+                    out.differ.push(at);
+                }
+                out.compared += n;
+                left -= n;
+                at += n;
+            }
+        }
+        Ok(Some(out))
     }
 
     /// Parity journal of a parity space.

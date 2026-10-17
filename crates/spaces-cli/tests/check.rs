@@ -448,7 +448,7 @@ fn a_changed_ntfs_boot_copy_is_suspect_and_gated() {
         "{out}"
     );
     assert!(
-        out.contains("what      the copy of the NTFS boot sector in the partition's last sector"),
+        out.contains("what      the copy of the NTFS boot sector after the volume's last sector"),
         "{out}"
     );
     assert!(

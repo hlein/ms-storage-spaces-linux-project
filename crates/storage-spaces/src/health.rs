@@ -158,8 +158,20 @@ pub fn health<D: ReadAt>(pool: &Pool<D>) -> Result<Health> {
                 continue;
             }
         };
+        if let Some(why) = crate::reader::unmapped(pool, space) {
+            unknown.push((space.id(), why));
+            continue;
+        }
         for l in &layouts {
             r = r.and(l.redundancy(present, evacuating));
+        }
+        // Nothing allocated (a thin space never written): what its policy
+        // tolerates.
+        if layouts.is_empty() {
+            r.left = space.info.policy.as_ref().map(|p| match p.resiliency {
+                crate::format::Resiliency::Parity => p.redundancy,
+                _ => p.copies.saturating_sub(1),
+            });
         }
         let mut words = Vec::new();
         let health = match r.left {

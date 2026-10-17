@@ -14,8 +14,9 @@
 //!   failed. Other checks the undamaged pool makes and a mutant's report
 //!   skips are counted;
 //! * user: the same with what the guard reads of the spaces' contents
-//!   (partition tables, boot sectors, ReFS metadata): panics, slow cases
-//!   and skipped checks of listed structures count;
+//!   (partition tables, boot sectors, ReFS metadata): panics, slow cases,
+//!   skipped checks of listed structures and a partition table skipped
+//!   while the space is called healthy count;
 //! * missing disks: each disk away, and each pair of a pool of at most 8
 //!   disks: no space healthy, and a space the guard lets be read reads as
 //!   with every disk.
@@ -305,9 +306,10 @@ struct Tally {
     /// again).
     paused: Vec<String>,
     /// A check the report on the undamaged pool makes, skipped (whatever
-    /// the verdict), and whether the database still lists the hidden
-    /// structure it checks.
-    skipped: Vec<(String, bool)>,
+    /// the verdict), whether the database still lists the hidden structure
+    /// it checks, and whether it is the partition table of a space the
+    /// report calls healthy.
+    skipped: Vec<(String, bool, bool)>,
     panics: Vec<String>,
     slow: Vec<String>,
 }
@@ -338,6 +340,7 @@ fn check_mutant(devs: Vec<Dev>, bases: &[Base<'_>], user: bool, rng: &mut Rng, t
                 t.skipped.push((
                     format!("{what}: space {} {id} skipped ({})", b.id, report.verdict().as_str()),
                     listed(&pool, b.id, id) == Some(true),
+                    id == "space.partitions" && report.verdict() == Verdict::Healthy,
                 ));
             }
         }
@@ -484,7 +487,7 @@ fn report(name: &str, mode: &str, t: &Tally, copies: usize) {
         t.wrong.len(),
         t.unreadable.len(),
         t.skipped.len(),
-        t.skipped.iter().filter(|(_, listed)| *listed).count(),
+        t.skipped.iter().filter(|(_, listed, _)| *listed).count(),
         t.panics.len(),
         t.slow.len(),
         t.paused.len()
@@ -493,7 +496,7 @@ fn report(name: &str, mode: &str, t: &Tally, copies: usize) {
         .wrong
         .iter()
         .chain(&t.unreadable)
-        .chain(t.skipped.iter().map(|(f, _)| f))
+        .chain(t.skipped.iter().map(|(f, ..)| f))
         .chain(&t.panics)
         .chain(&t.slow)
         .chain(&t.paused)
@@ -521,7 +524,14 @@ fn damage_where_the_guard_calls_a_space_healthy_does_not_change_it() {
             if !user && copies >= 3 {
                 failures.extend(t.wrong.iter().cloned());
             }
-            failures.extend(t.skipped.iter().filter(|(_, listed)| *listed).map(|(f, _)| f.clone()));
+            // A partition table that vanished from a space called healthy:
+            // what the user mode damages is the space's own table.
+            failures.extend(
+                t.skipped
+                    .iter()
+                    .filter(|(_, listed, table)| *listed || (user && *table))
+                    .map(|(f, ..)| f.clone()),
+            );
         }
     }
     assert!(failures.is_empty(), "{failures:#?}");

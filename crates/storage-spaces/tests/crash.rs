@@ -82,3 +82,30 @@ fn crashed_pools_read_like_windows_recovers_them() {
         assert!(refused * 100 <= want.len(), "{name}: {refused} MiB refused");
     }
 }
+
+/// The guard of `spaces attach` (its default read budget) on the crashed
+/// mirrors: the copies of a run the dirty region log lists differ where a
+/// write reached one disk only, and the reads there fail, so the space is
+/// suspect (1.2.2: healthy, "their copies are compared when read").
+#[test]
+fn crashed_mirrors_are_suspect() {
+    use storage_spaces::guard::{self, Options};
+    use storage_spaces::report::{Status, Verdict};
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../testdata/crash");
+    for name in ["crashmirror", "crashmirrorwc"] {
+        let dir = root.join(name);
+        let files: Vec<File> = (0..)
+            .map_while(|i| File::open(dir.join(format!("disk{i}.img"))).ok())
+            .collect();
+        if files.is_empty() {
+            eprintln!("{} missing, skipped", dir.display());
+            continue;
+        }
+        let pool = Pool::open(files).unwrap();
+        let space = pool.find_space(name).unwrap();
+        let r = guard::space_report(&pool, space, &[], &Options::default(), &mut guard::ntfs_hook);
+        let drl = r.checks.iter().find(|c| c.id == "space.drl").unwrap();
+        assert_eq!(drl.status, Status::Suspect, "{}", r.to_text());
+        assert_eq!(r.verdict(), Verdict::Suspect, "{}", r.to_text());
+    }
+}

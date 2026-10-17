@@ -48,5 +48,7 @@ pub use error::{Error, Result};
 pub use guid::Guid;
 pub use layout::Condition;
 pub use pool::{Issue, Member, PhysicalDisk, Pool, Space};
-pub use reader::{HeaderCopy, HeaderNote, OpenOptions, ParityCheck, Part, SpaceReader, SpaceStream, UncleanParity};
+pub use reader::{
+    HeaderCopy, HeaderNote, MirrorCheck, OpenOptions, ParityCheck, Part, SpaceReader, SpaceStream, UncleanParity,
+};
 pub use writer::SpaceWriter;

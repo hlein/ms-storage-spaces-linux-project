@@ -88,36 +88,6 @@ pub fn read_gpt<D: ReadAt + ?Sized>(dev: &D, sector: u64) -> Result<Option<Vec<P
     Ok(Some(parts))
 }
 
-/// Reads the primary entries of an MBR partition table (no extended partitions).
-pub fn read_mbr<D: ReadAt + ?Sized>(dev: &D, sector: u64) -> Result<Option<Vec<Partition>>> {
-    let size = dev.size()?;
-    if size < 512 {
-        return Ok(None);
-    }
-    let mbr = read_vec(dev, 0, 512)?;
-    if mbr[510..512] != [0x55, 0xaa] {
-        return Ok(None);
-    }
-    let mut parts = Vec::new();
-    for i in 0..4 {
-        let e = &mbr[446 + i * 16..462 + i * 16];
-        let kind = e[4];
-        let start = u32::from_le_bytes(e[8..12].try_into().unwrap()) as u64;
-        let count = u32::from_le_bytes(e[12..16].try_into().unwrap()) as u64;
-        if kind == 0 || count == 0 || kind == 0xee || (start + count) * sector > size {
-            continue;
-        }
-        parts.push(Partition {
-            number: i as u32 + 1,
-            offset: start * sector,
-            length: count * sector,
-            kind: format!("mbr:{kind:#04x}"),
-            name: String::new(),
-        });
-    }
-    Ok((!parts.is_empty()).then_some(parts))
-}
-
 /// Fails unless every partition lies inside a device of `size` bytes and
 /// none overlaps another (what device-mapper partitions are made of).
 pub fn check_partitions(parts: &[Partition], size: u64) -> Result<()> {
@@ -147,14 +117,6 @@ pub fn check_partitions(parts: &[Partition], size: u64) -> Result<()> {
         }
     }
     Ok(())
-}
-
-/// Lists the partitions of a device: GPT first, then MBR.
-pub fn read_partitions<D: ReadAt + ?Sized>(dev: &D, sector: u64) -> Result<Vec<Partition>> {
-    if let Some(parts) = read_gpt(dev, sector)? {
-        return Ok(parts);
-    }
-    Ok(read_mbr(dev, sector)?.unwrap_or_default())
 }
 
 /// Finds the Storage Spaces partition on a whole disk, or accepts a device
@@ -211,7 +173,7 @@ mod tests {
 
     #[test]
     fn reads_gpt_without_protective_mbr() {
-        let parts = read_partitions(&gpt_4k(), 4096).unwrap();
+        let parts = read_gpt(&gpt_4k(), 4096).unwrap().unwrap();
         assert_eq!(
             parts,
             [Partition {
@@ -246,7 +208,8 @@ mod tests {
         d[511] = 0xaa;
         d[446 + 8..446 + 12].copy_from_slice(&10u32.to_le_bytes());
         d[446 + 12..446 + 16].copy_from_slice(&50u32.to_le_bytes());
-        let parts = read_partitions(&MemDevice(d), 512).unwrap();
+        // (The MBR is read where the guard reads partition tables.)
+        let parts = crate::guard::partitions(&MemDevice(d), 512 * 100, 512);
         assert_eq!(
             (parts[0].offset, parts[0].length, parts[0].kind.as_str()),
             (5120, 25600, "mbr:0x07")

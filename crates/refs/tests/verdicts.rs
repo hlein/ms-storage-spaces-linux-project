@@ -32,6 +32,20 @@ const NOT_HEALTHY: &[(&str, Verdict, &str, &str)] = &[
         "space.cache",
         "disks pulled while Windows wrote: a cache slot reached one copy only",
     ),
+    // (The copies of crashmirror and crashmirrorwc differ beyond the
+    // budget of this test: tests/crash.rs checks them with the default.)
+    (
+        "snapshots/m5thinm/s1",
+        Verdict::Suspect,
+        "space.drl",
+        "taken while a write was in flight: it reached one copy of the mirror only",
+    ),
+    (
+        "snapshots/m5stale/s4",
+        Verdict::Suspect,
+        "space.drl",
+        "a disk back after it missed writes, before Windows repaired the space: the copies differ",
+    ),
     (
         "stale/stale3",
         Verdict::Degraded,

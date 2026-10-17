@@ -403,7 +403,7 @@ fn main() -> Result<()> {
             degraded,
             force,
         } => {
-            let pool = open_pool(&devices)?;
+            let pool = open_pool_shared(&devices)?;
             let space = find_user_space(&pool, &space)?;
             check::require(&pool, &devices, space, false, degraded, force)?;
             export(&pool, space, &output)
@@ -420,7 +420,7 @@ fn main() -> Result<()> {
             let pool = if rw {
                 open_pool_rw(&devices)?
             } else {
-                open_pool_exclusive(&devices)?
+                open_pool_shared(&devices)?
             };
             let space = find_user_space(&pool, &space)?;
             check::require(&pool, &devices, space, rw, degraded, force)?;
@@ -438,7 +438,7 @@ fn main() -> Result<()> {
             let pool: &'static Pool<File> = Box::leak(Box::new(if rw {
                 open_pool_rw(&devices)?
             } else {
-                open_pool_exclusive(&devices)?
+                open_pool_shared(&devices)?
             }));
             let found = find_user_space(pool, &space)?;
             check::require(pool, &devices, found, rw, degraded, force)?;
@@ -470,7 +470,7 @@ fn main() -> Result<()> {
             degraded,
             force,
         } => {
-            let pool: &'static Pool<File> = Box::leak(Box::new(open_pool_exclusive(&devices)?));
+            let pool: &'static Pool<File> = Box::leak(Box::new(open_pool_shared(&devices)?));
             let found = find_user_space(pool, &space)?;
             check::require(pool, &devices, found, false, degraded, force)?;
             let reader = Box::leak(Box::new(open_space(pool, found.id())?));
@@ -583,54 +583,173 @@ fn main() -> Result<()> {
 }
 
 fn open_pool(paths: &[PathBuf]) -> Result<Pool<File>> {
-    open_pool_with(paths, false)
+    open_pool_mode(paths, Hold::Read, false)
 }
 
-/// Opens the members exclusively (O_EXCL on block devices), so that nothing
-/// else can mount or assemble them while a serving process uses them.
-fn open_pool_exclusive(paths: &[PathBuf]) -> Result<Pool<File>> {
-    open_pool_with(paths, true)
+/// Opens the members to serve or export a space read-only: shared with the
+/// servers of the pool's other spaces, not with its writers.
+fn open_pool_shared(paths: &[PathBuf]) -> Result<Pool<File>> {
+    open_pool_mode(paths, Hold::Shared, false)
 }
 
 /// Opens the members for reading and writing, exclusively (for `--rw`).
 fn open_pool_rw(paths: &[PathBuf]) -> Result<Pool<File>> {
-    open_pool_mode(paths, true, true)
+    open_pool_mode(paths, Hold::Exclusive, true)
 }
 
-fn open_pool_with(paths: &[PathBuf], exclusive: bool) -> Result<Pool<File>> {
-    open_pool_mode(paths, exclusive, false)
+/// How a process holds the members of a pool it opens.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Hold {
+    /// Reading them for a moment (`info`, `check`): no lock.
+    Read,
+    /// Serving or exporting a space read-only: a shared lock on every
+    /// member, which the servers of the pool's other spaces share and its
+    /// writers do not get.
+    Shared,
+    /// Writing them (`--rw` servers, management): `O_EXCL` on block devices
+    /// (also through a symlink), which fails while they are mounted,
+    /// assembled or held by device-mapper, and an exclusive lock on every
+    /// member, which fails while another process serves or writes them.
+    Exclusive,
 }
 
-/// Opens a member. Exclusively: a block device (also through a symlink)
-/// with O_EXCL, which fails while it is mounted, assembled or opened so by
-/// another process, an image file with an exclusive lock that other
-/// `spaces` processes opening it exclusively respect.
-pub(crate) fn open_member(p: &Path, write: bool, exclusive: bool) -> Result<File> {
+/// Opens a member, held as `hold` says.
+pub(crate) fn open_member(p: &Path, write: bool, hold: Hold) -> Result<File> {
     let mut options = std::fs::OpenOptions::new();
     options.read(true).write(write);
     #[cfg(target_os = "linux")]
     {
         use std::os::unix::fs::{FileTypeExt, OpenOptionsExt};
-        if exclusive && std::fs::metadata(p).is_ok_and(|m| m.file_type().is_block_device()) {
+        if hold == Hold::Exclusive && std::fs::metadata(p).is_ok_and(|m| m.file_type().is_block_device()) {
             options.custom_flags(libc::O_EXCL);
         }
     }
-    let file = options
-        .open(p)
-        .with_context(|| format!("cannot open {}", p.display()))?;
-    if exclusive && file.metadata()?.is_file() {
-        file.try_lock().map_err(|e| match e {
-            std::fs::TryLockError::WouldBlock => anyhow::anyhow!("{} is in use by another process", p.display()),
-            std::fs::TryLockError::Error(e) => anyhow::Error::new(e).context(format!("cannot lock {}", p.display())),
-        })?;
-    }
+    let file = match options.open(p) {
+        Ok(f) => f,
+        Err(e) if e.raw_os_error() == Some(libc::EBUSY) => {
+            bail!("{} is in use by {}", p.display(), kernel_holders(p))
+        }
+        Err(e) => return Err(anyhow::Error::new(e).context(format!("cannot open {}", p.display()))),
+    };
+    let locked = match hold {
+        Hold::Read => return Ok(file),
+        Hold::Shared => file.try_lock_shared(),
+        Hold::Exclusive => file.try_lock(),
+    };
+    locked.map_err(|e| match e {
+        std::fs::TryLockError::WouldBlock => anyhow::anyhow!("{} is in use by {}", p.display(), lock_holders(&file)),
+        std::fs::TryLockError::Error(e) => anyhow::Error::new(e).context(format!("cannot lock {}", p.display())),
+    })?;
     Ok(file)
 }
 
-fn open_pool_mode(paths: &[PathBuf], exclusive: bool, write: bool) -> Result<Pool<File>> {
+/// The processes that hold a lock on `file` (from /proc/locks), as people
+/// read them: "pid 1234 (spaces serve-nbd ...)".
+fn lock_holders(file: &File) -> String {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if let (Ok(m), Ok(locks)) = (file.metadata(), std::fs::read_to_string("/proc/locks")) {
+            let dev = m.dev();
+            let (major, minor) = (
+                ((dev >> 8) & 0xfff) | ((dev >> 32) & !0xfff),
+                (dev & 0xff) | ((dev >> 12) & !0xff),
+            );
+            let key = format!("{major:02x}:{minor:02x}:{}", m.ino());
+            let mut pids: Vec<u32> = locks
+                .lines()
+                .filter_map(|line| {
+                    // "1: FLOCK  ADVISORY  READ  1234 08:02:5678 0 EOF", a
+                    // waiter with "->" after the number.
+                    let f: Vec<&str> = line.split_whitespace().filter(|w| *w != "->").collect();
+                    (f.get(1) == Some(&"FLOCK") && f.get(5) == Some(&key.as_str()))
+                        .then(|| f.get(4)?.parse().ok())
+                        .flatten()
+                })
+                .filter(|&pid| pid != std::process::id())
+                .collect();
+            pids.sort_unstable();
+            pids.dedup();
+            if !pids.is_empty() {
+                return pids.iter().map(|&pid| process(pid)).collect::<Vec<_>>().join(", ");
+            }
+        }
+    }
+    let _ = file;
+    "another process".into()
+}
+
+/// What holds block device `p` in the kernel (device-mapper tables, from
+/// /sys), as people read it.
+fn kernel_holders(p: &Path) -> String {
+    let held: Vec<String> = std::fs::canonicalize(p)
+        .ok()
+        .and_then(|real| Some(real.file_name()?.to_str()?.to_string()))
+        .and_then(|name| {
+            let dir = Path::new("/sys/class/block").join(&name).join("holders");
+            std::fs::read_dir(dir).ok()
+        })
+        .into_iter()
+        .flatten()
+        .filter_map(|e| {
+            let holder = e.ok()?.file_name().to_string_lossy().into_owned();
+            let dm = std::fs::read_to_string(format!("/sys/block/{holder}/dm/name")).ok();
+            Some(match dm {
+                Some(name) => format!("device-mapper {} ({holder})", name.trim()),
+                None => holder,
+            })
+        })
+        .collect();
+    if held.is_empty() {
+        "the kernel (mounted, assembled or opened exclusively)".into()
+    } else {
+        held.join(", ")
+    }
+}
+
+/// Process `pid` as people read it: its program, command and space, and
+/// its systemd unit: "pid 1234 (spaces serve-ublk --space data, unit
+/// ss-....service)".
+fn process(pid: u32) -> String {
+    let args: Vec<String> = std::fs::read(format!("/proc/{pid}/cmdline"))
+        .unwrap_or_default()
+        .split(|&b| b == 0)
+        .filter(|a| !a.is_empty())
+        .map(|a| String::from_utf8_lossy(a).into_owned())
+        .collect();
+    let Some((program, rest)) = args.split_first() else {
+        return format!("pid {pid}");
+    };
+    let mut what = vec![
+        Path::new(program)
+            .file_name()
+            .map_or(program.clone(), |n| n.to_string_lossy().into_owned()),
+    ];
+    what.extend(rest.first().filter(|a| !a.starts_with(['-', '/'])).cloned());
+    if let Some(i) = rest.iter().position(|a| a == "--space" || a == "-s") {
+        what.extend(rest.get(i + 1).map(|v| format!("--space {v}")));
+    }
+    let unit = std::fs::read_to_string(format!("/proc/{pid}/cgroup"))
+        .ok()
+        .and_then(|c| {
+            c.lines().find_map(|l| {
+                l.rsplit('/')
+                    .next()
+                    .filter(|u| u.ends_with(".service") || u.ends_with(".scope"))
+                    .map(str::to_owned)
+            })
+        });
+    let mut line = what.join(" ");
+    if let Some(unit) = unit {
+        line = format!("{line}, unit {unit}");
+    }
+    format!("pid {pid} ({})", storage_spaces::report::printable(&line))
+}
+
+fn open_pool_mode(paths: &[PathBuf], hold: Hold, write: bool) -> Result<Pool<File>> {
     let files = paths
         .iter()
-        .map(|p| open_member(p, write, exclusive))
+        .map(|p| open_member(p, write, hold))
         .collect::<Result<Vec<_>>>()?;
     let pool = Pool::open(files)?;
     for w in &pool.warnings {

@@ -4,6 +4,14 @@
 
 ### Fixes
 
+* A pool's spaces can be attached at once. Every server held the pool's
+  disks exclusively, also read-only, so that a pool's second space a server
+  serves (mirror, parity, tiered or cached spaces, or any beside a simple
+  space attached through device-mapper) failed to attach, "in use by another
+  process". Read-only servers and `spaces export` now share the disks; a
+  `--rw` server and the management commands still need them alone, and
+  their refusal names what holds them (a device-mapper device, or the
+  `spaces` process and its unit).
 * An extent record whose count of slabs is 0 (which Windows never writes:
   no pool of the corpus has one) left its space healthy, reading zeros
   where the extent belonged: the plausible values of 1.2.2 bound the count

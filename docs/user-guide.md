@@ -22,7 +22,7 @@ disks are never written, unless a space is attached read-write
 | Storage tiers, mirror-accelerated parity | read |
 | 512-byte and 4 KiB logical sectors, interleave 16 KiB to 1 MiB | read |
 | Pools after a crash or power loss | read; parity stripes and mirror rows left inconsistent by writes in flight are refused (see below) |
-| Several spaces per pool, fragmented and extended spaces | read; through servers one at a time (see below) |
+| Several spaces per pool, fragmented and extended spaces | read, every space of a pool at once (see below) |
 | Member disks with 512-byte, 512e and 4Kn sectors | read |
 | Pools after a disk was retired, replaced or removed | read |
 | Pools created by Windows 8/10/Server | not supported |
@@ -139,13 +139,15 @@ logical sector size matches the disks, and ublk otherwise. ublk keeps
 mirror and parity spaces readable when a disk fails while mounted; the
 device-mapper mapping reads one copy only.
 
-Until 1.3 a pool's spaces share its disks badly: a space served by a
-process (ublk, nbd, fuse: mirror and parity spaces, and the simple ones
-device-mapper does not serve, see above and Writing) holds the pool's
-disks exclusively, so that another space of that pool, through any
-backend, fails to attach ("in use by another process") while it is
-attached; device-mapper spaces of one pool attach side by side.
-`spaces export` and `spaces check` are not affected.
+Every space of a pool can be attached at once, through device-mapper and
+servers side by side: a space served read-only by a process (ublk, nbd,
+fuse: mirror and parity spaces, and the simple ones device-mapper does not
+serve, see above and Writing) shares the pool's disks with the others,
+and so does `spaces export`. What writes the disks needs them alone: `attach
+--rw` through a server, and the management commands, refuse while another
+space of the pool is attached and name what holds the disks (until 1.3 the
+first server-backed space of a pool held its disks exclusively, and the
+pool's other spaces failed to attach, "in use by another process").
 
 | Backend | Requirement |
 |---|---|
@@ -232,8 +234,9 @@ devices or image files) and:
 
 * computes a plan and prints it; nothing is written without `--yes`;
 * opens the disks exclusively: a disk that is mounted, attached (also by
-  `spaces attach`) or used by another program fails with "busy" or "in
-  use"; detach the pool first;
+  `spaces attach`) or used by another program fails with "in use by" and
+  what holds it (a device-mapper device, a `spaces` server and its unit, or
+  the kernel); detach the pool first;
 * works on clean pools only: every disk present, no copy out of date,
   every record understood. Attach a pool that is not clean to Windows
   first, or see [Replacing a failed disk](#replacing-a-failed-disk);
@@ -883,10 +886,13 @@ overflow checks, and its parsers are fuzzed (`docs/security.md`).
   behind; remove it with `dmsetup remove <name>`.
 * `backend ublk is not available`: load the module (`modprobe ublk_drv`) or
   use `--backend nbd`.
-* `cannot open /dev/...: Device or resource busy`: another process (a mount,
-  mdadm, LVM, a second `spaces` instance) holds the disk.
-* `... is in use by another process` (an image file): another `spaces`
-  process has it open for writing (`serve-ublk --rw`, a management command).
+* `... is in use by device-mapper ss-...` or `... by the kernel`: the disk is
+  held by an attached space of its pool, or mounted, or assembled by mdadm or
+  LVM; detach or stop that first.
+* `... is in use by pid N (spaces serve-ublk --space NAME, unit ...)`:
+  another `spaces` process serves or writes the pool (a server of one of its
+  spaces, `serve-ublk --rw`, a management command); a writer waits for every
+  server of the pool, and a server for a writer.
 * `the pool is not in a clean state`: a management command was given a pool
   with a missing disk or out-of-date copies; see
   [Replacing a failed disk](#replacing-a-failed-disk) or attach it to

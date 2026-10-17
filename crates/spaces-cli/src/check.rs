@@ -51,7 +51,7 @@ pub fn open_pool(paths: &[PathBuf]) -> Result<Pool<File>> {
     let opened = isolate::isolated(deadline(), move || -> Result<Pool<File>> {
         let files = owned
             .iter()
-            .map(|p| crate::open_member(p, false, false))
+            .map(|p| crate::open_member(p, false, crate::Hold::Read))
             .collect::<Result<Vec<File>>>()?;
         Ok(Pool::open(files)?)
     });

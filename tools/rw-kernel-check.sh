@@ -12,11 +12,12 @@
 #      reached the images), and check that the verification pattern outside
 #      the fio range is intact
 # POOLS overrides the directory of the pools (default /srv/spaces/pools).
+# SPACES overrides the spaces binary (default target/release/spaces).
 # Usage: sudo tools/rw-kernel-check.sh POOL BACKEND [MIB] [START]
 set -euo pipefail
 cd "$(dirname "$0")/.."
 pool=$1 backend=$2 mib=${3:-512} start_mib=${4:-256}
-spaces=$PWD/target/release/spaces
+spaces=${SPACES:-$PWD/target/release/spaces}
 src=${POOLS:-/srv/spaces/pools}/$pool
 work=/srv/spaces/work/$pool-$backend
 space=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1],encoding="utf-8-sig"))["space"]["name"])' "$src/manifest.json")

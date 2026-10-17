@@ -53,6 +53,11 @@ fn open_space<'p>(pool: &'p Pool<File>, id: u64) -> storage_spaces::Result<stora
     pool.open_space_with(id, OPEN_OPTIONS.get().copied().unwrap_or_default())
 }
 
+/// Opens a space for writing with the options given on the command line.
+fn open_space_rw<'p>(pool: &'p Pool<File>, id: u64) -> storage_spaces::Result<storage_spaces::SpaceWriter<'p, File>> {
+    pool.open_space_rw_with(id, OPEN_OPTIONS.get().copied().unwrap_or_default())
+}
+
 /// Command-line arguments that serving processes inherit from `attach`.
 pub(crate) fn inherited_args() -> Vec<String> {
     match OPEN_OPTIONS.get().map(|o| o.unclean_parity) {
@@ -444,7 +449,7 @@ fn main() -> Result<()> {
             check::require(pool, &devices, found, rw, degraded, force)?;
             let id = found.id();
             let writer: Option<&'static storage_spaces::SpaceWriter<'static, File>> = if rw {
-                Some(Box::leak(Box::new(pool.open_space_rw(id)?)))
+                Some(Box::leak(Box::new(open_space_rw(pool, id)?)))
             } else {
                 None
             };
@@ -819,13 +824,13 @@ fn write_pattern(
             .find_space(space)
             .map(|s| s.id())
             .ok_or_else(|| anyhow::anyhow!("no space {space:?}"))?;
-        let writer = pool.open_space_rw(id)?;
+        let writer = pool.open_space_rw_with(id, OPEN_OPTIONS.get().copied().unwrap_or_default())?;
         write_pattern_with(&writer, offset, length, tag, destage)?;
         eprintln!("member writes: {}", writes.load(std::sync::atomic::Ordering::SeqCst));
         return Ok(());
     }
     let pool = open_pool_rw(devices)?;
-    let writer = pool.open_space_rw(find_space(&pool, space)?.id())?;
+    let writer = open_space_rw(&pool, find_space(&pool, space)?.id())?;
     write_pattern_with(&writer, offset, length, tag, destage)
 }
 
@@ -1245,7 +1250,7 @@ fn serve_nbd(
     rw: bool,
 ) -> Result<()> {
     let writer = if rw {
-        Some(pool.open_space_rw(space.id())?)
+        Some(open_space_rw(pool, space.id())?)
     } else {
         None
     };

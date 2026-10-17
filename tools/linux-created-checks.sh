@@ -9,15 +9,22 @@
 #   read-only, the pattern intact;
 #   tools/rw-ntfs-check.sh with ntfs-3g on the mirror and the parity space,
 #   the work copies (images and files.json) kept for a Windows round trip.
+# The kind recycled is a thin parity space on slabs that held another
+# space's data (a simple space of 6 GiB filled with a pattern of its own and
+# deleted first): its stripes never written do not match their parity until
+# the writer makes them (1.2.2 left them so, and the space was suspect after
+# its first session).
 # Usage: sudo tools/linux-created-checks.sh [KIND...]
-#   (kinds: simple mirror parity thin; default all)
+#   (kinds: simple mirror parity thin recycled; default all)
 set -euo pipefail
 cd "$(dirname "$0")/.."
-spaces=$PWD/target/release/spaces
+# SPACES: the spaces binary to check (default target/release/spaces).
+export SPACES=${SPACES:-$PWD/target/release/spaces}
+spaces=$SPACES
 export POOLS=/srv/spaces/work/lnxpools
 pattern_mib=256
 kinds=("$@")
-((${#kinds[@]})) || kinds=(simple mirror parity thin)
+((${#kinds[@]})) || kinds=(simple mirror parity thin recycled)
 make_pool() {
   local kind=$1 dir=$POOLS/lnx_$1
   rm -rf -- "${dir:?}"
@@ -29,11 +36,23 @@ make_pool() {
     mirror) args=(--resiliency mirror --size 2G) ;;
     parity) args=(--resiliency parity --size 2G) ;;
     thin) args=(--resiliency mirror --size 4G --thin) ;;
+    recycled) args=(--resiliency parity --size 4G --thin) ;;
   esac
   "$spaces" pool create --name "ss-lnx_$kind" --yes "${disks[@]}" | tail -1
+  if [[ $kind == recycled ]]; then
+    "$spaces" space create --name old --resiliency simple --size 6G --yes "${disks[@]}" | tail -1
+    "$spaces" write-pattern "${disks[@]}" --space old --offset 0 --length $((6 << 30)) --tag old | tail -1
+    "$spaces" space delete --space old --yes "${disks[@]}" | tail -1
+  fi
   "$spaces" space create --name "lnx_$kind" "${args[@]}" --yes "${disks[@]}" | tail -1
   "$spaces" write-pattern "${disks[@]}" --space "lnx_$kind" --offset 0 --length $((pattern_mib << 20)) \
     --tag "lnx_$kind" --destage | tail -1
+  # Healthy after its first session (1.2.2 left the recycled one suspect).
+  if ! "$spaces" check "${disks[@]}" >/dev/null; then
+    "$spaces" check "${disks[@]}" | grep -vE '^ +(ok|info) ' >&2 || true
+    echo "lnx_$kind: not healthy after its first session" >&2
+    exit 1
+  fi
   python3 - "$dir/manifest.json" "$kind" $((pattern_mib << 20)) <<'PY'
 import json, sys
 path, kind, size = sys.argv[1], sys.argv[2], int(sys.argv[3])
@@ -48,7 +67,7 @@ for kind in "${kinds[@]}"; do
   backends=(ublk nbd)
   [[ $kind == simple ]] && backends+=(dm)
   for b in "${backends[@]}"; do tools/rw-kernel-check.sh "lnx_$kind" "$b" 512 "$pattern_mib" | tail -3; done
-  if [[ $kind == mirror || $kind == parity ]]; then
+  if [[ $kind == mirror || $kind == parity || $kind == recycled ]]; then
     tools/rw-ntfs-check.sh "lnx_$kind" ntfs-3g | tail -3
   fi
 done

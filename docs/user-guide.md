@@ -113,7 +113,8 @@ of a pool (a name two spaces share, or a name that is another space's GUID
 or id) is refused, with the spaces it names; give the id of the one meant.
 `--pool` takes a pool's GUID or name; a name two pools share is refused
 likewise, naming them by their GUIDs. `spaces detach <space>` naming no
-attached space fails.
+attached space fails, and one naming attached spaces of two pools (pools
+of one name) is refused, naming them: give the GUID or device-mapper name.
 
 `attach` checks every space first, as `spaces check` does, and attaches
 only healthy spaces without being asked; a space that is not healthy is
@@ -192,14 +193,17 @@ allocated (Windows does not clear it either), so the parts of a new row not
 written yet read whatever the disk held there. Thin spaces with other
 allocation units can be written only where they are allocated; writes
 elsewhere fail with an I/O error. When the pool has no free slab left, so do
-writes into rows not allocated yet. In a new row of a thin parity space, the
-stripes not written yet hold whatever the disks held and their parity does
-not match it; the parity journal lists them as not consistent, as it does
-for rows Windows allocates, so `spaces` refuses to read them (I/O error)
-unless `--unclean-parity data` is given (for reading: writing needs a
-healthy space, which a space with such stripes is not). File systems do
-not read what they have not written, but a copy of the whole device
-does.
+writes into rows not allocated yet. In a parity space the stripes not
+written yet hold whatever the disks held too (another space's data, where
+one was deleted), and their parity need not match it. The parity journal
+lists the stripes of an extent run (an allocation unit of every column:
+256 MiB for thin spaces) when a write first reaches it, as Windows does, and
+those never written as not consistent, which readers check; so before the
+first write into a run `spaces` reads the run once and writes the parity of
+every stripe that does not match. In 1.2.2 it did not, and a parity space
+written on slabs a deleted space had used was suspect after its first
+session and could not be written again. Writers read as
+`--unclean-parity` says, as readers do.
 
 Discards (`fstrim`, the `discard` mount option, `blkdiscard`) give the rows
 of thin simple and mirror spaces back to the pool once they are discarded

@@ -758,7 +758,17 @@ impl<D: ReadAt> Pool<D> {
     where
         D: WriteAt,
     {
-        SpaceWriter::new(self, id)
+        self.open_space_rw_with(id, OpenOptions::default())
+    }
+
+    /// Opens a space for writing, its reads made with `options` (what they
+    /// return where an unclean shutdown left stripes or mirror copies that
+    /// do not agree, [`crate::reader::UncleanParity`]).
+    pub fn open_space_rw_with(&self, id: u64, options: OpenOptions) -> Result<SpaceWriter<'_, D>>
+    where
+        D: WriteAt,
+    {
+        SpaceWriter::new(self, id, options)
     }
 
     /// Writes into a physical slab. Returns `false` if the disk is not present.

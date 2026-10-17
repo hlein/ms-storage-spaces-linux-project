@@ -1052,6 +1052,23 @@ take the newer. Entries whose run list does not fit into a slot are written
 as bitmaps (state 1); where neither fits, the whole run is recorded as not
 consistent.
 
+A run's first entry covers every stripe of the run, those never written as
+not consistent (above), and readers check those. A new space gets its slabs
+as they are ("Creating a space"): where another space's data was, a stripe
+never written does not match its parity. In 1.2.2 a parity space `spaces`
+wrote on such slabs was therefore suspect after its first session, and
+could not be written again, its destaging refused when it read the rest of
+such a stripe (audit 2026-10-16, W3). Before `spaces` first lists a run, it
+reads every stripe of the run once and writes the parity units that do not
+match the XOR of the data, so that those stripes hold what the slabs held
+and match their parity (test `a_parity_space_on_recycled_slabs_is_written_again`).
+A thin parity space written so on the slabs of a deleted space
+(`tools/linux-created-checks.sh recycled`: a pattern, fio, NTFS by ntfs-3g)
+attaches to Windows 11 healthy, before and after `Repair-VirtualDisk`;
+chkdsk finds nothing and every file reads as written (2026-10-18). How
+Windows settles such stripes itself is not known: the corpus pools sit on
+zeroed slabs.
+
 The newest entry per run wins. After a clean shutdown the runs whose
 stripes were all written are state 3 (or all-set bitmaps); stripes never
 written stay not consistent, and so do stripes whose data the write-back

@@ -53,7 +53,17 @@
   pool the scrub refuses: a warning, a record not understood): it is
   suspect now. A pool database that names no disk keeping a copy of it,
   read from devices that keep one, is suspect, not skipped.
-* `spaces detach NAME` naming no attached space exited 0; it fails now.
+* `spaces detach NAME` naming no attached space exited 0; it fails now. A
+  name that spaces of two pools share (pools of one name) is refused,
+  naming them; 1.2.2 detached both.
+* A parity space written on slabs that held another space's data (one
+  deleted before) was suspect after the first session that wrote it, and
+  could not be written again: the stripes of an extent run never written
+  hold that data, which their parity does not match, and the parity
+  journal lists them as not consistent once a write reaches the run. The
+  writer now makes them match their parity before it first lists a run
+  (reading the run once). Writers also read as `--unclean-parity` says;
+  1.2.2's refused whatever it said.
 
 ### Testing
 

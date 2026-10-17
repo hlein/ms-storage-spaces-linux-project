@@ -36,7 +36,12 @@
 //! flushed, recorded as consistent) and removed from the cache with
 //! tombstone entries, flushed before their blocks are handed out again. At
 //! every point either a stripe on disk matches its parity or the cache holds
-//! all of its data: the write hole stays closed.
+//! all of its data: the write hole stays closed. Before the journal first
+//! lists an extent run, every stripe of the run is made to match its parity
+//! (read once, parity written where it does not match): the first entry
+//! lists the run's stripes never written as not consistent, which readers
+//! check, and a new space's slabs hold whatever another space left there.
+//! Reads follow the options the writer was opened with (`--unclean-parity`).
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Mutex, RwLock, RwLockReadGuard};
@@ -142,14 +147,14 @@ struct CacheLog {
 }
 
 impl<'p, D: WriteAt> SpaceWriter<'p, D> {
-    pub(crate) fn new(pool: &'p Pool<D>, id: u64) -> Result<Self> {
+    pub(crate) fn new(pool: &'p Pool<D>, id: u64, options: OpenOptions) -> Result<Self> {
         if let Some(why) = pool.write_refusal(id)? {
             return Err(Error::Unsupported(format!(
                 "space {id} cannot be opened for writing: {why}"
             )));
         }
         pool.update_stale_copies()?;
-        let reader = pool.open_space_with(id, OpenOptions::default())?;
+        let reader = pool.open_space_with(id, options)?;
         let layout = reader.layout();
         let (mut drt, mut journal) = (None, None);
         if let Some(log) = reader
@@ -222,7 +227,7 @@ impl<'p, D: WriteAt> SpaceWriter<'p, D> {
         if writer.reader.cache().is_some_and(|c| c.cached_chunks() > 0) {
             writer.destage()?;
             // The reader's view of the cache is out of date now.
-            writer.reader = pool.open_space_with(id, OpenOptions::default())?;
+            writer.reader = pool.open_space_with(id, options)?;
         }
         Ok(writer)
     }
@@ -746,6 +751,18 @@ impl<'p, D: WriteAt> SpaceWriter<'p, D> {
                 .1
                 .push(stripe);
         }
+        // A run the journal lists for the first time is listed whole, its
+        // stripes never written as not consistent: they must match their
+        // parity first.
+        let mut settled = false;
+        for (&run_start, (run_stripes, _)) in &by_run {
+            if !writer.is_listed(run_start) {
+                settled |= self.settle_run(&layout, run_start, *run_stripes)?;
+            }
+        }
+        if settled {
+            pool.flush_members()?;
+        }
         let mut marked = false;
         for (&run_start, (run_stripes, list)) in &by_run {
             if !writer.is_listed(run_start) || list.iter().any(|&s| writer.is_consistent(run_start, *run_stripes, s)) {
@@ -776,6 +793,52 @@ impl<'p, D: WriteAt> SpaceWriter<'p, D> {
         for (run_start, (run_stripes, list)) in by_run {
             let records = writer.mark_stripes(run_start, run_stripes, &list, true);
             self.write_log(&journal.area, &records)?;
+        }
+        Ok(())
+    }
+
+    /// Makes every stripe of the extent run at owner offset `run_start` (of
+    /// `stripes` stripes) match its parity, before the journal first lists
+    /// the run. Windows lists a run whole when a write first touches it,
+    /// the stripes never written as not consistent, so that readers check
+    /// them; new spaces get their slabs as they are, and where another
+    /// space's data was, those stripes would not match (audit 2026-10-16,
+    /// W3). Each stripe is read once; parity is written where it does not
+    /// match. Whether anything was written.
+    fn settle_run(&self, layout: &Layout, run_start: u64, stripes: u64) -> Result<bool> {
+        let unit = layout.interleave;
+        let stripe_bytes = layout.data_columns * unit;
+        let (mut data, mut parity, mut on_disk) = (
+            vec![0u8; unit as usize],
+            vec![0u8; unit as usize],
+            vec![0u8; unit as usize],
+        );
+        let mut wrote = false;
+        for i in 0..stripes {
+            let start = run_start + i * stripe_bytes;
+            let loc = layout.locate(start);
+            parity.fill(0);
+            for k in 0..layout.data_columns {
+                let column = layout.locate(start + k * unit).column;
+                self.read_unit(layout, column, loc.row, loc.offset_in_slab, &mut data)?;
+                parity.iter_mut().zip(&data).for_each(|(p, d)| *p ^= d);
+            }
+            let column = layout.parity_column(layout.stripe_of(&loc));
+            self.read_unit(layout, column, loc.row, loc.offset_in_slab, &mut on_disk)?;
+            if on_disk != parity {
+                self.write_unit(layout, column, loc.row, loc.offset_in_slab, &parity)?;
+                wrote = true;
+            }
+        }
+        Ok(wrote)
+    }
+
+    fn read_unit(&self, layout: &Layout, column: u64, row: u64, offset_in_slab: u64, buf: &mut [u8]) -> Result<()> {
+        let (disk, slab) = layout
+            .physical(column, 0, row)
+            .ok_or_else(|| Error::Pool(format!("row {row} of column {column} is not allocated")))?;
+        if !self.reader.pool().read_slab(disk, slab, offset_in_slab, buf)? {
+            return Err(Error::Pool(format!("disk {disk} of the space is not present")));
         }
         Ok(())
     }

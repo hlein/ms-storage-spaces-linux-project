@@ -65,7 +65,9 @@ page in `/usr/local/bin` when it was built next to `spaces`,
 `mount.ReFS` (and `mount.refs`) in `/sbin`, the udev rule and the
 unit, lists `ublk_drv` and `nbd` in `/etc/modules-load.d`, and enables
 `storage-spaces-attach.service`. `contrib/uninstall.sh` (`-n` lists what it
-would do) removes it again; detach spaces first (`spaces detach`).
+would do) removes it again; it refuses while spaces its `spaces` serves are
+attached (they would run on with no program left to detach them): detach
+them first (`spaces detach`).
 
 The udev rule starts `storage-spaces-attach.service` whenever a pool member
 appears, so pools are attached at boot and when their disks are plugged in
@@ -76,16 +78,25 @@ with the packages, whose rule is
 `/usr/lib/udev/rules.d/69-storage-spaces.rules` (an upgrade would bring a
 removed one back), override it with an empty one, `sudo ln -s /dev/null
 /etc/udev/rules.d/69-storage-spaces.rules`, or mask the unit, `sudo
-systemctl mask storage-spaces-attach.service`. Removing the package
-detaches the spaces its `spaces` serves; the spaces another installation's
-`spaces` serves (such as `contrib/install.sh`'s in `/usr/local`) stay
-attached.
+systemctl mask storage-spaces-attach.service`. The deb enables the unit
+when it is first installed; an upgrade keeps it disabled or masked if the
+admin made it so (1.2.2 enabled it again on every upgrade), and a unit of
+that name in `/etc` (another installation's, or a mask) is left as it is.
+Removing the package detaches the spaces its `spaces` serves; the spaces
+another installation's `spaces` serves (such as `contrib/install.sh`'s in
+`/usr/local`) stay attached. A space in use (a volume mounted) stops the
+removal of the deb, which says so: detach it, then remove the package
+again (1.2.2 removed the package and left its server running). pacman
+cannot be stopped so: the Arch package warns and goes on.
 
 Check the installation: `spaces --version`, `refs --version`,
 `systemctl status storage-spaces-attach.service`, and `spaces scan` with a
 pool's disks plugged in. Man pages: `man spaces`, `man refs`. Upgrading is
 installing again. Spaces attached by the previous version are attached
-anew with the new one (`spaces detach --outdated`, then the attach unit),
+anew with the new one, as they were attached (`spaces detach --outdated`
+detaches them and attaches them again with the arguments their state
+records: image files, `--backend` and the flags given; 1.2.2 left the spaces no
+unit attaches, such as those attached by hand from image files, detached),
 except those in use (a volume mounted), attached read-write or past their
 verdict: they keep the old server, as the upgrade says, until they are
 detached and attached again or the machine restarts. 1.2.0 and earlier

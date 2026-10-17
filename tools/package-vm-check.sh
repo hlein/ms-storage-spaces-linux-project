@@ -15,6 +15,15 @@
 #   upgrade  installing over attached pools (OLD_DEB, else DEB again) attaches
 #            the space nothing uses anew with the new program and keeps the
 #            one whose volume is mounted on its old server, saying so
+#   byhand   wc4k attached by hand from its image file through nbd, which no
+#            unit attaches: installing over it attaches it again as it was,
+#            served by the new program (1.2.2 detached it and left it so)
+#   enabled  installing again keeps the attach unit disabled, masked or
+#            enabled as the admin left it, also coming from OLD_DEB after a
+#            purge (1.2.2 enabled it again)
+#   inuse    removing the package while a volume of a space it serves is
+#            mounted is refused, the space attached and readable (1.2.2
+#            removed the package and left the server running)
 #   remove   removing it detaches the spaces its own spaces serves, and only those
 #   partitions  a space whose table names 200 partitions (a pool made here,
 #            in ~/sstest/scratch/parts): attach makes no devices for them
@@ -32,7 +41,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 deb=${1:?usage: tools/package-vm-check.sh DEB [CASE...]}
 shift
-cases=${*:-install gpt user cycle servers busy partitions upgrade remove}
+cases=${*:-install gpt user cycle servers busy partitions upgrade byhand enabled inuse remove}
 host=${LINUX_VM_HOST:-192.168.189.142}
 [[ $host == *@* ]] || host=codex@$host
 ssh_opts=(-o BatchMode=yes -o ConnectTimeout=10 -o IdentitiesOnly=yes -i "$HOME/.ssh/rustadmin_vm_ed25519")
@@ -115,7 +124,7 @@ readable() { # every file of a directory reads
 }
 cleanup() { # the test pools' spaces and loop devices, by whichever spaces is there
   local d b l
-  for d in /mnt/sstest-busy /mnt/sstest-upgrade; do mountpoint -q "$d" && sudo umount "$d"; done
+  for d in /mnt/sstest-busy /mnt/sstest-upgrade /mnt/sstest-inuse; do mountpoint -q "$d" && sudo umount "$d"; done
   for d in $(ours); do
     for b in /usr/sbin/spaces "$other" /usr/local/sbin/spaces ~/sstest/spaces-fixed; do
       [[ -x $b ]] && sudo "$b" detach "$d" >/dev/null 2>&1 && break
@@ -226,6 +235,78 @@ for c in $CASES; do
     [[ $(main_pid "$n") == "$pn" && $en == *"(deleted)" && $ok == yes ]] || bad+=" $n: server $pn -> $(main_pid "$n") ($en), readable: $ok;"
     [[ $out == *"$n is served by the previous version and stays attached"* ]] || bad+=" no notice: ${out//$'\n'/ | }"
     if [[ -z $bad ]]; then result ok upgrade "$(basename "$old") -> check.deb: $w attached anew, $n kept (mounted)"; else result fail upgrade "$bad"; fi ;;
+  byhand)
+    w=ss-ss_wc4k-wc4k
+    sudo /usr/sbin/spaces detach "$w" >/dev/null 2>&1
+    for l in $(losetup -a | grep -E "pools/wc4k/" | cut -d: -f1); do sudo losetup -d "$l" 2>/dev/null; done
+    out=$(sudo /usr/sbin/spaces attach --backend nbd ~/sstest/pools/wc4k/disk0.img 2>&1)
+    if [[ ! -b /dev/mapper/$w ]]; then result fail byhand "cannot attach wc4k by hand: ${out//$'\n'/ | }"; attach_pools wc4k; continue; fi
+    pw=$(main_pid "$w")
+    out=$(sudo dpkg -i ~/sstest/check.deb 2>&1)
+    for _ in $(seq 30); do p=$(main_pid "$w"); [[ -n $p && $p != 0 && $p != "$pw" ]] && break; sleep 1; done
+    f=$(sudo sh -c 'grep -lx "dm=$0" /run/storage-spaces/*.state' "$w" 2>/dev/null | head -1)
+    backend=$(sudo sed -n 's/^backend=//p' "$f" 2>/dev/null)
+    e=$(sudo readlink "/proc/$(main_pid "$w")/exe" 2>/dev/null)
+    if [[ -b /dev/mapper/$w && $backend == nbd && $(main_pid "$w") != "$pw" && $e == /usr/sbin/spaces ]]; then
+      result ok byhand "attached again through nbd, server $pw -> $(main_pid "$w")"
+    else
+      attached=no
+      [[ -b /dev/mapper/$w ]] && attached=yes
+      result fail byhand "attached: $attached, backend ${backend:-none}, server $pw -> $(main_pid "$w") ($e): ${out//$'\n'/ | }"
+    fi
+    sudo /usr/sbin/spaces detach "$w" >/dev/null 2>&1
+    attach_pools wc4k
+    for _ in $(seq 60); do [[ -b /dev/mapper/$w ]] && break; sleep 1; done ;;
+  enabled)
+    if ((explicit)); then result skip enabled "an install.sh installation's unit shadows the package's here"; continue; fi
+    u=storage-spaces-attach.service
+    st() { systemctl is-enabled "$u" 2>/dev/null; }
+    bad=
+    if [[ -e ~/sstest/old.deb ]]; then
+      # The package before recorded nothing of the unit: what systemd says
+      # when the new one is installed over it is the admin's choice.
+      sudo dpkg --purge storage-spaces >/dev/null 2>&1
+      sudo dpkg -i ~/sstest/old.deb >/dev/null 2>&1
+      sudo systemctl disable "$u" >/dev/null 2>&1
+      sudo dpkg -i ~/sstest/check.deb >/dev/null 2>&1
+      [[ $(st) == disabled ]] || bad+=" disabled under $(dpkg-deb -f ~/sstest/old.deb Version), then installed over: $(st);"
+      sudo systemctl enable "$u" >/dev/null 2>&1
+    fi
+    sudo systemctl disable "$u" >/dev/null 2>&1
+    sudo dpkg -i ~/sstest/check.deb >/dev/null 2>&1
+    [[ $(st) == disabled ]] || bad+=" disabled, installed again: $(st);"
+    sudo systemctl mask "$u" >/dev/null 2>&1
+    sudo dpkg -i ~/sstest/check.deb >/dev/null 2>&1
+    [[ $(st) == masked ]] || bad+=" masked, installed again: $(st);"
+    sudo systemctl unmask "$u" >/dev/null 2>&1
+    sudo systemctl enable "$u" >/dev/null 2>&1
+    sudo dpkg -i ~/sstest/check.deb >/dev/null 2>&1
+    [[ $(st) == enabled ]] || bad+=" enabled, installed again: $(st);"
+    if [[ -z $bad ]]; then result ok enabled "disabled, masked and enabled each kept"; else result fail enabled "$bad"; fi
+    # The test pools attached for the cases after it.
+    sudo systemctl enable "$u" >/dev/null 2>&1
+    sudo systemctl start "$u" >/dev/null 2>&1
+    for _ in $(seq 60); do [[ $(ours | wc -l) -ge 2 ]] && break; sleep 1; done ;;
+  inuse)
+    n=ss-ss_ntfstier-ntfstier
+    if ! mount_ntfs "$n" /mnt/sstest-inuse; then result fail inuse "cannot mount the NTFS volume of $n"; continue; fi
+    out=$(sudo dpkg -r storage-spaces 2>&1)
+    rc=$?
+    installed=$(dpkg-query -W -f='${db:Status-Status}' storage-spaces 2>/dev/null)
+    ok=$(readable /mnt/sstest-inuse)
+    attached=no
+    [[ -b /dev/mapper/$n ]] && attached=yes
+    sudo umount /mnt/sstest-inuse
+    if [[ $rc != 0 && $installed == installed && $attached == yes && $ok == yes && $out == *"in use"* ]]; then
+      result ok inuse "refused: $(echo "$out" | grep -m1 'not removed')"
+    else
+      result fail inuse "dpkg -r exit $rc, package ${installed:-gone}, attached: $attached, readable: $ok: ${out//$'\n'/ | }"
+      # The case after it needs the package and the pools.
+      if [[ $installed != installed ]]; then
+        sudo dpkg -i ~/sstest/check.deb >/dev/null 2>&1
+        for _ in $(seq 60); do [[ $(ours | wc -l) -ge 2 ]] && break; sleep 1; done
+      fi
+    fi ;;
   remove)
     if ((!explicit)); then
       # Another installation's spaces: sect4k, served by a copy elsewhere.

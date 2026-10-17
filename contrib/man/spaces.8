@@ -196,8 +196,10 @@ the state with what is left, for the next detach.
 detaches only the spaces whose serving process runs an older copy of
 .B spaces
 (replaced by an upgrade since it started), attached read-only as healthy
-and not in use, and names the others; the packages run it after an upgrade
-and then attach again, so that the new version serves them.
+and not in use, names the others, and attaches the ones it detached again
+as they were attached (the arguments their state records: devices or
+image files, backend, flags); the packages run it after an upgrade, so
+that the new version serves them.
 .B \-\-leftovers
 removes instead the device-mapper devices with the UUID of a space
 .RB ( STORAGESPACES\- )

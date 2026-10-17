@@ -83,6 +83,16 @@
   removes nothing while there are any. A step that fails (a device that
   stays, a server that does not stop, nbd-client or losetup) keeps the
   state with what is left; 1.2.2 removed the state anyway.
+* Upgrades: `spaces detach --outdated` (the package scripts run it) left
+  the spaces it detached to the attach unit, which attaches none attached
+  by hand (image files, `--backend nbd`); it now attaches them again with
+  the arguments their state records. The deb's postinst enabled the attach
+  unit again on every upgrade; it keeps a unit the admin disabled or masked
+  (deb-systemd-helper), and leaves alone a unit of that name in `/etc`.
+  Removing the deb while a space it serves is in use failed silently and
+  left the server running with no program to detach it; the removal now
+  stops, saying what to do. `contrib/uninstall.sh` refuses likewise; the
+  Arch package, which pacman cannot stop, warns.
 
 ### Testing
 

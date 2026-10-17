@@ -63,7 +63,7 @@ pub enum Backend {
 }
 
 impl Backend {
-    fn name(self) -> &'static str {
+    pub fn name(self) -> &'static str {
         match self {
             Backend::Auto => "auto",
             Backend::Dm => "dm",
@@ -112,6 +112,9 @@ pub struct State {
     pub forced: bool,
     /// The report of the checks.
     pub report: Option<String>,
+    /// The arguments of `spaces attach` that attach the space again as it
+    /// is (`detach --outdated` does after an upgrade).
+    pub args: Vec<String>,
 }
 
 impl State {
@@ -166,6 +169,9 @@ impl State {
         for d in &self.dm {
             text += &format!("dm={d}\n");
         }
+        for a in &self.args {
+            text += &format!("arg={a}\n");
+        }
         if self.rw {
             text += "mode=rw\n";
         }
@@ -212,6 +218,7 @@ impl State {
                 "verdict" => s.verdict = Some(value),
                 "forced" => s.forced = value == "1",
                 "report" => s.report = Some(value),
+                "arg" => s.args.push(value),
                 _ => {}
             }
         }
@@ -852,22 +859,33 @@ fn step(name: &str) {
     let _ = name;
 }
 
-/// Attaches one space (read-write with `rw`) that the checks gave
-/// `verdict` (their report at `report`). Returns the state describing
+/// How `spaces attach` attaches a space.
+pub struct Request<'a> {
+    pub backend: Backend,
+    /// Read-write.
+    pub rw: bool,
+    /// The verdict of the checks, and where their report is.
+    pub verdict: Verdict,
+    pub report: Option<&'a Path>,
+    /// The arguments of `spaces attach` that attach it again as it is.
+    pub args: Vec<String>,
+}
+
+/// Attaches one space as `request` says (read-write with `rw`; the checks
+/// gave it `verdict`, their report at `report`). Returns the state describing
 /// what was created. The state comes first, marked attaching, with the
 /// server unit and the devices the attach makes; it is written again as
 /// each device appears, and marked attached at the end. What fails is
 /// undone; what cannot be undone stays in the state, for `spaces detach`
 /// and the next attach.
-pub fn attach_space(
-    pool: &Pool<File>,
-    space: &Space,
-    paths: &[PathBuf],
-    requested: Backend,
-    rw: bool,
-    verdict: Verdict,
-    report: Option<&Path>,
-) -> Result<State> {
+pub fn attach_space(pool: &Pool<File>, space: &Space, paths: &[PathBuf], request: Request<'_>) -> Result<State> {
+    let Request {
+        backend: requested,
+        rw,
+        verdict,
+        report,
+        args,
+    } = request;
     if verdict != Verdict::Healthy && rw {
         bail!("writing needs a healthy space, and this one is {}", verdict.as_str());
     }
@@ -909,6 +927,12 @@ pub fn attach_space(
         verdict: Some(verdict.as_str().into()),
         forced: verdict != Verdict::Healthy,
         report: report.map(|p| p.display().to_string()),
+        // An argument with a line break in it does not fit the state file.
+        args: if args.iter().any(|a| a.contains('\n')) {
+            Vec::new()
+        } else {
+            args
+        },
         ..Default::default()
     };
     state.save()?;
@@ -1096,29 +1120,40 @@ pub fn users(state: &State) -> Vec<String> {
     let numbers: Vec<Option<(String, libc::dev_t)>> = devices.iter().map(|d| device_number(&d.1)).collect();
     let index_of = |text: &str| numbers.iter().position(|n| n.as_ref().is_some_and(|(t, _)| t == text));
     let mut found = Vec::new();
-    // Mounts, in every mount namespace (one process's view of each).
-    let own_ns = fs::read_link("/proc/self/ns/mnt").ok();
+    // Mounts, in every mount namespace (one process's view of each, this
+    // one's first). A mount that propagated into another namespace (most
+    // services see the mounts made here) is its peer group's (shared:N
+    // there, master:N in the copy): reported once.
     let mut namespaces = std::collections::HashSet::new();
-    for pid in processes() {
+    let mut groups = std::collections::HashSet::new();
+    let views = std::iter::once("self".to_string()).chain(processes().into_iter().map(|p| p.to_string()));
+    for (n, pid) in views.enumerate() {
         let Ok(ns) = fs::read_link(format!("/proc/{pid}/ns/mnt")) else {
             continue;
         };
-        if !namespaces.insert(ns.clone()) {
+        if !namespaces.insert(ns) {
             continue;
         }
         let Ok(info) = fs::read_to_string(format!("/proc/{pid}/mountinfo")) else {
             continue;
         };
-        let whose = if Some(&ns) == own_ns.as_ref() {
+        let whose = if n == 0 {
             String::new()
         } else {
             format!(" in the mount namespace of pid {pid}")
         };
         for line in info.lines() {
             let f: Vec<&str> = line.split(' ').collect();
-            if f.len() > 4
-                && let Some(i) = index_of(f[2])
-            {
+            let Some(i) = f.get(2).and_then(|numbers| index_of(numbers)).filter(|_| f.len() > 6) else {
+                continue;
+            };
+            let optional = f[6..].iter().take_while(|&&t| t != "-");
+            let peers: Vec<&str> = optional
+                .filter_map(|t| t.strip_prefix("shared:").or_else(|| t.strip_prefix("master:")))
+                .collect();
+            let seen = peers.iter().any(|g| groups.contains(*g));
+            groups.extend(peers.iter().map(|g| g.to_string()));
+            if !seen {
                 found.push(format!(
                     "{} is mounted on {}{whose}",
                     devices[i].0,
@@ -1700,12 +1735,16 @@ mod name_tests {
                 status,
                 dm: vec!["ss-a-b".into(), "ss-a-b-p1".into()],
                 unit: Some("storage-spaces-s".into()),
+                args: ["--space", "s", "--backend", "nbd", "/images/a b=c/disk0.img"]
+                    .map(String::from)
+                    .to_vec(),
                 ..attached("ss-a-b", "p")
             };
             let back = State::parse(&s.text());
             assert_eq!(back.status, status);
             assert_eq!(back.dm, s.dm);
             assert_eq!(back.unit, s.unit);
+            assert_eq!(back.args, s.args);
         }
         assert_eq!(
             State::parse("space=s\npool=p\nbackend=dm\ndm=ss-a-b\n").status,

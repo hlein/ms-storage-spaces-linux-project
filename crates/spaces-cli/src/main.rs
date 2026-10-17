@@ -1494,11 +1494,29 @@ fn cmd_attach(
                 continue;
             }
             let write = matches!(decision, check::Decision::Attach { rw: true });
+            // How to attach it again as it is (`detach --outdated`).
+            let mut again = vec!["--space".to_string(), space.info.guid.to_string()];
+            if backend != attach::Backend::Auto {
+                again.extend(["--backend".into(), backend.name().into()]);
+            }
+            again.extend(
+                [(write, "--rw"), (degraded, "--degraded"), (force, "--force")]
+                    .into_iter()
+                    .filter(|(given, _)| *given)
+                    .map(|(_, flag)| flag.to_string()),
+            );
+            again.extend(inherited_args());
+            again.extend(devices.iter().map(|d| d.display().to_string()));
             // A panic there (on what the checks passed) fails this space only.
-            let attached = storage_spaces::isolate::caught(|| {
-                attach::attach_space(&pool, space, &paths, backend, write, verdict, path.as_deref())
-            })
-            .unwrap_or_else(|stopped| Err(anyhow::anyhow!("attaching it {stopped}")));
+            let request = attach::Request {
+                backend,
+                rw: write,
+                verdict,
+                report: path.as_deref(),
+                args: again,
+            };
+            let attached = storage_spaces::isolate::caught(|| attach::attach_space(&pool, space, &paths, request))
+                .unwrap_or_else(|stopped| Err(anyhow::anyhow!("attaching it {stopped}")));
             match attached {
                 Ok(state) => {
                     let mode = if state.rw {
@@ -1562,6 +1580,8 @@ fn cmd_detach(sel: Option<&str>, outdated: bool, leftovers: bool) -> Result<()> 
     }
     let program = std::env::current_exe()?;
     let (mut failures, mut matched) = (0, 0);
+    // Spaces --outdated detached, and the arguments that attach them again.
+    let mut again: Vec<(String, Vec<String>)> = Vec::new();
     for state in attach::select_attached(attach::State::load_all()?, sel)? {
         matched += 1;
         let name = state.dm.first().map_or(state.space_guid.as_str(), |d| d);
@@ -1579,7 +1599,11 @@ fn cmd_detach(sel: Option<&str>, outdated: bool, leftovers: bool) -> Result<()> 
                 continue;
             }
             match attach::teardown(&state) {
-                Ok(()) => println!("detached {name} (served by the previous version)"),
+                Ok(()) if state.args.is_empty() => println!("detached {name} (served by the previous version)"),
+                Ok(()) => {
+                    println!("detached {name} (served by the previous version), to attach it again as it was");
+                    again.push((name.to_string(), state.args.clone()));
+                }
                 Err(e) => println!("{name} is served by the previous version and stays attached ({e:#}): {switch}"),
             }
             continue;
@@ -1592,8 +1616,25 @@ fn cmd_detach(sel: Option<&str>, outdated: bool, leftovers: bool) -> Result<()> 
             }
         }
     }
+    // Attached again by the program as it is now (the new one after an
+    // upgrade), once this run lets go of the attach lock.
+    drop(_lock);
+    let mut lost = 0;
+    for (name, args) in again {
+        match std::process::Command::new(&program).arg("attach").args(&args).status() {
+            Ok(status) if status.success() => {}
+            outcome => {
+                let why = outcome.map_or_else(|e| e.to_string(), |s| s.to_string());
+                eprintln!("{name} is not attached again ({why}): spaces attach {}", args.join(" "));
+                lost += 1;
+            }
+        }
+    }
     if failures > 0 {
         bail!("{failures} space(s) not detached");
+    }
+    if lost > 0 {
+        bail!("{lost} space(s) detached and not attached again");
     }
     if let Some(s) = sel.filter(|_| matched == 0) {
         bail!("no attached space named {s:?} (spaces status lists them)");

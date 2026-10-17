@@ -54,22 +54,45 @@ CONTROL
 cat > "$stage/DEBIAN/postinst" <<'POSTINST'
 #!/bin/sh
 set -e
+unit=storage-spaces-attach.service
+# A unit of that name in /etc is the admin's or another installation's
+# (contrib/install.sh), or a mask: whether it is enabled is theirs to say.
+own=yes
+if [ -e "/etc/systemd/system/$unit" ] || [ -L "/etc/systemd/system/$unit" ]; then
+  own=
+fi
 if [ "$1" = configure ]; then
   systemctl daemon-reload || true
-  systemctl enable storage-spaces-attach.service || true
+  # Enabled on the first installation; an upgrade keeps a unit the admin
+  # disabled so (deb-systemd-helper records it; a package before 1.3 did
+  # not, and then what systemd says now is the choice).
+  if [ -n "$own" ] && [ -x /usr/bin/deb-systemd-helper ]; then
+    deb-systemd-helper unmask "$unit" >/dev/null || true
+    if [ -n "$2" ] && ! deb-systemd-helper --quiet debian-installed "$unit" &&
+      ! systemctl --quiet is-enabled "$unit" 2>/dev/null; then
+      deb-systemd-helper update-state "$unit" >/dev/null || true
+    fi
+    if deb-systemd-helper --quiet was-enabled "$unit"; then
+      deb-systemd-helper enable "$unit" >/dev/null || true
+    else
+      deb-systemd-helper update-state "$unit" >/dev/null || true
+    fi
+  elif [ -n "$own" ] && [ -z "$2" ]; then
+    systemctl enable "$unit" || true
+  fi
   udevadm control --reload || true
   modprobe ublk_drv 2>/dev/null || true
   modprobe nbd 2>/dev/null || true
   # After an upgrade the spaces attached before are still served by the
   # previous program (prerm detaches only on remove): detach those nothing
-  # uses, for the attach below to serve them with this one.
+  # uses, and attach them again as they were, with this one.
   if [ -n "$2" ]; then
     /usr/sbin/spaces detach --outdated || true
   fi
   # The udev rule acts on disks that appear later: attach the pools whose
-  # disks are here now.
-  if [ -d /run/systemd/system ]; then
-    systemctl start --no-block storage-spaces-attach.service || true
+  # disks are here now, unless the unit is turned off.
+  if [ -n "$own" ] && [ -d /run/systemd/system ] && systemctl --quiet is-enabled "$unit" 2>/dev/null; then
+    systemctl start --no-block "$unit" || true
   fi
 fi
 POSTINST
@@ -79,19 +102,39 @@ set -e
 if [ "$1" = remove ]; then
   # Detach what this package's spaces serves (and spaces without a server,
   # device-mapper only); the spaces another installation's spaces serves
-  # (contrib/install.sh's in /usr/local) stay attached.
+  # (contrib/install.sh's in /usr/local) stay attached. A space that stays
+  # (in use) stops the removal: its server would run on with no program
+  # left to detach it.
+  busy=
   for f in /run/storage-spaces/*.state; do
     [ -e "$f" ] || continue
     unit=$(sed -n 's/^unit=//p' "$f")
     space=$(sed -n 's/^space=//p' "$f")
     if [ -z "$unit" ] || systemctl show -p ExecStart --value "$unit" 2>/dev/null | grep -q 'path=/usr/sbin/spaces '; then
-      /usr/sbin/spaces detach "$space" || true
+      /usr/sbin/spaces detach "$space" || busy="$busy $space"
     fi
   done
-  systemctl disable storage-spaces-attach.service || true
+  if [ -n "$busy" ]; then
+    echo "storage-spaces is not removed: the spaces$busy are in use and stay attached." >&2
+    echo "Stop using them (spaces status lists them), run spaces detach, then remove the package again." >&2
+    exit 1
+  fi
 fi
 PRERM
-chmod 755 "$stage/DEBIAN/postinst" "$stage/DEBIAN/prerm"
+cat > "$stage/DEBIAN/postrm" <<'POSTRM'
+#!/bin/sh
+set -e
+unit=storage-spaces-attach.service
+# What the postinst enabled goes with the purge; a removed package's unit
+# file is gone, its link with it on the purge.
+if [ "$1" = purge ] && [ -x /usr/bin/deb-systemd-helper ]; then
+  deb-systemd-helper purge "$unit" >/dev/null || true
+fi
+if [ -d /run/systemd/system ]; then
+  systemctl daemon-reload || true
+fi
+POSTRM
+chmod 755 "$stage/DEBIAN/postinst" "$stage/DEBIAN/prerm" "$stage/DEBIAN/postrm"
 mkdir -p "$out"
 dpkg-deb --root-owner-group --build "$stage" "$out/storage-spaces_${version}_${arch}.deb" >/dev/null
 echo "$out/storage-spaces_${version}_${arch}.deb"

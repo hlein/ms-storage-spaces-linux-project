@@ -18,6 +18,15 @@ pub(crate) fn le64(b: &[u8], at: usize) -> u64 {
 
 /// UTF-16LE text, lossily.
 pub(crate) fn utf16(b: &[u8]) -> String {
+    utf16_exact(b).0
+}
+
+/// UTF-16LE text, and its units when the text cannot hold them (lone
+/// surrogates, which Windows allows in names; each is U+FFFD in the text).
+pub(crate) fn utf16_exact(b: &[u8]) -> (String, Option<Vec<u16>>) {
     let units: Vec<u16> = b.as_chunks::<2>().0.iter().map(|&c| u16::from_le_bytes(c)).collect();
-    String::from_utf16_lossy(&units)
+    match String::from_utf16(&units) {
+        Ok(s) => (s, None),
+        Err(_) => (String::from_utf16_lossy(&units), Some(units)),
+    }
 }

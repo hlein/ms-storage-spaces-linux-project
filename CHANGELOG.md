@@ -151,9 +151,31 @@
   or named by no file), and counts the clusters used that nothing
   references (on ReFS 3.14; Windows leaves some on every volume, so they
   are not problems).
+* `refs mount --rw`: a `refs write` (or any writing command) during the
+  mount was lost when the mount wrote its view of the volume over it. The
+  writing commands and the mount for writing take the device or image
+  exclusively, a read-only mount shared, and the others are refused, naming
+  the holder. The buffers of files open for writing were 0644 under a name
+  others could guess; they have no name and mode 0600 now. A volume without
+  room said "Operation not supported"; ENOSPC now. A file whose last name
+  went while open (unlinked, renamed over) failed its reads, fstat and
+  close with ENOENT; it reads and takes writes until its last handle
+  closes. A directory listed while names went skipped names (`rm -r`,
+  `find -delete`); it lists every name it had when it was opened. Two
+  names that differ only in a lone surrogate were one (one file
+  unreachable, listed twice); they are shown as WTF-8, each its own, and
+  read, not changed. `st_blocks` counted the size; it counts what the file
+  has (a sparse file less).
 
 ### Testing
 
+* `tools/refs-mount-check.sh --rw IMAGE` checks what writing through `refs
+  mount --rw` does (the hold, listings while names go, open files whose name
+  goes, the buffers' mode) on a copy of the image; the comparison with
+  Windows' listings mounts with `--force`, so that the two volumes of the
+  corpus taken with log records past their checkpoint, suspect since 1.2.1,
+  are compared again. `tools/linux-vm.sh -sync` keeps a `testdata` link on
+  the VM.
 * The boundary values of the plausibility limits are tried in every field
   on every fixture (79, not 8 as in 1.2.2) and in the slot, checkpoint and
   data offsets of write-back cache and parity journal headers, their CRC

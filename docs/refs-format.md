@@ -143,8 +143,11 @@ A directory's tree holds, keyed by a u16 row type at key 0:
 
 * 0x10: the directory's own attributes (its value is an attribute tree
   like a file record, see below; a junction's reparse point is there);
-* 0x30: one row per name, the UTF-16LE name at key + 4; key flags at
-  key + 2 decide the value:
+* 0x30: one row per name, the UTF-16LE name at key + 4 (any units, as
+  NTFS allows: a lone surrogate, which UTF-8 cannot carry, is kept as the
+  name's units beside the text, `Entry::units`, and the mount shows such
+  a name as WTF-8, read-only; 1.2.2 read U+FFFD for it, and two names
+  differing only there were one); key flags at key + 2 decide the value:
   * **1, embedded record**: the value is the file's record: the
     attribute tree's descriptor (0x00: offset of the node header, 0xa8;
     0x20: number of attribute rows), times at 0x28 created, 0x30

@@ -745,8 +745,10 @@ inode with its link count.
 With `--rw` (one image, disk or partition; not `--space`) the mount
 writes through the same code as the writing commands below: creating,
 writing, truncating and deleting files (a file opened for writing is
-kept in an unlinked temporary file, in `$REFS_TMPDIR` or the system's
-temporary directory; when it is closed or synced, what was written goes
+kept in a temporary file without a name that only the mounting user may
+read (`O_TMPFILE`, mode 0600; 1.2.2 made it 0644 under a name others could
+guess, for a moment), in `$REFS_TMPDIR` or the system's temporary
+directory; when it is closed or synced, what was written goes
 to the volume as Windows writes it: changed bytes where they are,
 appended data in new runs, a shortened file's tail freed, the touched
 clusters of an integrity stream copied on write; what lies past a file's
@@ -772,7 +774,23 @@ in one change and renamed in the next); so are a block clone to a new
 name and a named stream in clusters replaced. A file is created when it
 is opened and its data written when it is closed, two changes as on other
 file systems: a crash between them leaves it empty. A change `refs`
-refuses (a name that is not printable ASCII, for now) changes nothing.
+refuses (a name that is not printable ASCII, for now) changes nothing; one
+the volume has no room for fails with ENOSPC (1.2.2: "Operation not
+supported"). The mount holds the volume for itself: the writing commands
+and another mount are refused while it is mounted ("... is in use by pid N
+(refs mount)"), as a mount for writing is while a read-only one is; 1.2.2
+let `refs write` change a volume mounted for writing, and the mount's next
+change wrote its own view of the volume over that. A file whose last name
+goes while it is open (unlinked, or renamed over) reads and takes writes
+through its open handles until the last is closed, which writes nothing
+back (1.2.2 failed them, and the close, with ENOENT). A directory listed
+while names go or come lists every name it had when it was opened, each
+once (1.2.2 skipped names when files were deleted during the listing, as
+`rm -r` and `find -delete` do). `st_blocks` (`du`) counts what a file has
+on the volume: a sparse file less than its size. Names with a lone
+surrogate (a UTF-16 unit Windows allows in names and UTF-8 cannot carry)
+are shown as WTF-8 bytes, each its own file, and are read, not changed
+(1.2.2 showed U+FFFD for each, so two such names were one).
 A change whose writes fail on the disk reports the error, and the volume
 is read again from the disk (its checkpoint may be down or not); if that
 fails too, every later change is refused until the volume is mounted or
@@ -1009,6 +1027,10 @@ overflow checks, and its parsers are fuzzed (`docs/security.md`).
   another `spaces` process serves or writes the pool (a server of one of its
   spaces, `serve-ublk --rw`, a management command); a writer waits for every
   server of the pool, and a server for a writer.
+* `... is in use by pid N (refs mount ...)`: the ReFS volume is mounted
+  with `refs mount`; the writing `refs` commands, and a mount for writing,
+  wait until it is unmounted (a read-only mount allows other read-only
+  mounts).
 * `the pool is not in a clean state`: a management command was given a pool
   with a missing disk or out-of-date copies; see
   [Replacing a failed disk](#replacing-a-failed-disk) or attach it to

@@ -212,7 +212,9 @@ block clones (a whole file copied into an empty one with
 copy_file_range),
 directories, renames, hard links, times, the read-only attribute and
 named streams, each change one transaction as the writing commands make
-it. Experimental. The helper
+it. Experimental. The mount holds the device or image: while it is
+mounted the writing commands and a mount for writing are refused (a
+read-only mount allows other read-only mounts), naming it. The helper
 .B mount.ReFS
 (installed with
 .BR refs )

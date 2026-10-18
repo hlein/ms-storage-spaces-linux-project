@@ -12,6 +12,10 @@ pub enum Error {
     Unsupported(String),
     #[error("not found: {0}")]
     NotFound(String),
+    /// No room on the volume for what a change needs (clusters for its
+    /// data or pages).
+    #[error("no room: {0}")]
+    Full(String),
     /// File data that fails its integrity stream checksum.
     #[error("integrity checksum mismatch: {0}")]
     Checksum(String),

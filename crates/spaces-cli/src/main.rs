@@ -650,46 +650,14 @@ pub(crate) fn open_member(p: &Path, write: bool, hold: Hold) -> Result<File> {
         Hold::Exclusive => file.try_lock(),
     };
     locked.map_err(|e| match e {
-        std::fs::TryLockError::WouldBlock => anyhow::anyhow!("{} is in use by {}", p.display(), lock_holders(&file)),
+        std::fs::TryLockError::WouldBlock => anyhow::anyhow!(
+            "{} is in use by {}",
+            p.display(),
+            storage_spaces::holders::of_lock(&file)
+        ),
         std::fs::TryLockError::Error(e) => anyhow::Error::new(e).context(format!("cannot lock {}", p.display())),
     })?;
     Ok(file)
-}
-
-/// The processes that hold a lock on `file` (from /proc/locks), as people
-/// read them: "pid 1234 (spaces serve-nbd ...)".
-fn lock_holders(file: &File) -> String {
-    #[cfg(target_os = "linux")]
-    {
-        use std::os::unix::fs::MetadataExt;
-        if let (Ok(m), Ok(locks)) = (file.metadata(), std::fs::read_to_string("/proc/locks")) {
-            let dev = m.dev();
-            let (major, minor) = (
-                ((dev >> 8) & 0xfff) | ((dev >> 32) & !0xfff),
-                (dev & 0xff) | ((dev >> 12) & !0xff),
-            );
-            let key = format!("{major:02x}:{minor:02x}:{}", m.ino());
-            let mut pids: Vec<u32> = locks
-                .lines()
-                .filter_map(|line| {
-                    // "1: FLOCK  ADVISORY  READ  1234 08:02:5678 0 EOF", a
-                    // waiter with "->" after the number.
-                    let f: Vec<&str> = line.split_whitespace().filter(|w| *w != "->").collect();
-                    (f.get(1) == Some(&"FLOCK") && f.get(5) == Some(&key.as_str()))
-                        .then(|| f.get(4)?.parse().ok())
-                        .flatten()
-                })
-                .filter(|&pid| pid != std::process::id())
-                .collect();
-            pids.sort_unstable();
-            pids.dedup();
-            if !pids.is_empty() {
-                return pids.iter().map(|&pid| process(pid)).collect::<Vec<_>>().join(", ");
-            }
-        }
-    }
-    let _ = file;
-    "another process".into()
 }
 
 /// What holds block device `p` in the kernel (device-mapper tables, from
@@ -718,45 +686,6 @@ fn kernel_holders(p: &Path) -> String {
     } else {
         held.join(", ")
     }
-}
-
-/// Process `pid` as people read it: its program, command and space, and
-/// its systemd unit: "pid 1234 (spaces serve-ublk --space data, unit
-/// ss-....service)".
-fn process(pid: u32) -> String {
-    let args: Vec<String> = std::fs::read(format!("/proc/{pid}/cmdline"))
-        .unwrap_or_default()
-        .split(|&b| b == 0)
-        .filter(|a| !a.is_empty())
-        .map(|a| String::from_utf8_lossy(a).into_owned())
-        .collect();
-    let Some((program, rest)) = args.split_first() else {
-        return format!("pid {pid}");
-    };
-    let mut what = vec![
-        Path::new(program)
-            .file_name()
-            .map_or(program.clone(), |n| n.to_string_lossy().into_owned()),
-    ];
-    what.extend(rest.first().filter(|a| !a.starts_with(['-', '/'])).cloned());
-    if let Some(i) = rest.iter().position(|a| a == "--space" || a == "-s") {
-        what.extend(rest.get(i + 1).map(|v| format!("--space {v}")));
-    }
-    let unit = std::fs::read_to_string(format!("/proc/{pid}/cgroup"))
-        .ok()
-        .and_then(|c| {
-            c.lines().find_map(|l| {
-                l.rsplit('/')
-                    .next()
-                    .filter(|u| u.ends_with(".service") || u.ends_with(".scope"))
-                    .map(str::to_owned)
-            })
-        });
-    let mut line = what.join(" ");
-    if let Some(unit) = unit {
-        line = format!("{line}, unit {unit}");
-    }
-    format!("pid {pid} ({})", storage_spaces::report::printable(&line))
 }
 
 fn open_pool_mode(paths: &[PathBuf], hold: Hold, write: bool) -> Result<Pool<File>> {

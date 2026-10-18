@@ -5,11 +5,141 @@
 # times, the SHA-256 of every file and of every named stream up to 64 KiB
 # (extended attributes user.<name>; stream snapshots are not mounted),
 # link targets, and one inode for all
-# names of a hard-linked file. Needs FUSE; nothing is written to the images.
+# names of a hard-linked file. Needs FUSE; nothing is written to the images
+# (mounted with --force: a volume the guard calls suspect is read too).
 # Usage: tools/refs-mount-check.sh [NAME...]
+#
+# With --rw IMAGE: a copy of IMAGE (a ReFS 3.14 image: r314small) mounted
+# with `refs mount --rw`, the semantics of writing through it, one line
+# PASS or FAIL per case:
+#   hold      `refs create` on the image while it is mounted is refused, as is
+#             a second mount, naming the mount (1.2.2 wrote, and what it wrote
+#             was lost when the mount wrote its view of the volume over it)
+#   readdir   600 files (names of 120 characters, so that a listing takes
+#             several calls) listed while each is unlinked as it comes: all
+#             listed, none left (1.2.2's offsets counted the names left at
+#             each call, and names the unlinks moved were skipped)
+#   openread  a file open for reading, unlinked: it reads on (1.2.2: ENOENT)
+#   openwrite a file open for writing, unlinked: writes, reads and the close
+#             succeed (1.2.2: the close failed with ENOENT)
+#   tmpmode   the buffer of a file open for writing: mode 0600, no name
+#             (1.2.2: 0644 under the usual umask)
+# Usage: [REFS=binary] tools/refs-mount-check.sh --rw IMAGE [CASE...]
+# REFS names the refs binary to check (built here otherwise).
 set -uo pipefail
 cd "$(dirname "$0")/.."
-cargo build --release -q -p refs-cli || exit 1
+refs=${REFS:-target/release/refs}
+[[ -n ${REFS:-} ]] || cargo build --release -q -p refs-cli || exit 1
+if [[ ${1:-} == --rw ]]; then
+  image=${2:?usage: tools/refs-mount-check.sh --rw IMAGE [CASE...]}
+  shift 2
+  cases=${*:-hold readdir openread openwrite tmpmode}
+  work=$(mktemp -d)
+  unmount() { fusermount3 -uz "$1" 2>/dev/null || fusermount -uz "$1" 2>/dev/null; }
+  trap 'unmount "$work/mnt2"; unmount "$work/mnt"; [[ -n ${pid:-} ]] && wait "$pid"; rm -rf "$work"' EXIT
+  cp --sparse=always "$image" "$work/disk.img"
+  mkdir "$work/mnt"
+  REFS_TMPDIR=$work "$refs" mount --rw "$work/disk.img" "$work/mnt" 2>"$work/mount.log" &
+  pid=$!
+  for _ in $(seq 100); do mountpoint -q "$work/mnt" && break; sleep 0.1; done
+  if ! mountpoint -q "$work/mnt"; then
+    echo "FAIL mount: $(tr '\n' ' ' < "$work/mount.log")"
+    exit 1
+  fi
+  pass=0 fail=0
+  result() {
+    if [[ $1 == ok ]]; then echo "PASS $2${3:+ ($3)}"; pass=$((pass + 1)); else echo "FAIL $2: $3"; fail=$((fail + 1)); fi
+  }
+  for c in $cases; do
+    case $c in
+    hold)
+      echo "hello" > "$work/hello.txt"
+      out=$("$refs" create "$work/disk.img" --path /cli.txt --from "$work/hello.txt" --yes 2>&1)
+      rc=$?
+      mkdir -p "$work/mnt2"
+      second=$(timeout 20 "$refs" mount "$work/disk.img" "$work/mnt2" 2>&1)
+      rc2=$?
+      unmount "$work/mnt2"
+      if [[ $rc != 0 && $out == *"in use by"* && $rc2 != 0 && $second == *"in use by"* ]]; then
+        result ok hold "$(printf '%s' "$out" | tail -1)"
+      else
+        result fail hold "refs create exit $rc: $(printf '%s' "$out" | tail -1 | tr '\n' ' '); a second mount exit $rc2"
+      fi ;;
+    readdir)
+      out=$(python3 - "$work/mnt" <<'EOF' 2>&1
+import os, sys
+d = os.path.join(sys.argv[1], "many")
+os.mkdir(d)
+for i in range(600):
+    open(os.path.join(d, f"f{i:03}-" + "x" * 116), "w").close()
+seen = 0
+with os.scandir(d) as it:
+    for e in it:
+        os.unlink(e.path)
+        seen += 1
+print(f"{seen} listed, {len(os.listdir(d))} left")
+EOF
+      )
+      if [[ $out == "600 listed, 0 left" ]]; then result ok readdir "$out"; else result fail readdir "$out"; fi ;;
+    openread)
+      out=$(python3 - "$work/mnt" <<'EOF' 2>&1
+import os, sys
+p = os.path.join(sys.argv[1], "r.bin")
+data = bytes(range(256)) * 40
+with open(p, "wb") as f:
+    f.write(data)
+f = open(p, "rb")
+os.unlink(p)
+got = f.read()
+size = os.fstat(f.fileno()).st_size
+f.close()
+print("same" if got == data and size == len(data) else f"read {len(got)} bytes, fstat {size}")
+EOF
+      )
+      if [[ $out == same ]]; then result ok openread "read on after the unlink"; else result fail openread "$(printf '%s' "$out" | tail -1)"; fi ;;
+    openwrite)
+      out=$(python3 - "$work/mnt" <<'EOF' 2>&1
+import os, sys
+p = os.path.join(sys.argv[1], "w.bin")
+f = open(p, "w+b")
+f.write(b"before")
+f.flush()
+os.unlink(p)
+f.write(b" after")
+f.flush()
+f.seek(0)
+got = f.read()
+f.close()
+print("same" if got == b"before after" else f"read {got!r}")
+EOF
+      )
+      if [[ $out == same ]]; then result ok openwrite "written, read and closed after the unlink"; else result fail openwrite "$(printf '%s' "$out" | tail -1)"; fi ;;
+    tmpmode)
+      out=$(python3 - "$work/mnt" "$pid" <<'EOF' 2>&1
+import os, stat, sys
+f = open(os.path.join(sys.argv[1], "t.bin"), "wb")
+f.write(b"x")
+f.flush()
+modes = []
+for fd in os.listdir(f"/proc/{sys.argv[2]}/fd"):
+    link = os.readlink(f"/proc/{sys.argv[2]}/fd/{fd}")
+    if link.endswith("(deleted)"):
+        st = os.stat(f"/proc/{sys.argv[2]}/fd/{fd}")
+        if stat.S_ISREG(st.st_mode):
+            modes.append((oct(st.st_mode & 0o777), st.st_nlink))
+f.close()
+seen = " ".join(f"mode {m}, {n} links" for m, n in modes) or "no buffer found"
+print(("private: " if modes and all(m == "0o600" and n == 0 for m, n in modes) else "open: ") + seen)
+EOF
+      )
+      if [[ $out == private:* ]]; then result ok tmpmode "${out#private: }"; else result fail tmpmode "${out#open: }"; fi ;;
+    *) result fail "$c" "unknown case" ;;
+    esac
+  done
+  echo "$pass passed, $fail failed ($("$refs" --version 2>&1 | head -1))"
+  ((fail == 0))
+  exit
+fi
 names=("$@")
 ((${#names[@]})) || mapfile -t names < <(ls testdata/refs)
 mnt=$(mktemp -d)
@@ -27,7 +157,10 @@ for name in "${names[@]}"; do
     source=("$dir/disk.img")
   fi
   [[ -f ${source[-1]} ]] || continue
-  target/release/refs mount "${source[@]}" "$mnt" &
+  # Read as it is (the guard's verdict has tests of its own): since 1.2.1
+  # two volumes of the corpus, taken with log records past their checkpoint,
+  # are suspect and were not mounted, so not compared.
+  "$refs" mount --force "${source[@]}" "$mnt" &
   pid=$!
   for _ in $(seq 100); do mountpoint -q "$mnt" && break; sleep 0.1; done
   python3 - "$dir/manifest.json" "$mnt" <<'EOF' || failed=1

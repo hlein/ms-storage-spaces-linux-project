@@ -381,19 +381,53 @@ impl FileSource {
         Ok(FileSource(Self::temporary()?.0, 0))
     }
 
-    /// An unlinked temporary file (in $REFS_TMPDIR, else the system's).
+    /// An unnamed temporary file (see `temp_file`).
     fn temporary() -> Result<Self> {
-        let dir = std::env::var_os("REFS_TMPDIR").map_or_else(std::env::temp_dir, PathBuf::from);
-        let path = dir.join(format!("refs-{}", std::process::id()));
-        let f = std::fs::OpenOptions::new()
+        Ok(FileSource(temp_file().context("cannot make a temporary file")?, 0))
+    }
+}
+
+/// An unnamed temporary file in $REFS_TMPDIR (else the system's temporary
+/// directory) that only this user can read: O_TMPFILE, which never has a
+/// name, or where the file system cannot, a random name made with mode 0600
+/// and unlinked at once. (1.2.2 made it with the default mode, 0644 under
+/// the usual umask, and a name others could guess, so that for the moment
+/// it had one another user could open it and read what went to the volume.)
+pub(crate) fn temp_file() -> std::io::Result<File> {
+    use std::io::Read;
+    use std::os::unix::fs::OpenOptionsExt;
+    let dir = std::env::var_os("REFS_TMPDIR").map_or_else(std::env::temp_dir, PathBuf::from);
+    #[cfg(all(target_os = "linux", feature = "fuse"))]
+    {
+        use rustix::fs::{Mode, OFlags};
+        let flags = OFlags::TMPFILE | OFlags::RDWR | OFlags::CLOEXEC;
+        match rustix::fs::open(&dir, flags, Mode::from_raw_mode(0o600)) {
+            Ok(fd) => return Ok(File::from(fd)),
+            // A file system without O_TMPFILE.
+            Err(rustix::io::Errno::OPNOTSUPP | rustix::io::Errno::ISDIR | rustix::io::Errno::INVAL) => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
+    let mut random = [0u8; 8];
+    for _ in 0..16 {
+        File::open("/dev/urandom")?.read_exact(&mut random)?;
+        let path = dir.join(format!("refs-{:016x}", u64::from_le_bytes(random)));
+        match std::fs::OpenOptions::new()
             .read(true)
             .write(true)
             .create_new(true)
+            .mode(0o600)
             .open(&path)
-            .with_context(|| format!("cannot make {}", path.display()))?;
-        let _ = std::fs::remove_file(&path);
-        Ok(FileSource(f, 0))
+        {
+            Ok(f) => {
+                let _ = std::fs::remove_file(&path);
+                return Ok(f);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
     }
+    Err(std::io::Error::other("no free name for a temporary file"))
 }
 
 impl refs::write::Source for FileSource {
@@ -471,6 +505,7 @@ fn mount(
             .write(true)
             .open(&source.devices[0])
             .with_context(|| format!("cannot open {}", source.devices[0].display()))?;
+        hold(&file, &source.devices[0], true)?;
         let offset = match source.offset {
             Some(o) => o,
             None => *find_volumes(&file)?.first().context("no ReFS volume on the device")?,
@@ -497,7 +532,7 @@ fn mount(
         }
         vol
     } else {
-        let dev: Device = Box::new(Counted(open_device(source)?, status.counter()));
+        let dev: Device = Box::new(Counted(open_device_as(source, true)?, status.counter()));
         let offset = match source.offset {
             Some(o) => o,
             None => *find_volumes(dev.as_ref())?
@@ -541,10 +576,44 @@ impl ReadAt for Counted {
 }
 
 fn open_device(source: &Source) -> Result<Device> {
+    open_device_as(source, false)
+}
+
+/// Takes the lock that keeps a volume's writers apart: exclusive for the
+/// writing commands and `refs mount --rw`, shared for a read-only mount
+/// (`--space`: on every disk of the pool, as the servers of `spaces` hold
+/// them). A holder of the other kind is named. (1.2.2 took none: a change
+/// made during a mount for writing was lost when the mount wrote its own
+/// view of the volume over it.)
+fn hold(file: &File, path: &std::path::Path, exclusive: bool) -> Result<()> {
+    let locked = if exclusive {
+        file.try_lock()
+    } else {
+        file.try_lock_shared()
+    };
+    locked.map_err(|e| match e {
+        std::fs::TryLockError::WouldBlock => anyhow::anyhow!(
+            "{} is in use by {}",
+            path.display(),
+            storage_spaces::holders::of_lock(file)
+        ),
+        std::fs::TryLockError::Error(e) => anyhow::Error::new(e).context(format!("cannot lock {}", path.display())),
+    })
+}
+
+/// The device of `source`, with the shared lock of a read-only mount when
+/// `shared`.
+fn open_device_as(source: &Source, shared: bool) -> Result<Device> {
     let files = source
         .devices
         .iter()
-        .map(|p| File::open(p).with_context(|| format!("cannot open {}", p.display())))
+        .map(|p| {
+            let f = File::open(p).with_context(|| format!("cannot open {}", p.display()))?;
+            if shared {
+                hold(&f, p, false)?;
+            }
+            Ok(f)
+        })
         .collect::<Result<Vec<_>>>()?;
     match &source.space {
         None => {
@@ -773,6 +842,9 @@ fn open_writable(device: &std::path::Path, offset: Option<u64>, write: bool) -> 
         .write(write)
         .open(device)
         .with_context(|| format!("cannot open {}", device.display()))?;
+    if write {
+        hold(&file, device, true)?;
+    }
     let offset = match offset {
         Some(o) => o,
         None => *find_volumes(&file)?.first().context("no ReFS volume on the device")?,
@@ -1195,6 +1267,9 @@ fn main() -> Result<()> {
                 .write(yes)
                 .open(&device)
                 .with_context(|| format!("cannot open {}", device.display()))?;
+            if yes {
+                hold(&file, &device, true)?;
+            }
             let offset = match offset {
                 Some(o) => o,
                 None => *find_volumes(&file)?.first().context("no ReFS volume on the device")?,
@@ -1256,6 +1331,9 @@ fn main() -> Result<()> {
                 .write(yes)
                 .open(&device)
                 .with_context(|| format!("cannot open {}", device.display()))?;
+            if yes {
+                hold(&file, &device, true)?;
+            }
             let offset = match offset {
                 Some(o) => o,
                 None => *find_volumes(&file)?.first().context("no ReFS volume on the device")?,
@@ -1288,6 +1366,9 @@ fn main() -> Result<()> {
                 .write(yes)
                 .open(&device)
                 .with_context(|| format!("cannot open {}", device.display()))?;
+            if yes {
+                hold(&file, &device, true)?;
+            }
             let offset = match offset {
                 Some(o) => o,
                 None => *find_volumes(&file)?.first().context("no ReFS volume on the device")?,
@@ -1626,6 +1707,51 @@ fn in_memory(size: u64) -> Result<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A fixture of crates/refs/tests as an image file (sparse, in the
+    /// temporary directory), and the volume's offset.
+    fn image_file(name: &str) -> (PathBuf, u64) {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../refs/tests/fixtures")
+            .join(name);
+        let image = storage_spaces::io::SparseImage::read_from(File::open(dir.join("disk.fixture")).unwrap()).unwrap();
+        let text = std::fs::read_to_string(dir.join("manifest.json")).unwrap();
+        let manifest: serde_json::Value = serde_json::from_str(text.trim_start_matches('\u{feff}')).unwrap();
+        let path = std::env::temp_dir().join(format!("refs-test-{}-{name}.img", std::process::id()));
+        let out = File::create(&path).unwrap();
+        out.set_len(image.size().unwrap()).unwrap();
+        for (at, n) in image.ranges() {
+            let mut buf = vec![0u8; n];
+            image.read_exact_at(&mut buf, at).unwrap();
+            std::os::unix::fs::FileExt::write_all_at(&out, &buf, at).unwrap();
+        }
+        (path, manifest["partition_offset"].as_u64().unwrap())
+    }
+
+    /// A writer of a volume another process holds (a mount, for writing or
+    /// not, or another writer) is refused, naming it; a dry run reads on.
+    /// (1.2.2 took no lock: a change made during a mount for writing was
+    /// lost when the mount wrote its own view of the volume; audit M18.)
+    #[test]
+    fn writers_wait_for_whoever_holds_the_volume() {
+        let (path, offset) = image_file("r314small");
+        for exclusive in [true, false] {
+            let held = File::open(&path).unwrap();
+            if exclusive {
+                held.lock().unwrap();
+            } else {
+                held.lock_shared().unwrap();
+            }
+            let err = open_writable(&path, Some(offset), true)
+                .err()
+                .expect("refused while held");
+            assert!(err.to_string().contains("is in use by"), "{err}");
+            assert!(open_writable(&path, Some(offset), false).is_ok(), "a dry run");
+            drop(held);
+        }
+        assert!(open_writable(&path, Some(offset), true).is_ok());
+        std::fs::remove_file(&path).unwrap();
+    }
 
     #[test]
     fn appending_does_not_reserve_what_the_volume_claims() {

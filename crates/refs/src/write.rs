@@ -365,7 +365,7 @@ impl<'v, D: WriteAt> Transaction<'v, D> {
                 Some(n) => n,
                 None => match self.hand_out_container()? {
                     Some(n) => n,
-                    None => metadata.ok_or_else(|| Error::Unsupported("the volume is full".into()))?,
+                    None => metadata.ok_or_else(|| Error::Full("the volume is full".into()))?,
                 },
             };
             tried.insert(next);
@@ -519,7 +519,7 @@ impl<'v, D: WriteAt> Transaction<'v, D> {
             }
             return Ok((start + j..start + j + n as u64).collect());
         }
-        Err(format_err!("allocator {allocator} has no {n} free clusters"))
+        Err(Error::Full(format!("allocator {allocator} has no {n} free clusters")))
     }
 
     /// Marks clusters free again.

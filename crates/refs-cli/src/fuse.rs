@@ -109,24 +109,10 @@ struct Pending {
 
 impl Pending {
     fn new() -> Result<Self, Errno> {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static NEXT: AtomicU64 = AtomicU64::new(0);
-        let dir = std::env::var_os("REFS_TMPDIR").map_or_else(std::env::temp_dir, PathBuf::from);
-        let path = dir.join(format!(
-            "refs-mount-{}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        ));
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create_new(true)
-            .open(&path)
-            .map_err(|e| {
-                eprintln!("{}: {e}", path.display());
-                Errno::EIO
-            })?;
-        let _ = std::fs::remove_file(&path);
+        let file = crate::temp_file().map_err(|e| {
+            eprintln!("a buffer for a file open for writing: {e}");
+            Errno::EIO
+        })?;
         Ok(Pending {
             file,
             len: 0,
@@ -198,6 +184,19 @@ struct State {
     pending: HashMap<u64, Pending>,
     /// The handles open for writing: the inode each holds the buffer of.
     writers: HashMap<u64, u64>,
+    /// The handles open for reading only: their inode.
+    readers: HashMap<u64, u64>,
+    /// Files whose last name went while they were open: their attributes
+    /// then. Their buffer holds their content for their handles until the
+    /// last closes, and nothing is written back (1.2.2 failed their reads
+    /// and fstat, and their close with ENOENT, and kept the buffer).
+    orphans: HashMap<u64, FileAttr>,
+    /// Open directories: the listing each was opened on, which its readdir
+    /// calls page through (their offsets count its entries, so that what a
+    /// change removes or adds meanwhile moves none; 1.2.2 counted the
+    /// entries the directory had at each call, and entries were skipped
+    /// when names went while it was read).
+    dir_handles: HashMap<u64, Arc<Dir>>,
     next_handle: u64,
     /// The lookups the kernel holds per inode (`forget` gives them back).
     lookups: HashMap<u64, u64>,
@@ -215,6 +214,9 @@ impl State {
             files: HashMap::new(),
             pending: HashMap::new(),
             writers: HashMap::new(),
+            readers: HashMap::new(),
+            orphans: HashMap::new(),
+            dir_handles: HashMap::new(),
             next_handle: 1,
             lookups: HashMap::new(),
         };
@@ -229,6 +231,27 @@ impl State {
         let fh = self.next_handle;
         self.next_handle += 1;
         self.writers.insert(fh, ino);
+        fh
+    }
+
+    /// A new handle open for reading inode `ino` (it holds no buffer).
+    fn reader(&mut self, ino: u64) -> u64 {
+        let fh = self.next_handle;
+        self.next_handle += 1;
+        self.readers.insert(fh, ino);
+        fh
+    }
+
+    /// Whether inode `ino` is open, for reading or writing.
+    fn is_open(&self, ino: u64) -> bool {
+        self.readers.values().chain(self.writers.values()).any(|&i| i == ino)
+    }
+
+    /// A new handle of an open directory, its listing `dir`.
+    fn dir_handle(&mut self, dir: Arc<Dir>) -> u64 {
+        let fh = self.next_handle;
+        self.next_handle += 1;
+        self.dir_handles.insert(fh, dir);
         fh
     }
 
@@ -353,6 +376,90 @@ fn now() -> u64 {
     filetime(SystemTime::now())
 }
 
+/// A name as the mount keeps it in its paths: the volume's name, with each
+/// lone surrogate (a UTF-16 unit UTF-8 cannot carry, which Windows allows
+/// in names) as `\uXXXX`. No name on the volume has a backslash, so these
+/// stand for nothing else; one from the kernel is kept as `\\`. (1.2.2 had
+/// U+FFFD for each, and two names differing only there were one: one file
+/// unreachable, listed twice.)
+fn internal_name(e: &Entry) -> String {
+    let Some(units) = &e.units else {
+        return e.name.clone();
+    };
+    char::decode_utf16(units.iter().copied())
+        .map(|r| match r {
+            Ok(c) => c.to_string(),
+            Err(lone) => format!("\\u{:04x}", lone.unpaired_surrogate()),
+        })
+        .collect()
+}
+
+/// A name from the kernel as the mount keeps it (see `internal_name`): its
+/// bytes UTF-8, a lone surrogate as UTF-8 would have it (WTF-8: three
+/// bytes, 0xed 0xa0..0xbf ..) escaped; other bytes are refused.
+fn kernel_name(name: &OsStr) -> Result<String, Errno> {
+    use std::os::unix::ffi::OsStrExt;
+    let bytes = name.as_bytes();
+    let mut out = String::with_capacity(bytes.len());
+    let mut at = 0;
+    loop {
+        let (valid, rest) = match std::str::from_utf8(&bytes[at..]) {
+            Ok(text) => (text, None),
+            Err(e) => (
+                std::str::from_utf8(&bytes[at..at + e.valid_up_to()]).unwrap_or_default(),
+                Some(at + e.valid_up_to()),
+            ),
+        };
+        out.push_str(&valid.replace('\\', "\\\\"));
+        let Some(bad) = rest else {
+            return Ok(out);
+        };
+        match bytes.get(bad..bad + 3) {
+            Some(&[0xed, b1 @ 0xa0..=0xbf, b2 @ 0x80..=0xbf]) => {
+                let unit = 0xd000 | u16::from(b1 & 0x3f) << 6 | u16::from(b2 & 0x3f);
+                out.push_str(&format!("\\u{unit:04x}"));
+                at = bad + 3;
+            }
+            _ => return Err(Errno::EINVAL),
+        }
+    }
+}
+
+/// A name the mount keeps (see `internal_name`) as the kernel takes it:
+/// lone surrogates as WTF-8, `\\` as a backslash.
+fn os_name(internal: &str) -> std::ffi::OsString {
+    use std::os::unix::ffi::OsStringExt;
+    if !internal.contains('\\') {
+        return internal.into();
+    }
+    let mut out: Vec<u8> = Vec::with_capacity(internal.len());
+    let mut rest = internal;
+    while let Some(i) = rest.find('\\') {
+        out.extend(&rest.as_bytes()[..i]);
+        let after = &rest[i + 1..];
+        if let Some(r) = after.strip_prefix('\\') {
+            out.push(b'\\');
+            rest = r;
+        } else if let Some(unit) = after
+            .strip_prefix('u')
+            .and_then(|h| h.get(..4))
+            .and_then(|h| u16::from_str_radix(h, 16).ok())
+        {
+            out.extend([
+                0xe0 | (unit >> 12) as u8,
+                0x80 | (unit >> 6 & 0x3f) as u8,
+                0x80 | (unit & 0x3f) as u8,
+            ]);
+            rest = &after[5..];
+        } else {
+            out.push(b'\\');
+            rest = after;
+        }
+    }
+    out.extend(rest.as_bytes());
+    std::ffi::OsString::from_vec(out)
+}
+
 fn child(parent: &str, name: &str) -> String {
     if parent == "/" {
         format!("/{name}")
@@ -377,6 +484,8 @@ fn errno(what: &str, e: refs::Error) -> Errno {
         refs::Error::Unsupported(m) if m.contains("not empty") => Errno::ENOTEMPTY,
         refs::Error::Unsupported(m) if m.contains("exists") => Errno::EEXIST,
         refs::Error::Unsupported(_) => Errno::EOPNOTSUPP,
+        // 1.2.2 said "Operation not supported".
+        refs::Error::Full(_) => Errno::ENOSPC,
         _ => Errno::EIO,
     }
 }
@@ -475,7 +584,7 @@ impl RefsFs {
         let entries = vol
             .read_dir(oid)
             .map_err(|e| errno(&format!("directory {oid:#x}"), e))?;
-        let by_name = entries.iter().enumerate().map(|(i, e)| (e.name.clone(), i)).collect();
+        let by_name = entries.iter().enumerate().map(|(i, e)| (internal_name(e), i)).collect();
         let d = Arc::new(Dir { entries, by_name });
         self.state.lock_ok().cache_dir(oid, d.clone());
         Ok(d)
@@ -502,7 +611,12 @@ impl RefsFs {
                 .by_name
                 .get(part)
                 .map(|&i| &listing.entries[i])
-                .or_else(|| listing.entries.iter().find(|e| e.name.eq_ignore_ascii_case(part)))
+                .or_else(|| {
+                    listing
+                        .entries
+                        .iter()
+                        .find(|e| internal_name(e).eq_ignore_ascii_case(part))
+                })
                 .ok_or(Errno::ENOENT)?
                 .clone();
             if let Target::Directory(child) = e.target {
@@ -541,6 +655,18 @@ impl RefsFs {
     }
 
     fn attr(&self, vol: &Volume<Rw>, ino: u64) -> Result<FileAttr, Errno> {
+        {
+            let s = self.state.lock_ok();
+            if let Some(&a) = s.orphans.get(&ino) {
+                let size = s.pending.get(&ino).map_or(a.size, |p| p.len);
+                return Ok(FileAttr {
+                    size,
+                    blocks: size.div_ceil(vol.cluster) * vol.cluster / 512,
+                    nlink: 0,
+                    ..a
+                });
+            }
+        }
         let path = self.path(ino)?;
         let mut entry = self.resolve(vol, &path)?;
         // A moved or linked file: its record has the current sizes and
@@ -559,6 +685,7 @@ impl RefsFs {
                 accessed: u64_at(0x40),
             };
             e.size = u64_at(0x58);
+            e.allocated = u64_at(0x60);
             e.attributes = (e.attributes & !0xffff) | u32::from_le_bytes(r[0x48..0x4c].try_into().unwrap()) & 0xffff;
             links = u32::from_le_bytes(r[0x98..0x9c].try_into().unwrap()).max(1);
         }
@@ -582,14 +709,21 @@ impl RefsFs {
                 (FileType::RegularFile, e.size, 0o444 | writable, e.times)
             }
         };
+        // What it has on the volume (a sparse file less than its size; 1.2.2
+        // counted the size), or, written to, its size in whole clusters.
+        let mut allocated = match &entry {
+            Some(e) if kind == FileType::RegularFile => e.allocated,
+            _ => 0,
+        };
         if let Some(p) = self.state.lock_ok().pending.get(&ino) {
             size = p.len;
+            allocated = size.div_ceil(vol.cluster) * vol.cluster;
         }
         let (uid, gid) = if self.writable { self.owner } else { (0, 0) };
         Ok(FileAttr {
             ino: INodeNo(ino),
             size,
-            blocks: size.div_ceil(512),
+            blocks: allocated.div_ceil(512),
             atime: system_time(times.accessed),
             mtime: system_time(times.modified),
             ctime: system_time(times.changed),
@@ -658,6 +792,15 @@ impl RefsFs {
         if !self.writable {
             return Err(Errno::EROFS);
         }
+        // A name with a lone surrogate (or a backslash) is read, not changed:
+        // the library takes names as UTF-8.
+        if what.contains('\\') {
+            eprintln!(
+                "{}: names with a lone surrogate or a backslash are not changed",
+                os_name(what).to_string_lossy()
+            );
+            return Err(Errno::EACCES);
+        }
         let mut vol = self.vol.write_ok();
         let r = storage_spaces::isolate::caught(|| f(&mut vol));
         drop(vol);
@@ -678,7 +821,14 @@ impl RefsFs {
     /// and reports the error (1.2.1 forgot the changes at the first try).
     fn write_back(&self, ino: u64) -> Result<(), Errno> {
         let (file, len, ranges, whole) = {
-            let s = self.state.lock_ok();
+            let mut s = self.state.lock_ok();
+            // A file without a name: nothing to write it to.
+            if s.orphans.contains_key(&ino) {
+                if let Some(p) = s.pending.get_mut(&ino) {
+                    p.dirty = false;
+                }
+                return Ok(());
+            }
             match s.pending.get(&ino) {
                 Some(p) if p.dirty => (
                     p.file.try_clone().map_err(|_| Errno::EIO)?,
@@ -707,16 +857,19 @@ impl RefsFs {
     }
 
     /// Opens inode `ino` with open(2)'s `flags`: for writing, its content
-    /// in a buffer its writers share. The handle (0 for reading only).
+    /// in a buffer its writers share. The handle.
     fn open_inode(&self, ino: u64, flags: i32) -> Result<u64, Errno> {
         let path = self.path(ino)?;
         let vol = self.vol.read_ok();
         self.file(&vol, &path)?;
         if flags & 3 == 0 {
-            return Ok(0);
+            return Ok(self.state.lock_ok().reader(ino));
         }
         if !self.writable {
             return Err(Errno::EROFS);
+        }
+        if path.contains('\\') {
+            return Err(Errno::EACCES);
         }
         let truncate = flags & O_TRUNC != 0;
         let mut s = self.state.lock_ok();
@@ -762,15 +915,106 @@ impl RefsFs {
     fn release_inode(&self, ino: u64, fh: u64) -> Result<(), Errno> {
         let r = self.write_back(ino);
         let mut s = self.state.lock_ok();
+        s.readers.remove(&fh);
         if s.writers.remove(&fh).is_some()
             && let Some(p) = s.pending.get_mut(&ino)
         {
             p.handles = p.handles.saturating_sub(1);
         }
-        if s.pending.get(&ino).is_some_and(|p| p.handles == 0 && !p.dirty) {
+        if s.orphans.contains_key(&ino) {
+            // Its buffer serves its readers too, until the last handle.
+            if !s.is_open(ino) {
+                s.pending.remove(&ino);
+                s.orphans.remove(&ino);
+            }
+        } else if s.pending.get(&ino).is_some_and(|p| p.handles == 0 && !p.dirty) {
             s.pending.remove(&ino);
         }
         r
+    }
+
+    /// Reads `size` bytes from `offset` of inode `ino`: from its buffer,
+    /// else from the volume.
+    fn read_inode(&self, ino: u64, offset: u64, size: u32) -> Result<Vec<u8>, Errno> {
+        if let Some(p) = self.state.lock_ok().pending.get(&ino) {
+            return p.read_at(offset, size);
+        }
+        let vol = self.vol.read_ok();
+        let file = self.path(ino).and_then(|p| self.file(&vol, &p))?;
+        let Some(stream) = &file.data else {
+            return Ok(Vec::new());
+        };
+        let mut buf = vec![0u8; size as usize];
+        let n = vol.read_stream(stream, offset, &mut buf).map_err(|e| {
+            eprintln!("read of {size} bytes at {offset:#x} failed: {e}");
+            Errno::EIO
+        })?;
+        buf.truncate(n);
+        Ok(buf)
+    }
+
+    /// Before name `path` goes: when it is the last name of a file that is
+    /// open, its content in a buffer (unless it has one), the file's
+    /// attributes, and whether the buffer was made for this. None for a
+    /// file not open, or with names left.
+    fn keep_open(&self, path: &str) -> Option<(u64, FileAttr, bool)> {
+        let ino = *self.state.lock_ok().inodes.get(path)?;
+        if !self.state.lock_ok().is_open(ino) {
+            return None;
+        }
+        let vol = self.vol.read_ok();
+        let entry = self.resolve(&vol, path).ok()??;
+        if entry.is_dir() {
+            return None;
+        }
+        let names = match entry.target {
+            Target::Split { .. } => vol
+                .record(&entry)
+                .ok()
+                .filter(|r| r.len() >= 0x9c)
+                .map_or(1, |r| u32::from_le_bytes(r[0x98..0x9c].try_into().unwrap())),
+            _ => 1,
+        };
+        if names > 1 {
+            return None;
+        }
+        let attr = self.attr(&vol, ino).ok()?;
+        let made = !self.state.lock_ok().pending.contains_key(&ino);
+        if made {
+            match self.content(&vol, path) {
+                Ok(mut p) => {
+                    p.handles = 0;
+                    self.state.lock_ok().pending.insert(ino, p);
+                }
+                Err(e) => eprintln!("{path}: open, its content not kept: {e:?}"),
+            }
+        }
+        Some((ino, attr, made))
+    }
+
+    /// After the change `keep_open` prepared for: the file has no name now
+    /// (`gone`), or, the change refused, the buffer made for it goes.
+    fn settle_open(&self, kept: Option<(u64, FileAttr, bool)>, gone: bool) {
+        let Some((ino, attr, made)) = kept else {
+            return;
+        };
+        let mut s = self.state.lock_ok();
+        if gone {
+            s.orphans.insert(ino, attr);
+        } else if made {
+            s.pending.remove(&ino);
+        }
+    }
+
+    /// Removes name `path` (unlink, rmdir); the last name of a file that is
+    /// open leaves it to its handles (see `orphans`).
+    fn unlink_path(&self, path: &str) -> Result<(), Errno> {
+        let kept = self.keep_open(path);
+        let r = self.change(path, |v| v.delete_file(path, now()));
+        self.settle_open(kept, r.is_ok());
+        r?;
+        self.changed(Some(path));
+        Ok(())
     }
 
     /// Renames `from` to `to` (paths), replacing what `to` names unless
@@ -796,7 +1040,14 @@ impl RefsFs {
                     return Err(if target.is_dir() { Errno::EISDIR } else { Errno::ENOTDIR });
                 }
             }
-            self.change(from, |v| v.rename_replacing(from, to, now()))?;
+            let kept = if from.eq_ignore_ascii_case(to) {
+                None
+            } else {
+                self.keep_open(to)
+            };
+            let r = self.change(from, |v| v.rename_replacing(from, to, now()));
+            self.settle_open(kept, r.is_ok());
+            r?;
         } else {
             let (from_dir, _) = split(from);
             let (to_dir, to_name) = split(to);
@@ -808,6 +1059,49 @@ impl RefsFs {
         }
         self.moved(from, to);
         Ok(())
+    }
+
+    /// Opens directory `ino`: a handle on its listing now.
+    fn open_dir(&self, ino: u64) -> Result<u64, Errno> {
+        let vol = self.vol.read_ok();
+        let path = self.path(ino)?;
+        let listing = self.directory(&vol, &path).and_then(|d| self.listing(&vol, d))?;
+        Ok(self.state.lock_ok().dir_handle(listing))
+    }
+
+    /// The entries of directory `ino` from `offset` on (".", "..", then
+    /// its names; each with the offset of the next): of the listing handle
+    /// `fh` was opened on, else of the listing now.
+    fn dir_page(&self, ino: u64, fh: u64, offset: u64) -> Result<Vec<(u64, FileType, String, u64)>, Errno> {
+        let vol = self.vol.read_ok();
+        let path = self.path(ino)?;
+        let opened = self.state.lock_ok().dir_handles.get(&fh).cloned();
+        let listing = match opened {
+            Some(l) => l,
+            None => self.directory(&vol, &path).and_then(|d| self.listing(&vol, d))?,
+        };
+        let mut page = Vec::new();
+        for (i, name) in [".", ".."].into_iter().enumerate().skip(offset as usize) {
+            page.push((ino, FileType::Directory, name.to_owned(), i as u64 + 1));
+        }
+        for (i, e) in listing
+            .entries
+            .iter()
+            .enumerate()
+            .skip((offset as usize).saturating_sub(2))
+        {
+            let kind = if Self::is_link(e) {
+                FileType::Symlink
+            } else if e.is_dir() {
+                FileType::Directory
+            } else {
+                FileType::RegularFile
+            };
+            let name = internal_name(e);
+            let child = self.inode(&child(&path, &name), Some(e));
+            page.push((child, kind, name, i as u64 + 3));
+        }
+        Ok(page)
     }
 
     /// The entry reply for a path just made.
@@ -825,8 +1119,7 @@ impl RefsFs {
     }
 
     fn name_path(&self, parent: INodeNo, name: &OsStr) -> Result<String, Errno> {
-        let name = name.to_str().ok_or(Errno::EINVAL)?;
-        Ok(child(&self.path(parent.0)?, name))
+        Ok(child(&self.path(parent.0)?, &kernel_name(name)?))
     }
 }
 
@@ -843,7 +1136,7 @@ impl Filesystem for RefsFs {
             }
             // The name as the volume spells it (lookups ignore case).
             let (path, entry) = match self.resolve(&vol, &path) {
-                Ok(Some(e)) => (child(split(&path).0, &e.name), Some(e)),
+                Ok(Some(e)) => (child(split(&path).0, &internal_name(&e)), Some(e)),
                 Ok(None) => (path, None),
                 Err(e) => return reply.error(e),
             };
@@ -894,6 +1187,16 @@ impl Filesystem for RefsFs {
     ) {
         self.guard("setattr", move || {
             let r = (|| -> Result<(), Errno> {
+                {
+                    // A file without a name: its buffer's length, nothing else.
+                    let mut s = self.state.lock_ok();
+                    if s.orphans.contains_key(&ino.0) {
+                        if let (Some(size), Some(p)) = (size, s.pending.get_mut(&ino.0)) {
+                            p.set_len(size)?;
+                        }
+                        return Ok(());
+                    }
+                }
                 let path = self.path(ino.0)?;
                 if let Some(size) = size {
                     if size > MAX_WRITTEN {
@@ -980,11 +1283,8 @@ impl Filesystem for RefsFs {
                 Ok(p) => p,
                 Err(e) => return reply.error(e),
             };
-            match self.change(&path, |v| v.delete_file(&path, now())) {
-                Ok(()) => {
-                    self.changed(Some(&path));
-                    reply.ok()
-                }
+            match self.unlink_path(&path) {
+                Ok(()) => reply.ok(),
                 Err(e) => reply.error(e),
             }
         })
@@ -1092,29 +1392,9 @@ impl Filesystem for RefsFs {
         _lock_owner: Option<LockOwner>,
         reply: ReplyData,
     ) {
-        self.guard("read", move || {
-            if let Some(p) = self.state.lock_ok().pending.get(&ino.0) {
-                return match p.read_at(offset, size) {
-                    Ok(b) => reply.data(&b),
-                    Err(e) => reply.error(e),
-                };
-            }
-            let vol = self.vol.read_ok();
-            let file = match self.path(ino.0).and_then(|p| self.file(&vol, &p)) {
-                Ok(f) => f,
-                Err(e) => return reply.error(e),
-            };
-            let Some(stream) = &file.data else {
-                return reply.data(&[]);
-            };
-            let mut buf = vec![0u8; size as usize];
-            match vol.read_stream(stream, offset, &mut buf) {
-                Ok(n) => reply.data(&buf[..n]),
-                Err(e) => {
-                    eprintln!("read of {size} bytes at {offset:#x} failed: {e}");
-                    reply.error(Errno::EIO)
-                }
-            }
+        self.guard("read", move || match self.read_inode(ino.0, offset, size) {
+            Ok(b) => reply.data(&b),
+            Err(e) => reply.error(e),
         })
     }
 
@@ -1258,33 +1538,28 @@ impl Filesystem for RefsFs {
         })
     }
 
-    fn readdir(&self, _req: &Request, ino: INodeNo, _fh: FileHandle, offset: u64, mut reply: ReplyDirectory) {
+    fn opendir(&self, _req: &Request, ino: INodeNo, _flags: OpenFlags, reply: ReplyOpen) {
+        self.guard("opendir", move || match self.open_dir(ino.0) {
+            Ok(fh) => reply.opened(FileHandle(fh), FopenFlags::empty()),
+            Err(e) => reply.error(e),
+        })
+    }
+
+    fn releasedir(&self, _req: &Request, _ino: INodeNo, fh: FileHandle, _flags: OpenFlags, reply: ReplyEmpty) {
+        self.guard("releasedir", move || {
+            self.state.lock_ok().dir_handles.remove(&fh.0);
+            reply.ok()
+        })
+    }
+
+    fn readdir(&self, _req: &Request, ino: INodeNo, fh: FileHandle, offset: u64, mut reply: ReplyDirectory) {
         self.guard("readdir", move || {
-            let vol = self.vol.read_ok();
-            let path = match self.path(ino.0) {
+            let page = match self.dir_page(ino.0, fh.0, offset) {
                 Ok(p) => p,
                 Err(e) => return reply.error(e),
             };
-            let listing = match self.directory(&vol, &path).and_then(|d| self.listing(&vol, d)) {
-                Ok(l) => l,
-                Err(e) => return reply.error(e),
-            };
-            let mut all = vec![
-                (ino.0, FileType::Directory, ".".to_owned()),
-                (ino.0, FileType::Directory, "..".to_owned()),
-            ];
-            for e in &listing.entries {
-                let kind = if Self::is_link(e) {
-                    FileType::Symlink
-                } else if e.is_dir() {
-                    FileType::Directory
-                } else {
-                    FileType::RegularFile
-                };
-                all.push((self.inode(&child(&path, &e.name), Some(e)), kind, e.name.clone()));
-            }
-            for (i, (child, kind, name)) in all.into_iter().enumerate().skip(offset as usize) {
-                if reply.add(INodeNo(child), (i + 1) as u64, kind, name) {
+            for (child, kind, name, next) in page {
+                if reply.add(INodeNo(child), next, kind, os_name(&name)) {
                     break;
                 }
             }
@@ -1707,12 +1982,19 @@ fn unescape_octal(s: &str) -> Vec<u8> {
     out
 }
 
+/// The refs tests' forging of fixtures (pages changed, their checksums
+/// stored again), for names Windows allows and `refs` does not write.
+#[cfg(test)]
+#[allow(dead_code)]
+#[path = "../../refs/tests/forge/mod.rs"]
+mod forge;
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::Arc;
 
-    use storage_spaces::io::{Overlay, SparseImage};
+    use storage_spaces::io::{Overlay, ReadAt as _, SparseImage};
 
     /// The status file of `refs mount --status-file`: opening with the
     /// bytes read while the volume opens, then mounted or failed, each
@@ -1784,6 +2066,7 @@ mod tests {
     fn entry(name: &str) -> Entry {
         Entry {
             name: name.to_owned(),
+            units: None,
             attributes: 0,
             times: Default::default(),
             size: 0,
@@ -1872,6 +2155,231 @@ mod tests {
         serve("r314small", writable, |image| Box::new(Overlay::new(image)))
     }
 
+    /// An image at hand served from memory (changes in an overlay).
+    fn serve_image(image: SparseImage, offset: u64, writable: bool) -> RefsFs {
+        RefsFs {
+            vol: RwLock::new(Volume::open(Box::new(Overlay::new(image)) as Rw, offset).unwrap()),
+            writable,
+            mountpoint: PathBuf::from("/mnt"),
+            owner: (0, 0),
+            state: Mutex::new(State::new()),
+            broken: AtomicBool::new(false),
+        }
+    }
+
+    /// The buffer of a file open for writing has no name, and only its user
+    /// may read it (1.2.2 made it with the default mode, 0644 under the
+    /// usual umask, and a name others could guess, for the moment it had
+    /// one; audit M18).
+    #[test]
+    fn buffers_of_files_open_for_writing_are_private() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let p = Pending::new().unwrap();
+        let m = p.file.metadata().unwrap();
+        assert_eq!((m.permissions().mode() & 0o777, m.nlink()), (0o600, 0));
+    }
+
+    /// st_blocks counts what a file has on the volume: Windows' sparse file
+    /// has half its size (1.2.2 counted the size; audit M18).
+    #[test]
+    fn st_blocks_count_what_a_file_has() {
+        let fs = serve("r314sparsemap", false, |image| Box::new(Overlay::new(image)));
+        let ino = fs.inode("/holes.bin", None);
+        let attr = fs.attr(&fs.vol.read_ok(), ino).unwrap();
+        assert_eq!((attr.size, attr.blocks), (204_800_000, 25_000 * 4096 / 512));
+    }
+
+    /// Data of zeros, as much as asked for.
+    struct Zeros(u64);
+
+    impl refs::write::Source for Zeros {
+        fn len(&self) -> u64 {
+            self.0
+        }
+        fn read_into(&self, _offset: u64, buf: &mut [u8]) -> refs::Result<()> {
+            buf.fill(0);
+            Ok(())
+        }
+    }
+
+    /// A change the volume has no room for fails with ENOSPC (1.2.2:
+    /// EOPNOTSUPP, "Operation not supported"; audit M18).
+    #[test]
+    fn a_change_without_room_is_enospc() {
+        let fs = served(true);
+        let free = {
+            let vol = fs.vol.read_ok();
+            vol.free_clusters().unwrap() * vol.cluster
+        };
+        let more = Zeros(free + (1 << 30));
+        let r = fs.change("/big.bin", |v| v.create_file_from("/big.bin", &more, now()));
+        assert_eq!(r, Err(Errno::ENOSPC));
+    }
+
+    /// A directory listed while its names go: every name it had when it
+    /// was opened comes once, none is skipped (1.2.2's offsets counted the
+    /// names left at each call: 10 unlinked, the next page skipped 10;
+    /// audit M18).
+    #[test]
+    fn a_listing_survives_unlinks_between_pages() {
+        let fs = served(true);
+        {
+            let mut vol = fs.vol.write_ok();
+            vol.create_directory("/many", now()).unwrap();
+            for i in 0..40 {
+                vol.create_file(&format!("/many/f{i:02}"), b"x", now()).unwrap();
+            }
+        }
+        fs.changed(None);
+        let ino = fs.inode("/many", None);
+        let fh = fs.open_dir(ino).unwrap();
+        let first = fs.dir_page(ino, fh, 0).unwrap();
+        let mut seen: Vec<String> = first[..12].iter().map(|e| e.2.clone()).collect();
+        for name in &seen[2..] {
+            fs.unlink_path(&format!("/many/{name}")).unwrap();
+        }
+        seen.extend(fs.dir_page(ino, fh, first[11].3).unwrap().into_iter().map(|e| e.2));
+        let mut want = vec![".".to_owned(), "..".to_owned()];
+        want.extend((0..40).map(|i| format!("f{i:02}")));
+        assert_eq!(seen, want);
+        // A new handle lists what is left.
+        let fresh = fs.open_dir(ino).unwrap();
+        assert_eq!(fs.dir_page(ino, fresh, 0).unwrap().len(), 2 + 30);
+    }
+
+    /// A file open for reading whose name goes (unlink, a rename over it)
+    /// reads on as it was, and fstat says so, until it is closed (1.2.2:
+    /// ENOENT; audit M18).
+    #[test]
+    fn a_file_whose_name_goes_while_open_reads_on() {
+        let fs = served(true);
+        for how in ["unlink", "rename over"] {
+            {
+                let mut vol = fs.vol.write_ok();
+                vol.create_file("/o.bin", &[0x6f; 9000], now()).unwrap();
+                vol.create_file("/n.bin", b"new", now()).unwrap();
+            }
+            fs.changed(None);
+            let ino = fs.inode("/o.bin", None);
+            let fh = fs.open_inode(ino, 0).unwrap();
+            if how == "unlink" {
+                fs.unlink_path("/o.bin").unwrap();
+            } else {
+                fs.rename_paths("/n.bin", "/o.bin", RenameFlags::empty()).unwrap();
+            }
+            assert_eq!(fs.read_inode(ino, 0, 9000).unwrap(), vec![0x6f; 9000], "{how}");
+            let a = fs.attr(&fs.vol.read_ok(), ino).unwrap();
+            assert_eq!((a.size, a.nlink), (9000, 0), "{how}");
+            fs.release_inode(ino, fh).unwrap();
+            assert!(!fs.state.lock_ok().pending.contains_key(&ino), "{how}");
+            let _ = fs.unlink_path("/o.bin");
+            let _ = fs.unlink_path("/n.bin");
+        }
+    }
+
+    /// A file open for writing whose name goes takes writes and reads them
+    /// back until it is closed, which writes nothing and reports nothing
+    /// (1.2.2: the close failed with ENOENT and the buffer stayed).
+    #[test]
+    fn a_file_whose_name_goes_while_open_for_writing_closes_cleanly() {
+        let fs = served(true);
+        fs.vol.write_ok().create_file("/w.bin", &[1; 5000], now()).unwrap();
+        fs.changed(None);
+        let ino = fs.inode("/w.bin", None);
+        let fh = fs.open_inode(ino, 1).unwrap();
+        assert_eq!(fs.write_inode(ino, 0, b"before"), Ok(6));
+        fs.unlink_path("/w.bin").unwrap();
+        assert_eq!(fs.write_inode(ino, 6, b" after"), Ok(6));
+        assert_eq!(&fs.read_inode(ino, 0, 12).unwrap(), b"before after");
+        fs.release_inode(ino, fh).unwrap();
+        assert!(!fs.state.lock_ok().pending.contains_key(&ino));
+        assert!(fs.vol.read_ok().lookup("/w.bin").is_err());
+    }
+
+    /// Names between the kernel and the mount: lone surrogates as WTF-8,
+    /// backslashes kept apart from the escapes, other bytes refused.
+    #[test]
+    fn names_round_trip_between_the_kernel_and_the_mount() {
+        use std::os::unix::ffi::OsStrExt;
+        for bytes in [
+            b"plain".to_vec(),
+            b"back\\slash".to_vec(),
+            b"a\\u0041".to_vec(),
+            vec![0xed, 0xa0, 0x80, b'x', 0xed, 0xbf, 0xbf],
+            "\u{1f600}".as_bytes().to_vec(),
+        ] {
+            let name = OsStr::from_bytes(&bytes);
+            assert_eq!(os_name(&kernel_name(name).unwrap()), name, "{bytes:x?}");
+        }
+        assert_eq!(kernel_name(OsStr::new("a\\u0041")).unwrap(), "a\\\\u0041");
+        assert_eq!(kernel_name(OsStr::from_bytes(&[0xff])), Err(Errno::EINVAL));
+    }
+
+    /// Two names that differ only in a lone surrogate (Windows allows them):
+    /// each listed once, as WTF-8, each opening its own file; read, not
+    /// changed (1.2.2 read U+FFFD for both: one file unreachable, listed
+    /// twice; audit M18).
+    #[test]
+    fn names_with_lone_surrogates_stay_apart() {
+        use std::os::unix::ffi::OsStringExt;
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../refs/tests/fixtures/r314small");
+        let base = SparseImage::read_from(std::fs::File::open(dir.join("disk.fixture")).unwrap()).unwrap();
+        let offset = 16 << 20;
+        let overlay = Overlay::new(base.clone());
+        {
+            let mut vol = Volume::open(&overlay, offset).unwrap();
+            vol.create_file("/amall.txt", b"first", now()).unwrap();
+            vol.create_file("/bmall.txt", b"second", now()).unwrap();
+        }
+        let mut image = base;
+        for at in overlay.written_pages() {
+            let mut page = vec![0u8; 4096];
+            overlay.read_exact_at(&mut page, at).unwrap();
+            image.insert(at, &page);
+        }
+        let mut forge = forge::Forge { image, offset };
+        for (first, unit) in [(b'a', 0xd800u16), (b'b', 0xd801)] {
+            let key: Vec<u8> = [0x30, 0, 1, 0]
+                .into_iter()
+                .chain(
+                    format!("{}mall.txt", first as char)
+                        .encode_utf16()
+                        .flat_map(u16::to_le_bytes),
+                )
+                .collect();
+            let at = move |page: &[u8]| page.windows(key.len()).position(|w| w == key.as_slice());
+            let pick = at.clone();
+            forge.patch(
+                forge::Tree::Object(refs::volume::ROOT_DIRECTORY),
+                move |page| pick(page).is_some(),
+                move |page| {
+                    let i = at(page).unwrap() + 4;
+                    page[i..i + 2].copy_from_slice(&unit.to_le_bytes());
+                },
+            );
+        }
+        let fs = serve_image(forge.image, offset, true);
+        {
+            let vol = fs.vol.read_ok();
+            let listing = fs.listing(&vol, refs::volume::ROOT_DIRECTORY).unwrap();
+            assert_eq!(listing.by_name.len(), listing.entries.len(), "every name its own");
+        }
+        let page = fs.dir_page(INodeNo::ROOT.0, 0, 0).unwrap();
+        let names: Vec<std::ffi::OsString> = page.iter().map(|e| os_name(&e.2)).collect();
+        for (unit, data) in [(0xd800u16, &b"first"[..]), (0xd801, &b"second"[..])] {
+            let wtf8 = [0xed, 0x80 | (unit >> 6 & 0x3f) as u8, 0x80 | (unit & 0x3f) as u8];
+            let name = std::ffi::OsString::from_vec([&wtf8[..], b"mall.txt"].concat());
+            assert_eq!(names.iter().filter(|n| **n == name).count(), 1, "{name:?}");
+            let path = child("/", &kernel_name(&name).unwrap());
+            let ino = fs.inode(&path, None);
+            let fh = fs.open_inode(ino, 0).unwrap();
+            assert_eq!(fs.read_inode(ino, 0, 16).unwrap(), data);
+            fs.release_inode(ino, fh).unwrap();
+            assert_eq!(fs.open_inode(ino, 1), Err(Errno::EACCES), "read, not changed");
+            assert_eq!(fs.unlink_path(&path), Err(Errno::EACCES));
+        }
+    }
+
     /// A device whose writes fail while `fail` is set.
     struct Flaky(Overlay<SparseImage>, Arc<AtomicBool>);
 
@@ -1945,7 +2453,7 @@ mod tests {
         let ino = fs.inode("/small.txt", None);
         let w = fs.open_inode(ino, 1).unwrap();
         let r = fs.open_inode(ino, 0).unwrap();
-        assert_eq!(r, 0);
+        assert_ne!(r, w);
         assert_eq!(fs.write_inode(ino, 0, b"first"), Ok(5));
         fs.release_inode(ino, r).unwrap();
         assert_eq!(fs.write_inode(ino, 5, b" then"), Ok(5));

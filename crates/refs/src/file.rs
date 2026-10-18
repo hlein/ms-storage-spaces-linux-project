@@ -76,6 +76,10 @@ pub enum Target {
 #[derive(Debug, Clone)]
 pub struct Entry {
     pub name: String,
+    /// The name's UTF-16 units, when `name` cannot hold them: lone
+    /// surrogates, which Windows allows and UTF-8 cannot carry (`name` has
+    /// U+FFFD for each, so two such names can read alike there).
+    pub units: Option<Vec<u16>>,
     /// Windows' attribute bits (0x10 for directories).
     pub attributes: u32,
     pub times: Times,
@@ -96,7 +100,7 @@ impl Entry {
     fn parse(key: &[u8], value: &[u8], v1: bool) -> Result<Self> {
         let sizes = if v1 { 0x68 } else { 0x58 };
         let flags = le16(key, 2);
-        let name = utf16(
+        let (name, units) = crate::util::utf16_exact(
             key.get(4..)
                 .ok_or_else(|| format_err!("name row with a key of {} bytes", key.len()))?,
         );
@@ -114,6 +118,7 @@ impl Entry {
                 }
                 Ok(Entry {
                     name,
+                    units,
                     attributes: windows(le32(value, 0x48)),
                     times: Times {
                         created: le64(value, 0x28),
@@ -138,6 +143,7 @@ impl Entry {
                 };
                 Ok(Entry {
                     name,
+                    units,
                     attributes: windows(raw),
                     times: Times {
                         created: le64(value, 0x10),

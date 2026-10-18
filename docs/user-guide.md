@@ -711,7 +711,10 @@ sudo losetup -r -P -b <sector size> -f --show data.img
 ```
 
 `spaces info` prints the sector size; 4 KiB spaces need `-b 4096`, or the
-partition table will not be found.
+partition table will not be found. The image is a new file only its owner
+may read (0600: it holds the space's data), written beside its name and
+renamed into place once it is complete and on disk, so that a failed
+export leaves no partial image (1.2.2 left one, with the umask's mode).
 
 ## Reading ReFS volumes
 

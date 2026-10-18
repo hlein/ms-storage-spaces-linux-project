@@ -243,6 +243,14 @@
   commands that replace a file's content dropped the rows of its record
   the writer does not know (it kept named streams and their sets alone):
   every row but the data's stays (audit 2026-10-16, M25).
+* `spaces export` wrote the image with the umask's mode (0644 for most:
+  everyone could read the space's data), left what it had written when a
+  read or write failed, and did not name the file in its errors. The image
+  is 0600 now, written beside its name, made durable and renamed into
+  place; a failure leaves nothing and names the file. The NBD socket of
+  `spaces serve-nbd` was made 0600 after `bind`, which listens at once: it
+  is bound in a directory of its own and moved into place once it is 0600
+  (audit 2026-10-16, Low "spaces CLI").
 
 ### Testing
 

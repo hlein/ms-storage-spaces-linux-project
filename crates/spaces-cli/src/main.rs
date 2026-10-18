@@ -1,7 +1,7 @@
 #![forbid(unsafe_code)]
 use std::fs::{File, OpenOptions};
 use std::io::{Seek, SeekFrom, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
@@ -795,23 +795,58 @@ pub(crate) fn extents_text<D: ReadAt>(pool: &Pool<D>, space: &Space) -> String {
     out
 }
 
+/// Copies the space into a new file `output`, 0600 (it holds the space's
+/// data): written into a file of its own beside it, made durable, then
+/// renamed, so that `output` appears whole or not at all (1.2.2 left what
+/// it had written when a read or write failed, with the umask's mode).
 fn export(pool: &Pool<File>, space: &Space, output: &PathBuf) -> Result<()> {
+    use std::os::unix::fs::OpenOptionsExt;
     let reader = open_space(pool, space.id())?;
-    let mut out = OpenOptions::new().write(true).create_new(true).open(output)?;
-    const CHUNK: usize = 1 << 20;
-    let mut buf = vec![0u8; CHUNK];
-    let mut offset = 0;
-    while offset < reader.size() {
-        let n = CHUNK.min((reader.size() - offset) as usize);
-        reader.read_exact_at(&mut buf[..n], offset)?;
-        if buf[..n].iter().all(|&b| b == 0) {
-            out.seek(SeekFrom::Current(n as i64))?;
-        } else {
-            out.write_all(&buf[..n])?;
-        }
-        offset += n as u64;
+    if output.symlink_metadata().is_ok() {
+        bail!("{} exists", output.display());
     }
-    out.set_len(reader.size())?;
+    let name = output
+        .file_name()
+        .with_context(|| format!("{} names no file", output.display()))?;
+    let dir = output
+        .parent()
+        .filter(|d| !d.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let part = dir.join(format!(".{}.{}.part", name.to_string_lossy(), std::process::id()));
+    let mut out = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&part)
+        .with_context(|| format!("cannot create {}", part.display()))?;
+    let copied = (|| -> Result<()> {
+        const CHUNK: usize = 1 << 20;
+        let mut buf = vec![0u8; CHUNK];
+        let mut offset = 0;
+        while offset < reader.size() {
+            let n = CHUNK.min((reader.size() - offset) as usize);
+            reader.read_exact_at(&mut buf[..n], offset)?;
+            if buf[..n].iter().all(|&b| b == 0) {
+                out.seek(SeekFrom::Current(n as i64))?;
+            } else {
+                out.write_all(&buf[..n])
+                    .with_context(|| format!("writing {}", part.display()))?;
+            }
+            offset += n as u64;
+        }
+        out.set_len(reader.size())
+            .with_context(|| format!("writing {}", part.display()))?;
+        out.sync_all().with_context(|| format!("writing {}", part.display()))?;
+        std::fs::rename(&part, output)
+            .with_context(|| format!("cannot rename {} to {}", part.display(), output.display()))?;
+        File::open(dir)
+            .and_then(|d| d.sync_all())
+            .with_context(|| format!("syncing {}", dir.display()))
+    })();
+    if let Err(e) = copied {
+        let _ = std::fs::remove_file(&part);
+        return Err(e.context(format!("exporting {:?} to {}", space.name(), output.display())));
+    }
     println!(
         "exported {} to {} (logical sector size {}; use `losetup -b {}`)",
         size(reader.size()),
@@ -820,6 +855,36 @@ fn export(pool: &Pool<File>, space: &Space, output: &PathBuf) -> Result<()> {
         pool.logical_sector_size
     );
     Ok(())
+}
+
+/// A listener on `socket` that only its owner may connect to, whatever the
+/// umask: bound in a directory of its own beside it (0700), made 0600 and
+/// then moved into place, so that nobody can connect before (1.2.2 made the
+/// socket 0600 after `bind`, which listens at once).
+fn bind_private(socket: &Path) -> std::io::Result<std::os::unix::net::UnixListener> {
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+    let name = socket.file_name().ok_or(std::io::ErrorKind::InvalidInput)?;
+    let parent = socket
+        .parent()
+        .filter(|d| !d.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    // A file there stays (bind refused it too).
+    if socket.symlink_metadata().is_ok() {
+        return Err(std::io::ErrorKind::AddrInUse.into());
+    }
+    let dir = parent.join(format!(".{}.{}", name.to_string_lossy(), std::process::id()));
+    std::fs::DirBuilder::new().mode(0o700).create(&dir)?;
+    let bound = (|| {
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
+        let at = dir.join("socket");
+        let listener = std::os::unix::net::UnixListener::bind(&at)?;
+        std::fs::set_permissions(&at, std::fs::Permissions::from_mode(0o600))?;
+        std::fs::rename(&at, socket)?;
+        Ok(listener)
+    })();
+    let _ = std::fs::remove_file(dir.join("socket"));
+    let _ = std::fs::remove_dir(&dir);
+    bound
 }
 
 fn check_pattern(pool: &Pool<File>, space: &Space, length: Option<u64>, tag: &str) -> Result<()> {
@@ -976,7 +1041,7 @@ impl nbd::Sink for storage_spaces::SpaceWriter<'_, File> {
 fn serve_nbd(
     pool: &Pool<File>,
     space: &Space,
-    socket: &PathBuf,
+    socket: &Path,
     ready_file: Option<&std::path::Path>,
     rw: bool,
 ) -> Result<()> {
@@ -993,10 +1058,7 @@ fn serve_nbd(
             &reader_ro
         }
     };
-    let listener = std::os::unix::net::UnixListener::bind(socket)
-        .with_context(|| format!("cannot listen on {}", socket.display()))?;
-    // Only the owner may connect (whatever the umask), before anyone can.
-    std::fs::set_permissions(socket, std::os::unix::fs::PermissionsExt::from_mode(0o600))?;
+    let listener = bind_private(socket).with_context(|| format!("cannot listen on {}", socket.display()))?;
     let space_size = source.size()?;
     let export = nbd::Export {
         name: space.name(),

@@ -74,17 +74,27 @@ fn pool(dir: &Path) -> Vec<String> {
 /// Starts `spaces serve-nbd` for `space` on `disks` and waits until it
 /// listens; its output if it ends first.
 fn serve(dir: &Path, disks: &[String], space: &str) -> Result<Server, String> {
+    serve_under(dir, disks, space, "022")
+}
+
+/// `serve` under the umask `umask`.
+fn serve_under(dir: &Path, disks: &[String], space: &str, umask: &str) -> Result<Server, String> {
     let socket = dir.join(format!("{space}.sock"));
     let ready = dir.join(format!("{space}.ready"));
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_spaces"));
-    cmd.arg("serve-nbd")
-        .args(disks)
-        .args(["--space", space, "--socket"])
-        .arg(&socket)
-        .arg("--ready-file")
-        .arg(&ready)
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped());
+    let mut cmd = Command::new("sh");
+    cmd.args([
+        "-c",
+        &format!("umask {umask}; exec \"$0\" \"$@\""),
+        env!("CARGO_BIN_EXE_spaces"),
+    ])
+    .arg("serve-nbd")
+    .args(disks)
+    .args(["--space", space, "--socket"])
+    .arg(&socket)
+    .arg("--ready-file")
+    .arg(&ready)
+    .stdout(Stdio::null())
+    .stderr(Stdio::piped());
     let mut server = Server(cmd.spawn().unwrap());
     let start = Instant::now();
     while !ready.exists() {
@@ -139,4 +149,30 @@ fn the_spaces_of_a_pool_are_served_at_once_and_writers_wait() {
     drop((one, two));
     let o = spaces(&args);
     assert!(o.status.success(), "{}", text(&o));
+}
+
+/// The socket is the owner's alone whatever the umask, from the moment it
+/// can be connected to: bound in a directory of its own (0700), made 0600,
+/// then moved into place, the directory gone (1.2.2 made it 0600 after
+/// `bind`, which listens at once). A file at the path stays, refused.
+#[test]
+fn sockets_are_the_owners_alone_whatever_the_umask() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = std::env::temp_dir().join(format!("spaces-sockets-{}", std::process::id()));
+    let _scratch = Scratch(dir.clone());
+    let disks = pool(&dir);
+    let one = serve_under(&dir, &disks, "one", "000").unwrap();
+    let mode = std::fs::metadata(dir.join("one.sock")).unwrap().permissions().mode();
+    assert_eq!(mode & 0o777, 0o600);
+    let left: Vec<String> = std::fs::read_dir(&dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|n| n.starts_with('.'))
+        .collect();
+    assert!(left.is_empty(), "{left:?}");
+    drop(one);
+    std::fs::write(dir.join("two.sock"), b"a file").unwrap();
+    let e = serve(&dir, &disks, "two").map(|_| ()).unwrap_err();
+    assert!(e.contains("cannot listen on"), "{e}");
+    assert_eq!(std::fs::read(dir.join("two.sock")).unwrap(), b"a file");
 }

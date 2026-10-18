@@ -1309,17 +1309,50 @@ fn serve_nbd(
                 std::process::exit(code);
             }
         });
+        let mut short = false;
         for conn in listener.incoming() {
-            let conn = conn?;
-            let export = &export;
-            scope.spawn(move || {
-                if let Err(e) = nbd::serve(export, conn) {
-                    eprintln!("connection failed: {e}");
+            match conn {
+                Ok(conn) => {
+                    short = false;
+                    let export = &export;
+                    scope.spawn(move || {
+                        if let Err(e) = nbd::serve(export, conn) {
+                            eprintln!("connection failed: {e}");
+                        }
+                    });
                 }
-            });
+                // Out of descriptors or memory for now (the connections
+                // being served hold them): accepting goes on once they
+                // close. 1.2.2 stopped accepting and lived on, deaf.
+                Err(e) if is_transient_accept_error(&e) => {
+                    if !short {
+                        eprintln!("cannot accept a connection now ({e}); trying again");
+                        short = true;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+                // A listener that accepts nothing any more: the process ends
+                // with an error, for systemd and attach to see.
+                Err(e) => {
+                    eprintln!("cannot accept connections: {e}");
+                    if let Some(w) = writer {
+                        let _ = w.flush();
+                    }
+                    std::process::exit(1);
+                }
+            }
         }
         Ok(())
     })
+}
+
+/// Whether an error of accept(2) passes (a shortage of descriptors or
+/// memory, a connection that went before it was accepted).
+fn is_transient_accept_error(e: &std::io::Error) -> bool {
+    matches!(
+        e.raw_os_error(),
+        Some(libc::EMFILE | libc::ENFILE | libc::ENOBUFS | libc::ENOMEM | libc::ECONNABORTED | libc::EINTR)
+    )
 }
 
 #[cfg(target_os = "linux")]

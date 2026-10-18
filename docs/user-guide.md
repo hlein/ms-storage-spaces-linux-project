@@ -917,6 +917,17 @@ security`, scores 9.5 UNSAFE before, 5.1 MEDIUM after):
   `serve-fuse`, as transient `storage-spaces-<guid>.service` units) get
   the same limits from the program itself, but for the FUSE server a
   private view of the file system, whose mount the host could not see.
+  A server that cannot go on ends with an error, for systemd to show
+  (`systemctl status storage-spaces-<guid>`), rather than live on
+  uselessly: `serve-ublk`
+  after an internal error (a panic in a queue fails its requests and
+  removes the device; 1.2.2 exited 0, or hung with a request in flight),
+  `serve-nbd` when its listener fails for good (out of descriptors it
+  goes on once connections close; 1.2.2 stopped accepting and stayed).
+  `serve-fuse` unmounts on SIGINT and SIGTERM (1.2.2 left a dead mount
+  that failed the next attach), and a signal that comes before a ublk
+  device starts is no longer lost. `spaces detach` deletes the ublk device
+  of a server that was killed before it could (1.2.2 left it DEAD).
 * `mount.ReFS` (what `mount -t ReFS` and udisks2 call, as root) runs
   `refs mount` as a transient `refs-mount-<pid>.service` without network,
   new privileges, namespaces or most capabilities. It keeps the host's

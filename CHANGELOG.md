@@ -105,6 +105,16 @@
   names what it did not get to). The units and the servers no longer mount
   a private `/var/tmp`, which with a `/var` of its own made systemd create
   a directory on a root file system still read-only at boot.
+* Servers: `serve-nbd` stopped accepting connections at the first error of
+  accept(2), out of descriptors with many connections, and lived on deaf;
+  it now goes on once some close, and ends with an error when the listener
+  fails for good. `serve-fuse` died on SIGTERM and left a dead mount that
+  failed the next attach; it unmounts first now, and attach removes such a
+  mount. A panic in a `serve-ublk` queue was only reported by libublk and
+  the server exited 0 (or hung, its request in flight); the request fails,
+  the device is removed and the server ends with an error. A SIGTERM before
+  the ublk device started was lost. `spaces detach` deletes the ublk device
+  of a server that was killed (1.2.2 left it DEAD).
 
 ### Testing
 

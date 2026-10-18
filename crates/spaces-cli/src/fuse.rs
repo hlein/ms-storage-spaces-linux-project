@@ -139,6 +139,33 @@ pub fn serve(
     config.n_threads = Some(4);
     let session = fuser::spawn_mount(SpaceFs { reader, block_size }, mountpoint, &config)
         .with_context(|| format!("cannot mount on {}", mountpoint.display()))?;
+    // SIGINT and SIGTERM unmount the file system, lazily while the space's
+    // file is open (the loop device of an attached space), and the session
+    // ends then: in 1.2.2 they ended the process and left a dead mount,
+    // which failed the next attach.
+    let mut signals = signal_hook::iterator::Signals::new([signal_hook::consts::SIGINT, signal_hook::consts::SIGTERM])?;
+    let point = mountpoint.to_path_buf();
+    std::thread::spawn(move || {
+        if signals.forever().next().is_some() {
+            let tries: [&[&str]; 4] = [
+                &["umount"],
+                &["fusermount3", "-u"],
+                &["umount", "-l"],
+                &["fusermount3", "-uz"],
+            ];
+            for t in tries {
+                let unmounted = std::process::Command::new(t[0])
+                    .args(&t[1..])
+                    .arg(&point)
+                    .stderr(std::process::Stdio::null())
+                    .status()
+                    .is_ok_and(|s| s.success());
+                if unmounted {
+                    break;
+                }
+            }
+        }
+    });
     if let Some(path) = ready_file {
         std::fs::write(path, mountpoint.join(FILE_NAME).display().to_string())?;
     }

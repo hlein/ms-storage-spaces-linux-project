@@ -434,20 +434,28 @@ process (transient systemd unit) behind
 needs Linux 6.0 or newer and the
 .B ublk_drv
 module. Exposes the space's own sector size and keeps reading when a mirror
-copy or parity column fails.
+copy or parity column fails. A server that stops on an internal error
+fails the requests in flight, removes its device and ends with an error;
+.B detach
+deletes the device of a server that was killed before it could. A signal
+that comes before the device starts ends the server without serving.
 .TP
 .B nbd
 A
 .B spaces serve\-nbd
 process connected with
 .BR nbd\-client (8).
+When it is out of file descriptors it goes on accepting connections once
+some close, and a listener that fails for good ends it with an error.
 .TP
 .B fuse
 A
 .B spaces serve\-fuse
 process exposing an image file, attached with
 .BR losetup (8).
-Read-only.
+Read-only. SIGINT and SIGTERM unmount it (lazily while the image file is
+open) before it ends; a mount a killed server left is removed by the next
+attach.
 .SH FILES
 .TP
 .I /run/storage-spaces/

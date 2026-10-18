@@ -998,6 +998,12 @@ pub fn attach_space(pool: &Pool<File>, space: &Space, paths: &[PathBuf], request
                 dm_create(&name, &uuid, &format!("0 {sectors} linear {dev} 0\n"), rw)?;
             }
             Backend::Fuse => {
+                // A mount left there by a server that was killed (dead: it
+                // fails every access) goes first.
+                let point = mount.display().to_string();
+                if is_mount_point(&point) {
+                    let _ = run("umount", &["-l", &point], None);
+                }
                 fs::create_dir_all(&mount)?;
                 let mountpoint = mount.display().to_string();
                 let mut extra = vec!["--mountpoint", mountpoint.as_str()];
@@ -1350,6 +1356,22 @@ pub fn teardown(state: &State) -> Result<()> {
             return Err(stop(&left, format!("its server {unit} does not stop")));
         }
         left.unit = None;
+    }
+    // A ublk device a server left behind, killed before it deleted it.
+    #[cfg(feature = "ublk")]
+    if state.backend == "ublk"
+        && let Some(n) = state
+            .device
+            .as_deref()
+            .and_then(|d| d.strip_prefix("/dev/ublkb"))
+            .and_then(|n| n.parse::<u32>().ok())
+        && Path::new(&format!("/sys/class/ublk-char/ublkc{n}")).exists()
+    {
+        match crate::ublk::remove_left(n) {
+            Ok(true) => eprintln!("removed the ublk device {n}, which its server left"),
+            Ok(false) => {}
+            Err(e) => eprintln!("the ublk device {n}, which its server left, stays: {e:#}"),
+        }
     }
     if let Some(mount) = &state.fuse_mount {
         let _ = fs::remove_dir(mount);

@@ -6,6 +6,7 @@
 #   create1   space create cut after its first step (the databases in the
 #             metadata space written, the pool database not yet)
 #   create2   space create cut after the first copy of the pool database
+#             (each copy is two steps: its entries, then its header)
 #   adddisk   disk add cut after the new disk's first update on one copy
 #   retire    a fourth disk added, then disk retire cut in the middle of
 #             moving a mirror slab: its data copied to the new disk, the
@@ -51,18 +52,19 @@ state() {
   for s in cmirror cparity; do "$spaces" check-pattern "${all[@]}" --space "$s" --tag "$s" | tail -1; done
 }
 state create1 1 space create --name cnew --resiliency simple --size 1G
-state create2 2 space create --name cnew --resiliency simple --size 1G
-state adddisk 2 disk add
-# Retire: on four disks (the parity space's rows use three). Steps 1-4 mark
-# the disk retired, 5-8 move a hidden slab, 9 copies the mirror's slab and
-# 10 records the move on the first database copy.
+state create2 3 space create --name cnew --resiliency simple --size 1G
+state adddisk 3 disk add
+# Retire: on four disks (the parity space's rows use three). Steps 1-8 mark
+# the disk retired (two steps per database copy), 9-15 move a hidden slab,
+# 16 copies the mirror's slab and 17-18 record the move on the first
+# database copy.
 mkdir -p "$dir/retire"
 for i in 0 1 2; do cp --sparse=always "$dir/base/disk$i.img" "$dir/retire/disk$i.img"; done
 truncate -s 8G "$dir/retire/disk3.img"
 "$spaces" disk add --new "$dir/retire/disk3.img" --yes "$dir"/retire/disk{0,1,2}.img | tail -1
 four=("$dir"/retire/disk{0,1,2,3}.img)
 retired=$("$spaces" info "${four[@]}" | awk '/device 0$/ {print $1}')
-SPACES_STOP_AFTER_STEP=10 "$spaces" disk retire --disk "$retired" --yes "${four[@]}" | grep -E "^stopped|^step (9|10):" || true
+SPACES_STOP_AFTER_STEP=18 "$spaces" disk retire --disk "$retired" --yes "${four[@]}" | grep -E "^stopped|^step (16|17|18):" || true
 manifest "$dir/retire"
 for s in cmirror cparity; do "$spaces" check-pattern "${four[@]}" --space "$s" --tag "$s" | tail -1; done
 echo "crash states: $dir/{create1,create2,adddisk,retire}"

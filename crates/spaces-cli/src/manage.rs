@@ -5,6 +5,7 @@
 
 use std::fs::File;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use storage_spaces::report::printable;
 
 use anyhow::{Context, Result, bail};
@@ -330,16 +331,31 @@ pub fn parse_size(s: &str) -> std::result::Result<u64, String> {
 
 /// Random (version 4) GUIDs from the kernel.
 fn random_guids() -> impl FnMut() -> Guid {
-    let mut urandom = File::open("/dev/urandom").ok();
+    guids_from(File::open("/dev/urandom").ok())
+}
+
+/// Version 4 GUIDs from `source`, or where it gives none (no such file, a
+/// read that fails), from the time, the process and a count, so that they
+/// still differ. 1.2.2 panicked when /dev/urandom could not be read, and
+/// without it made the same GUID twice within 100 ns (audit 2026-10-16,
+/// writers).
+fn guids_from(mut source: Option<File>) -> impl FnMut() -> Guid {
+    let mut count = 0u64;
     move || {
         let mut g = [0u8; 16];
-        match urandom.as_mut() {
-            Some(f) => std::io::Read::read_exact(f, &mut g).expect("reading /dev/urandom"),
-            None => {
-                let t = ops::filetime_now().to_le_bytes();
-                g[..8].copy_from_slice(&t);
-                g[8..].copy_from_slice(&(std::process::id() as u64).to_le_bytes());
-            }
+        let read = source
+            .as_mut()
+            .is_some_and(|f| std::io::Read::read_exact(f, &mut g).is_ok());
+        if !read {
+            source = None;
+            count += 1;
+            // splitmix64 of what tells this GUID apart.
+            let mut z =
+                ops::filetime_now() ^ (u64::from(std::process::id()) << 40) ^ count.wrapping_mul(0x9e37_79b9_7f4a_7c15);
+            z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+            g[..8].copy_from_slice(&ops::filetime_now().to_le_bytes());
+            g[8..].copy_from_slice(&((z ^ (z >> 31)) ^ count).to_le_bytes());
         }
         g[6] = (g[6] & 0x0f) | 0x40;
         g[8] = (g[8] & 0x3f) | 0x80;
@@ -371,7 +387,13 @@ fn sysfs(dev: &Path, attr: &str) -> Option<String> {
 
 fn describe(path: &Path, file: &File) -> Result<BlankDisk> {
     let size = file.size()?;
-    let block = path.starts_with("/dev");
+    // What the file is, not where its name points (1.2.2 took every path
+    // under /dev for a block device and every other one for an image:
+    // audit 2026-10-16, writers).
+    #[cfg(unix)]
+    let block = std::os::unix::fs::FileTypeExt::is_block_device(&file.metadata()?.file_type());
+    #[cfg(not(unix))]
+    let block = false;
     let number = |attr: &str, default: u64| sysfs(path, attr).and_then(|s| s.parse().ok()).unwrap_or(default);
     Ok(BlankDisk {
         size,
@@ -433,25 +455,47 @@ fn run<M: storage_spaces::io::WriteAt, N: storage_spaces::io::WriteAt>(
     Ok(true)
 }
 
-/// Plans with the pool of `devices`, then carries the plan out on them
-/// (reopened after the pool's own handles are closed).
+/// Plans with the pool of `devices`, then carries the plan out on the same
+/// handles: a path opened again could name another disk by then (1.2.2
+/// opened the devices again for the writes: audit 2026-10-16, writers).
 fn on_pool(
     devices: &[PathBuf],
     yes: bool,
-    make: impl FnOnce(&Pool<File>) -> storage_spaces::Result<Plan>,
+    make: impl FnOnce(&Pool<Arc<File>>) -> storage_spaces::Result<Plan>,
 ) -> Result<()> {
-    let pool = Pool::open(open_rw(devices)?)?;
-    let plan = make(&pool)?;
-    drop(pool);
-    let members = open_rw(devices)?;
-    if run::<File, File>(&plan, yes, &members, &[])? {
-        drop(members);
-        let pool = Pool::open(open_rw(devices)?)?;
+    let members: Vec<Arc<File>> = open_rw(devices)?.into_iter().map(Arc::new).collect();
+    let plan = make(&Pool::open(members.clone())?)?;
+    if run::<Arc<File>, File>(&plan, yes, &members, &[])? {
+        let pool = Pool::open(members)?;
         for w in &pool.warnings {
             eprintln!("warning: {w}");
         }
     }
     Ok(())
+}
+
+/// A first step that clears what the pool's writes leave of the old start
+/// and end of the new disks `disks` (index of the new disk, size):
+/// partition tables, file system signatures, the header and database of an
+/// earlier pool in the first 17 MiB, the last MiB.
+fn wipe_step(disks: &[(usize, u64)]) -> storage_spaces::plan::Step {
+    let mut actions = Vec::new();
+    for &(i, size) in disks {
+        actions.push(Action::Write {
+            target: Target::New(i),
+            offset: 0,
+            bytes: vec![0; (17 << 20).min(size as usize)],
+        });
+        actions.push(Action::Write {
+            target: Target::New(i),
+            offset: size - (1 << 20).min(size),
+            bytes: vec![0; (1 << 20).min(size as usize)],
+        });
+    }
+    storage_spaces::plan::Step {
+        what: "wipe".into(),
+        actions,
+    }
 }
 
 pub fn pool(command: PoolCommand) -> Result<()> {
@@ -550,33 +594,13 @@ pub fn pool(command: PoolCommand) -> Result<()> {
             if !dirty.is_empty() {
                 // First clear what the pool's writes leave of the old start
                 // and end (partition tables, file system signatures).
-                let mut wipe_step = Vec::new();
-                for &i in &dirty {
-                    let size = disks[i].size;
-                    wipe_step.push(Action::Write {
-                        target: Target::New(i),
-                        offset: 0,
-                        bytes: vec![0; (17 << 20).min(size as usize)],
-                    });
-                    wipe_step.push(Action::Write {
-                        target: Target::New(i),
-                        offset: size - (1 << 20).min(size),
-                        bytes: vec![0; (1 << 20).min(size as usize)],
-                    });
-                }
+                let sizes: Vec<(usize, u64)> = dirty.iter().map(|&i| (i, disks[i].size)).collect();
                 plan.summary
                     .push(format!("wipe the start and end of {} disks", dirty.len()));
-                plan.steps.insert(
-                    0,
-                    storage_spaces::plan::Step {
-                        what: "wipe".into(),
-                        actions: wipe_step,
-                    },
-                );
+                plan.steps.insert(0, wipe_step(&sizes));
             }
             if run::<File, File>(&plan, yes, &[], &files)? {
-                drop(files);
-                let pool = Pool::open(open_rw(&devices)?)?;
+                let pool = Pool::open(files.iter().collect::<Vec<_>>())?;
                 if !pool.warnings.is_empty() {
                     bail!("the new pool reports: {}", pool.warnings.join("; "));
                 }
@@ -595,16 +619,23 @@ pub fn disk(command: DiskCommand) -> Result<()> {
             yes,
             devices,
         } => {
-            let pool = Pool::open(open_rw(&devices)?)?;
+            let files = open_rw(&devices)?;
+            let members: Vec<&File> = files.iter().collect();
+            let pool = Pool::open(members.clone())?;
             let file = open_rw(std::slice::from_ref(&new))?.remove(0);
-            if !is_blank(&file)? && !wipe {
+            let dirty = !is_blank(&file)?;
+            if dirty && !wipe {
                 bail!("{} is not blank; --wipe overwrites it", new.display());
             }
             let blank = describe(&new, &file)?;
-            let plan = ops::plan_add_disk(&pool, &blank, &mut random_guids())?;
+            let mut plan = ops::plan_add_disk(&pool, &blank, &mut random_guids())?;
             drop(pool);
-            let members = open_rw(&devices)?;
-            run(&plan, yes, &members, &[file])?;
+            // (1.2.2 took --wipe and wiped nothing: audit 2026-10-16, writers.)
+            if dirty {
+                plan.summary.push("wipe the start and end of the new disk".into());
+                plan.steps.insert(0, wipe_step(&[(0, blank.size)]));
+            }
+            run(&plan, yes, &members, &[&file])?;
             Ok(())
         }
         DiskCommand::Set {
@@ -636,7 +667,9 @@ pub fn disk(command: DiskCommand) -> Result<()> {
         }
         DiskCommand::Retire { disk, yes, devices } => on_pool(&devices, yes, |p| ops::plan_retire_disk(p, disk)),
         DiskCommand::Remove { disk, yes, devices } => {
-            let pool = Pool::open(open_rw(&devices)?)?;
+            let files = open_rw(&devices)?;
+            let members: Vec<&File> = files.iter().collect();
+            let pool = Pool::open(members.clone())?;
             let plan = ops::plan_remove_disk(&pool, disk)?;
             let removed = pool
                 .disks
@@ -644,16 +677,14 @@ pub fn disk(command: DiskCommand) -> Result<()> {
                 .and_then(|d| d.member)
                 .map(|m| pool.members[m].device);
             drop(pool);
-            let members = open_rw(&devices)?;
-            if run::<File, File>(&plan, yes, &members, &[])? {
-                drop(members);
-                let rest: Vec<PathBuf> = devices
+            if run::<&File, File>(&plan, yes, &members, &[])? {
+                let rest: Vec<&File> = members
                     .iter()
                     .enumerate()
                     .filter(|(i, _)| Some(*i) != removed)
-                    .map(|(_, p)| p.clone())
+                    .map(|(_, f)| *f)
                     .collect();
-                let pool = Pool::open(open_rw(&rest)?)?;
+                let pool = Pool::open(rest)?;
                 for w in &pool.warnings {
                     eprintln!("warning: {w}");
                 }
@@ -694,7 +725,9 @@ pub fn space(command: SpaceCommand) -> Result<()> {
             yes,
             devices,
         } => {
-            let pool = Pool::open(open_rw(&devices)?)?;
+            let files = open_rw(&devices)?;
+            let members: Vec<&File> = files.iter().collect();
+            let pool = Pool::open(members.clone())?;
             let (plan, new) = if tier.is_empty() {
                 let resiliency = match resiliency.as_deref() {
                     Some("simple") => 1,
@@ -725,18 +758,154 @@ pub fn space(command: SpaceCommand) -> Result<()> {
                     .collect::<Result<Vec<_>>>()?;
                 ops::plan_create_tiered_space(&pool, &name, &tiers, &mut random_guids())?
             };
-            // (Exclusive opens: the pool's handles go first.)
             drop(pool);
-            let members = open_rw(&devices)?;
-            if run::<File, File>(&plan, yes, &members, &[])? {
-                drop(members);
-                let pool = Pool::open(open_rw(&devices)?)?;
+            if run::<&File, File>(&plan, yes, &members, &[])? {
+                let pool = Pool::open(members)?;
                 if !pool.warnings.is_empty() {
                     bail!("the pool reports: {}", pool.warnings.join("; "));
                 }
                 println!("space \"{}\" {} ({} bytes)", printable(&new.name), new.guid, new.size);
             }
             Ok(())
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::FileExt;
+
+    /// A directory removed when the test ends.
+    struct Scratch(PathBuf);
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// Sparse image files of 8 GiB in a new directory.
+    fn images(name: &str, n: usize) -> (Scratch, Vec<PathBuf>) {
+        let dir = std::env::temp_dir().join(format!("spaces-manage-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let paths: Vec<PathBuf> = (0..n).map(|i| dir.join(format!("disk{i}.img"))).collect();
+        for p in &paths {
+            File::create(p).unwrap().set_len(8 << 30).unwrap();
+        }
+        (Scratch(dir), paths)
+    }
+
+    fn create(name: &str, devices: &[PathBuf]) {
+        pool(PoolCommand::Create {
+            name: name.into(),
+            logical_sector: None,
+            wipe: false,
+            yes: true,
+            devices: devices.to_vec(),
+        })
+        .unwrap();
+    }
+
+    fn zero(path: &Path, offset: u64, len: usize) -> bool {
+        let mut b = vec![1u8; len];
+        FileExt::read_exact_at(&File::open(path).unwrap(), &mut b, offset).unwrap();
+        b.iter().all(|&x| x == 0)
+    }
+
+    /// A plan is carried out on the handles it was made with: here the
+    /// second disk's path names a blank file by the time the plan is
+    /// carried out, which keeps nothing of it. 1.2.2 opened the paths again
+    /// and wrote the second disk's copy of the database into that file
+    /// (audit 2026-10-16, writers).
+    #[test]
+    fn plans_are_carried_out_on_the_disks_they_were_made_with() {
+        let (_dir, paths) = images("handles", 2);
+        create("handles", &paths);
+        let moved = paths[1].with_extension("moved");
+        let _ = on_pool(&paths, true, |p| {
+            std::fs::rename(&paths[1], &moved).unwrap();
+            File::create(&paths[1]).unwrap().set_len(8 << 30).unwrap();
+            ops::plan_rename_pool(p, "renamed")
+        });
+        assert!(zero(&paths[1], 0, 32 << 20), "the other file was written");
+        let pool = Pool::open(vec![File::open(&paths[0]).unwrap(), File::open(&moved).unwrap()]).unwrap();
+        assert_eq!(pool.name, "renamed");
+        assert!(pool.warnings.is_empty(), "{:?}", pool.warnings);
+    }
+
+    /// `disk add --wipe` clears the start and end of a disk that is not
+    /// blank, as `pool create --wipe` does: a file system's signature at
+    /// 64 KiB and data in the last MiB are gone. 1.2.2 took the flag and
+    /// wiped nothing (audit 2026-10-16, writers).
+    #[test]
+    fn disk_add_wipe_clears_the_new_disk() {
+        let (_dir, mut paths) = images("wipe", 3);
+        let new = paths.pop().unwrap();
+        create("wipe", &paths);
+        let f = File::options().write(true).open(&new).unwrap();
+        f.write_all_at(b"_BHRfS_M", (64 << 10) + 0x40).unwrap();
+        f.write_all_at(&[0xee; 4096], (8 << 30) - (512 << 10)).unwrap();
+        drop(f);
+        let refused = disk(DiskCommand::Add {
+            new: new.clone(),
+            wipe: false,
+            yes: true,
+            devices: paths.clone(),
+        });
+        assert!(refused.unwrap_err().to_string().contains("not blank"));
+        disk(DiskCommand::Add {
+            new: new.clone(),
+            wipe: true,
+            yes: true,
+            devices: paths.clone(),
+        })
+        .unwrap();
+        assert!(zero(&new, 64 << 10, 4096), "the signature at 64 KiB stayed");
+        assert!(zero(&new, (8 << 30) - (512 << 10), 4096), "the data at the end stayed");
+        paths.push(new);
+        let pool = Pool::open(paths.iter().map(|p| File::open(p).unwrap()).collect()).unwrap();
+        assert_eq!(pool.members.len(), 3);
+        assert!(pool.warnings.is_empty(), "{:?}", pool.warnings);
+    }
+
+    /// Whether a disk is a block device follows from what the file is, not
+    /// from its path: an image under /dev (here /dev/shm) is an image. 1.2.2
+    /// took every path under /dev for a block device, and a block device
+    /// named by a path elsewhere for an image of 512-byte sectors (audit
+    /// 2026-10-16, writers).
+    #[test]
+    fn block_devices_are_told_by_what_they_are() {
+        let shm = Path::new("/dev/shm");
+        if !shm.is_dir() {
+            eprintln!("no /dev/shm: skipped");
+            return;
+        }
+        let path = shm.join(format!("spaces-describe-{}", std::process::id()));
+        let file = File::create(&path).unwrap();
+        file.set_len(8 << 30).unwrap();
+        let d = describe(&path, &file);
+        let _ = std::fs::remove_file(&path);
+        let d = d.unwrap();
+        assert_eq!(
+            (d.model.as_str(), d.logical_sector, d.physical_sector),
+            ("Image", 512, 4096)
+        );
+    }
+
+    /// GUIDs come without a panic when the kernel's random bytes cannot be
+    /// read, and still differ. 1.2.2 panicked when /dev/urandom could not
+    /// be read (the old binary under a bind mount of /dev/null there), and
+    /// without the file made the same GUID twice within 100 ns (audit
+    /// 2026-10-16, writers).
+    #[test]
+    fn guids_differ_without_random_bytes() {
+        for source in [File::open("/dev/null").ok(), None, File::open("/dev/urandom").ok()] {
+            let mut guid = guids_from(source);
+            let all: std::collections::BTreeSet<[u8; 16]> = (0..10_000).map(|_| guid().0).collect();
+            assert_eq!(all.len(), 10_000);
+            assert!(all.iter().all(|g| g[6] >> 4 == 4 && g[8] >> 6 == 2));
         }
     }
 }

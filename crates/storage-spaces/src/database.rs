@@ -77,9 +77,14 @@ impl Database {
     }
 
     /// Reads the database whose header is at `offset` with all its
-    /// formatted slots: pages of 4 KiB whose slots carry "SDBB" and their
-    /// own number (the pool database starts with one page and grows by
-    /// pages, see [`Database::grow`]).
+    /// formatted slots: the pages of 4 KiB that hold the slots the header
+    /// counts (all that readers read), and the pages after them whose
+    /// slots all carry "SDBB" and their own number (the pool database
+    /// starts with one page and grows by pages, see [`Database::grow`]). A
+    /// slot that is zero is free all the same. 1.2.2 read only up to the
+    /// last page formatted whole: where a page in use was formatted only in
+    /// part (in the fixtures, which keep what the reader reads; on a disk,
+    /// damage or another writer), the planners' updates lost its records.
     pub fn read_formatted<D: ReadAt + ?Sized>(dev: &D, offset: u64) -> Result<Self> {
         let head = read_vec(dev, offset, HEADER_LEN)?;
         if &head[..8] != SDBC_SIGNATURE {
@@ -90,7 +95,11 @@ impl Database {
             return Err(format_err!("implausible database geometry"));
         }
         let per_page = PAGE / entry_size;
-        let mut pages = 1;
+        let counted = u32::from_be_bytes(head[0x28..0x2c].try_into().unwrap()) as usize;
+        let mut pages = counted.div_ceil(per_page).max(1);
+        if pages > MAX_PAGES {
+            return Err(format_err!("implausible database geometry: {counted} slots"));
+        }
         while pages < MAX_PAGES {
             let page = read_vec(dev, offset + (pages * PAGE) as u64, PAGE)?;
             let formatted = page.chunks_exact(entry_size).enumerate().all(|(k, e)| {
@@ -102,7 +111,16 @@ impl Database {
             }
             pages += 1;
         }
-        Self::read(dev, offset, pages * per_page)
+        let mut db = Self::read(dev, offset, pages * per_page)?;
+        // The slots past those the header counts are free, whatever a write
+        // a crash cut short left in them (readers never read them; an update
+        // would count them again, and a record no one wrote whole with them).
+        for i in counted.max(HEADER_SLOTS)..db.slots() {
+            if !db.is_free(i) {
+                db.free(i);
+            }
+        }
+        Ok(db)
     }
 
     /// Formats one more page of free slots at the end (when no run of
@@ -273,30 +291,28 @@ impl Database {
         h[0x0c..0x10].copy_from_slice(&crc.to_be_bytes());
     }
 
-    /// The extent records with their ids.
-    pub fn extents(&self) -> Vec<(u32, crate::format::ExtentRecord)> {
-        crate::format::assemble_records(&self.bytes, self.entry_size)
-            .unwrap_or_default()
+    /// The extent records with their ids. Fails when the records do not
+    /// assemble (1.2.2 took that for no extents at all).
+    pub fn extents(&self) -> Result<Vec<(u32, crate::format::ExtentRecord)>> {
+        Ok(crate::format::assemble_records(&self.bytes, self.entry_size)?
             .iter()
             .filter_map(|r| match crate::format::Record::decode(r) {
                 Ok(crate::format::Record::Extent(e)) => Some((r.id, e)),
                 _ => None,
             })
-            .collect()
+            .collect())
     }
 
     /// The first slab of disk `disk_id` that no extent uses: where Windows
-    /// puts a slab it allocates on that disk.
-    pub fn first_free_slab(&self, disk_id: u64) -> u64 {
-        let records = crate::format::assemble_records(&self.bytes, self.entry_size).unwrap_or_default();
-        let mut used: Vec<(u64, u64)> = records
-            .iter()
-            .filter_map(|r| match crate::format::Record::decode(r) {
-                Ok(crate::format::Record::Extent(e)) if e.disk_id == disk_id => {
-                    Some((e.physical_slab, e.physical_slab.saturating_add(e.slab_count)))
-                }
-                _ => None,
-            })
+    /// puts a slab it allocates on that disk. Fails when the records do
+    /// not assemble: 1.2.2 counted no extents then and gave slab 0, which
+    /// holds the metadata space.
+    pub fn first_free_slab(&self, disk_id: u64) -> Result<u64> {
+        let mut used: Vec<(u64, u64)> = self
+            .extents()?
+            .into_iter()
+            .filter(|(_, e)| e.disk_id == disk_id)
+            .map(|(_, e)| (e.physical_slab, e.physical_slab.saturating_add(e.slab_count)))
             .collect();
         used.sort();
         let mut free = 0;
@@ -306,7 +322,7 @@ impl Database {
             }
             free = free.max(end);
         }
-        free
+        Ok(free)
     }
 
     pub fn sequence(&self) -> u64 {

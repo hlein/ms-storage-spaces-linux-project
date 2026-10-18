@@ -111,6 +111,13 @@ rename, new space, extension, deletion):
 * The header then gets the slots up to the last one in use (0x28), the new
   sequence at 0x38 and 0x40, the timestamp at 0x48 and its checksum.
   Setting the pool read-only or writable changes nothing in it.
+* Readers read the slots the header counts (0x28). The model of an update
+  (`Database::read_formatted`) takes those and the pages after them whose
+  slots are all formatted; a zero slot is a free one. (The fixtures keep
+  what the reader reads: in 17 of them the second page is formatted only
+  up to its last slot in use. Until 1.3 the model stopped at the last page
+  formatted whole there, and an update lost the records of that page. The
+  pools of the corpus have whole pages.)
 * Records carry the sequence of the update that wrote them as their second
   integer. A space record changed through the management API (renamed,
   extended) also gains a security descriptor (`SPACE_SECURITY_DESCRIPTOR`:
@@ -122,6 +129,24 @@ rename, new space, extension, deletion):
 * Not predicted yet: the object id of a new space (37 in `m5db`, where the
   existing ones were 1-5), and which disks and slabs its extents take (see
   slab allocation).
+
+Writing a copy: Linux writes an update to the members that carry a copy
+one after the other, and each copy in two writes, each made durable before
+the next: everything after the header, then the header (its 0x200 bytes,
+with the member's SPACEDB header page where that is written too). A write
+a crash tears leaves the old header and so the old sequence: the copy
+cannot pass for the newest, and the members not written yet hold the old
+version whole. Until 1.3 the header went first, in one write with the
+entries, so that a torn copy was the newest (audit 2026-10-16, M20; test
+`a_torn_database_copy_never_passes_for_the_newest`, every write of a rename
+cut after each of its sectors on pools of five, four and two copies).
+Opening a space for writing brings such a copy up to date, as it does
+stale copies, where most copies of its sequence hold the version read; of
+two copies, neither outvotes the other, and the pool is refused for writing
+(and suspect to the guard) until Windows has it. The slots past those a
+header counts are free whatever an interrupted write left in them. A copy
+must fit its pool partition; one that would reach past the end of the
+partition is not written (test `database_copies_stay_inside_their_partitions`).
 
 Choosing a copy: members carry copies of the pool database, and the one
 with the highest sequence is current (**verified**: stale copies of `stale3`).
@@ -303,7 +328,12 @@ Each of these is one pool database update and writes nothing else
 * `Resize-VirtualDisk` of a fixed space: the space record with the new size
   and the security descriptor, and an extent per column and copy for the
   new rows (virtual slabs continuing, allocation unit x data columns per
-  row group). The parity journal's header keeps its first run count.
+  row group). The parity journal's header keeps its first run count. The
+  data columns are the layout's (a local reconstruction code has a parity
+  unit per group and a global one: 8 of the 11 columns of `lrc11`); until
+  1.3 `spaces space resize` took the columns less the redundancy there,
+  and the new rows started where no row does (test
+  `a_space_of_local_groups_grows_and_opens`).
 * `Set-StoragePool -IsReadOnly` writes nothing.
 * `Add-PhysicalDisk` of a blank disk to a pool of three (**verified** byte
   for byte on every page by the test `an_added_disk_is_predicted_byte_for_byte`,
@@ -638,8 +668,8 @@ How Windows allocates slabs (**verified** by the tests
 
 `SpaceWriter` allocates rows of thin spaces with 256 MiB allocation units
 the same way: one database update per row, written to every member in turn
-(each flushed before the next, so a crash leaves each copy whole, old or
-new), before the row's data; simple and mirror rows when a write first
+(each copy as above, so a crash leaves every copy whole, old or new, but
+the one being written, which keeps the old sequence), before the row's data; simple and mirror rows when a write first
 reaches them, parity rows when the cache destages them. Each slab goes to
 the present disk with the most free slabs that the row does not use yet,
 so the disks fill evenly.
@@ -957,6 +987,13 @@ their recorded step times on `DrtWriter` and compares every snapshot):
 * `Disconnect-VirtualDisk` removes every run and writes generation 0 into
   both copies (after `[0, 1, 3]` the page holds the stale entries 1, 1, 3).
 * Whether the header reaches the disks before the data is not observed yet.
+  Linux (`SpaceWriter`) writes the header that lists a run, flushed, before
+  the run's data, and writes a header that stops listing runs only after
+  the members are flushed, so that what was written into those runs is on
+  every copy (until 1.3 they were dropped unflushed: test
+  `a_run_leaves_the_dirty_region_log_once_its_data_is_durable`). A tracking
+  space must hold both header copies (12 KiB at least), or the mirror is
+  not written.
 
 Windows does not use the log to reconcile the copies, and it reads either
 copy (**verified** by the round trips recorded in `tests/evidence`
@@ -1051,6 +1088,15 @@ the state without the slot), but readers refuse the chunk unless told to
 take the newer. Entries whose run list does not fit into a slot are written
 as bitmaps (state 1); where neither fits, the whole run is recorded as not
 consistent.
+
+A cache entry takes one slot at most: before a write that could make a
+chunk's runs outgrow its slot (a chunk of 1 MiB in 512-byte sectors after
+about a thousand writes apart from each other) everything is destaged, as
+when the slots run out (until 1.3 the entry was cut off at the slot's end
+and the log no longer loaded: test `entries_never_outgrow_a_slot`). A
+cache's chunk is a stripe of its space (**verified** on the 48 parity
+caches of the fixtures and the corpus); a parity space whose cache keeps
+other chunks is not written.
 
 A run's first entry covers every stripe of the run, those never written as
 not consistent (above), and readers check those. A new space gets its slabs

@@ -203,7 +203,7 @@ pub fn add_disk<D: crate::io::ReadAt>(
         pool_partition_guid: disk.partition_guid,
         pool_name: pool.name.clone(),
     };
-    let partition = table.pool_partition();
+    let partition = table.pool_partition()?;
     let mut record = DiskBody {
         id,
         sequence: db.sequence() + 1,
@@ -287,7 +287,7 @@ pub fn add_disk<D: crate::io::ReadAt>(
         list
     };
     let mut members = Vec::new();
-    let mut new_disk = table.regions();
+    let mut new_disk = table.regions()?;
     // The new disk: its partition table and a header without a copy.
     let first_header = DiskHeader {
         version: 3,
@@ -348,16 +348,7 @@ pub fn add_disk<D: crate::io::ReadAt>(
         "new disk: partition table, header and its copy of the metadata space",
         setup,
     );
-    for m in &copies {
-        plan.step(
-            format!("first update on device {}", m.device),
-            vec![write(
-                Target::Member(m.device),
-                m.partition.offset + POOL_DB_OFFSET,
-                first.bytes().to_vec(),
-            )],
-        );
-    }
+    crate::ops::copy_steps(&mut plan, "first update", &copies, first.bytes())?;
     plan.step("databases in the metadata space", space_dbs);
     for m in pool.members.iter().filter(|m| m.header.database_copy) {
         members.push((m.device, m.partition.offset + POOL_DB_OFFSET, second.bytes().to_vec()));
@@ -374,21 +365,15 @@ pub fn add_disk<D: crate::io::ReadAt>(
     let mut page = header.encode().to_vec();
     page.resize(POOL_DB_OFFSET as usize, 0);
     page.extend_from_slice(second.bytes());
-    new_disk.push((partition.offset, page.clone()));
-    plan.step(
-        "new disk: pool database and header with the copy",
-        vec![write(Target::New(0), partition.offset, page)],
-    );
-    for m in &copies {
-        plan.step(
-            format!("second update on device {}", m.device),
-            vec![write(
-                Target::Member(m.device),
-                m.partition.offset + POOL_DB_OFFSET,
-                second.bytes().to_vec(),
-            )],
-        );
+    let [entries, head] = crate::pool::database_copy(&partition, &page[..POOL_DB_OFFSET as usize], second.bytes())?;
+    new_disk.push((partition.offset, page));
+    for (what, (offset, bytes)) in [
+        ("pool database", entries),
+        ("its header and a header with the copy", head),
+    ] {
+        plan.step(format!("new disk: {what}"), vec![write(Target::New(0), offset, bytes)]);
     }
+    crate::ops::copy_steps(&mut plan, "second update", &copies, second.bytes())?;
     Ok(AddDiskPlan {
         new_disk,
         members,

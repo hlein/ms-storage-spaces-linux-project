@@ -270,19 +270,40 @@ impl PoolDiskTable {
         self.disk_size / self.sector
     }
 
-    /// The pool partition's location.
-    pub fn pool_partition(&self) -> PartitionLocation {
-        let last_usable = self.sectors() - 2 - self.table_sectors();
-        let end = (last_usable + 1) * self.sector / (1 << 20) * (1 << 20);
-        PartitionLocation {
-            offset: POOL_PARTITION_START,
-            length: end - POOL_PARTITION_START,
+    /// The pool partition's location. A disk must have room for one with
+    /// its data area and a slab, in sectors of 512 or 4096 bytes: 1.2.2
+    /// computed the partition of a smaller disk with wrapping arithmetic
+    /// (debug builds panicked), and took a disk of no bytes for one of 16
+    /// EiB (audit 2026-10-16, writers).
+    pub fn pool_partition(&self) -> Result<PartitionLocation> {
+        let too_small = || {
+            crate::error::format_err!(
+                "a disk of {} bytes is too small for a pool (it takes {} bytes at least)",
+                self.disk_size,
+                POOL_PARTITION_START + crate::format::DATA_AREA_OFFSET + crate::format::SLAB_SIZE + (2 << 20)
+            )
+        };
+        if !matches!(self.sector, 512 | 4096) {
+            return Err(crate::error::format_err!("a disk of {}-byte sectors", self.sector));
         }
+        let last_usable = self
+            .sectors()
+            .checked_sub(2 + self.table_sectors())
+            .ok_or_else(too_small)?;
+        let end = (last_usable + 1) * self.sector / (1 << 20) * (1 << 20);
+        let length = end
+            .checked_sub(POOL_PARTITION_START)
+            .filter(|&l| l > crate::format::DATA_AREA_OFFSET + crate::format::SLAB_SIZE)
+            .ok_or_else(too_small)?;
+        Ok(PartitionLocation {
+            offset: POOL_PARTITION_START,
+            length,
+        })
     }
 
-    fn entries(&self, with_pool: bool) -> Vec<u8> {
+    fn entries(&self, with_pool: bool) -> Result<Vec<u8>> {
         let first_usable = 2 + self.table_sectors();
-        let pool = self.pool_partition();
+        let pool = self.pool_partition()?;
         let mut table = vec![0u8; (Self::ENTRIES * Self::ENTRY_SIZE) as usize];
         let parts = [
             (
@@ -315,7 +336,7 @@ impl PoolDiskTable {
                 e[56 + 2 * k..58 + 2 * k].copy_from_slice(&unit.to_le_bytes());
             }
         }
-        table
+        Ok(table)
     }
 
     fn header(&self, current: u64, backup: u64, entries_lba: u64, entries_crc: u32) -> Vec<u8> {
@@ -368,7 +389,7 @@ impl PoolDiskTable {
 
     /// The byte ranges to write: the protective MBR, the primary header and
     /// entries, and the backup entries and header at the end of the disk.
-    pub fn regions(&self) -> Vec<(u64, Vec<u8>)> {
+    pub fn regions(&self) -> Result<Vec<(u64, Vec<u8>)>> {
         self.write(true)
     }
 
@@ -376,12 +397,12 @@ impl PoolDiskTable {
     /// `Remove-PhysicalDisk` leave a disk (the Microsoft reserved partition
     /// stays; the SPACEDB header and pool database stay behind it,
     /// unreferenced).
-    pub fn regions_without_pool(&self) -> Vec<(u64, Vec<u8>)> {
+    pub fn regions_without_pool(&self) -> Result<Vec<(u64, Vec<u8>)>> {
         self.write(false)
     }
 
-    fn write(&self, with_pool: bool) -> Vec<(u64, Vec<u8>)> {
-        let entries = self.entries(with_pool);
+    fn write(&self, with_pool: bool) -> Result<Vec<(u64, Vec<u8>)>> {
+        let entries = self.entries(with_pool)?;
         let crc = crate::crc::crc32(&entries);
         let last = self.sectors() - 1;
         let backup_entries = last - self.table_sectors();
@@ -390,7 +411,7 @@ impl PoolDiskTable {
         primary.extend_from_slice(&entries);
         let mut backup = entries;
         backup.extend(self.header(last, 1, backup_entries, crc));
-        vec![(0, primary), (backup_entries * self.sector, backup)]
+        Ok(vec![(0, primary), (backup_entries * self.sector, backup)])
     }
 }
 

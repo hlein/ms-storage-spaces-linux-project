@@ -44,6 +44,7 @@
 //! Reads follow the options the writer was opened with (`--unclean-parity`).
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, RwLock, RwLockReadGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -91,6 +92,8 @@ pub struct SpaceWriter<'p, D> {
     drt: Option<DrtState>,
     journal: Option<JournalState>,
     cache: Option<CacheState>,
+    /// A write or flush failed: nothing more is written ([`SpaceWriter::guarded`]).
+    failed: AtomicBool,
 }
 
 /// Allocates rows of a thin space as Windows does (format document, "Slab
@@ -162,6 +165,13 @@ impl<'p, D: WriteAt> SpaceWriter<'p, D> {
             .filter(|_| layout.resiliency == Resiliency::Mirror)
         {
             let (layout, size) = Self::child_space(pool, id, SpaceRole::Other(0x06))?;
+            // Room for both header copies, the second 8 KiB before the end
+            // (1.2.2 took a smaller size from the metadata and wrapped).
+            if size < 0x3000 {
+                return Err(Error::Unsupported(format!(
+                    "space {id} cannot be opened for writing: its dirty region log has {size} bytes"
+                )));
+            }
             drt = Some(DrtState {
                 layout,
                 size,
@@ -223,6 +233,7 @@ impl<'p, D: WriteAt> SpaceWriter<'p, D> {
             drt,
             journal,
             cache,
+            failed: AtomicBool::new(false),
         };
         if writer.reader.cache().is_some_and(|c| c.cached_chunks() > 0) {
             writer.destage()?;
@@ -284,7 +295,7 @@ impl<'p, D: WriteAt> SpaceWriter<'p, D> {
                     copy,
                     slab_count: 1,
                     disk_id,
-                    physical_slab: a.db.first_free_slab(disk_id),
+                    physical_slab: a.db.first_free_slab(disk_id)?,
                     flags: 0,
                     stale_marker: 0xffff_ffff,
                 });
@@ -327,6 +338,10 @@ impl<'p, D: WriteAt> SpaceWriter<'p, D> {
         if !self.discards() || len == 0 {
             return Ok(());
         }
+        self.guarded(|| self.discard_rows(offset, end))
+    }
+
+    fn discard_rows(&self, offset: u64, end: u64) -> Result<()> {
         let _gate = self.gate.write().unwrap();
         let (base, row_bytes) = {
             let layout = self.layout();
@@ -366,7 +381,7 @@ impl<'p, D: WriteAt> SpaceWriter<'p, D> {
         let virtual_slab = a.base / SLAB_SIZE + row * data_columns;
         let space_id = self.reader.space.id();
         let ids: Vec<u32> =
-            a.db.extents()
+            a.db.extents()?
                 .into_iter()
                 .filter(|(_, e)| e.space_id == space_id && e.virtual_slab == virtual_slab && e.slab_count == 1)
                 .map(|(id, _)| id)
@@ -482,10 +497,30 @@ impl<'p, D: WriteAt> SpaceWriter<'p, D> {
         if buf.is_empty() {
             return Ok(());
         }
-        if let (Some(journal), Some(cache)) = (&self.journal, &self.cache) {
-            return self.write_parity(journal, cache, &mut cache.log.write().unwrap(), buf, offset);
+        self.guarded(|| match (&self.journal, &self.cache) {
+            (Some(journal), Some(cache)) => {
+                self.write_parity(journal, cache, &mut cache.log.write().unwrap(), buf, offset)
+            }
+            _ => self.write_direct(buf, offset),
+        })
+    }
+
+    /// Runs `work`, a write, flush, discard or destage, unless one failed
+    /// before; a failure of the disks (an I/O error) stops every later one.
+    /// What reached which copy is not known after it, nor what the logs
+    /// say: 1.2.2 carried on, and a later flush could report as durable
+    /// what had been lost (audit 2026-10-16, M20).
+    fn guarded<T>(&self, work: impl FnOnce() -> Result<T>) -> Result<T> {
+        if self.failed.load(Ordering::Acquire) {
+            return Err(Error::Pool(
+                "a write or flush of the space failed before; nothing more is written until it is opened again".into(),
+            ));
         }
-        self.write_direct(buf, offset)
+        let result = work();
+        if let Err(Error::Io(_)) = &result {
+            self.failed.store(true, Ordering::Release);
+        }
+        result
     }
 
     /// Writes to a simple or mirror space itself.
@@ -619,7 +654,7 @@ impl<'p, D: WriteAt> SpaceWriter<'p, D> {
     /// documentation) and makes it durable.
     pub fn destage(&self) -> Result<()> {
         match &self.cache {
-            Some(cache) => self.destage_locked(cache, &mut cache.log.write().unwrap()),
+            Some(cache) => self.guarded(|| self.destage_locked(cache, &mut cache.log.write().unwrap())),
             None => Ok(()),
         }
     }
@@ -734,7 +769,12 @@ impl<'p, D: WriteAt> SpaceWriter<'p, D> {
         // (offset, data, location, run start, stripes of the run, stripe in the run)
         let mut stripes = Vec::new();
         for &(offset, buf) in parts {
-            assert!(offset.is_multiple_of(stripe_bytes) && (buf.len() as u64).is_multiple_of(stripe_bytes));
+            if !offset.is_multiple_of(stripe_bytes) || !(buf.len() as u64).is_multiple_of(stripe_bytes) {
+                return Err(Error::Pool(format!(
+                    "a write of {} bytes at {offset:#x} is no run of whole {stripe_bytes}-byte stripes",
+                    buf.len()
+                )));
+            }
             for (i, data) in buf.chunks(stripe_bytes as usize).enumerate() {
                 let start = offset + i as u64 * stripe_bytes;
                 let loc = layout.locate(layout.base + start);
@@ -860,17 +900,24 @@ impl<'p, D: WriteAt> SpaceWriter<'p, D> {
         let (writer, last_write) = &mut *guard;
         let now = Instant::now();
         if !writer.runs().contains(&run) {
+            let listed = writer.runs().len();
             writer.clean(|r| {
                 last_write
                     .get(&r)
                     .is_some_and(|t| now.duration_since(*t) > DRT_CLEAN_AFTER)
             });
             last_write.retain(|r, _| writer.runs().contains(r));
+            let pool = self.reader.pool();
+            // The runs no longer listed hold their data on every copy
+            // before the header that drops them is written (1.2.2 dropped
+            // them unflushed: audit 2026-10-16, M20).
+            if writer.runs().len() < listed {
+                pool.flush_members()?;
+            }
             let Some((at_end, page)) = writer.write(run) else {
                 return Err(Error::Unsupported("the dirty region log is full".into()));
             };
             let offset = if at_end { drt.size - 0x2000 } else { 0 };
-            let pool = self.reader.pool();
             write_copies(pool, &drt.layout, drt.layout.base + offset, &page)?;
             pool.flush_members()?;
         }
@@ -881,10 +928,12 @@ impl<'p, D: WriteAt> SpaceWriter<'p, D> {
     /// Makes the writes so far durable on every member (and the log slots
     /// of cached writes with them).
     pub fn flush(&self) -> Result<()> {
-        if let Some(cache) = &self.cache {
-            self.write_pending(cache, &mut cache.log.write().unwrap())?;
-        }
-        self.reader.pool().flush_members()
+        self.guarded(|| {
+            if let Some(cache) = &self.cache {
+                self.write_pending(cache, &mut cache.log.write().unwrap())?;
+            }
+            self.reader.pool().flush_members()
+        })
     }
 }
 
@@ -964,6 +1013,15 @@ pub(crate) fn refusal<D: ReadAt>(pool: &Pool<D>, reader: &SpaceReader<'_, D>) ->
         if index.header.checkpoint_count == 0 {
             return Some("its write-back cache has no checkpoint areas".into());
         }
+        // A parity space destages whole chunks as whole stripes: a chunk is
+        // a stripe (1.2.2 took the cache's word for it and panicked).
+        let stripe = layout.data_columns * layout.interleave;
+        if layout.resiliency == Resiliency::Parity && u64::from(index.header.chunk_size) != stripe {
+            return Some(format!(
+                "its write-back cache keeps chunks of {} bytes, not its stripes of {stripe}",
+                index.header.chunk_size
+            ));
+        }
     }
     None
 }
@@ -973,23 +1031,27 @@ pub(crate) fn refusal<D: ReadAt>(pool: &Pool<D>, reader: &SpaceReader<'_, D>) ->
 /// evenly and a mirror or parity row finds its disks as long as possible
 /// (Windows' choice does not follow from the metadata).
 fn pick_disk<D: ReadAt>(pool: &Pool<D>, db: &Database, row: u64, used: &BTreeSet<u64>) -> Result<u64> {
-    let free = |disk_id: u64| -> u64 {
+    let free = |disk_id: u64| -> Result<u64> {
         let Some(m) = pool
             .disks
             .get(&disk_id)
             .and_then(|d| d.member)
             .map(|m| &pool.members[m])
         else {
-            return 0;
+            return Ok(0);
         };
         let capacity = m.partition.length.saturating_sub(DATA_AREA_OFFSET) / SLAB_SIZE;
-        capacity.saturating_sub(db.first_free_slab(disk_id))
+        Ok(capacity.saturating_sub(db.first_free_slab(disk_id)?))
     };
-    pool.disks
+    let candidates = pool
+        .disks
         .values()
         .filter(|d| d.member.is_some() && matches!(d.usage, DiskUsage::AutoSelect | DiskUsage::ManualSelect))
         .filter(|d| !used.contains(&d.id))
-        .map(|d| (free(d.id), d.id))
+        .map(|d| Ok((free(d.id)?, d.id)))
+        .collect::<Result<Vec<_>>>()?;
+    candidates
+        .into_iter()
         .filter(|&(free, _)| free > 0)
         .min_by_key(|&(free, id)| (u64::MAX - free, id))
         .map(|(_, id)| id)
@@ -1695,7 +1757,7 @@ mod tests {
         r.read_exact_at(&mut back, 2 << 30).unwrap();
         assert!(back == data);
         let (disk, slab) = r.layout().physical(0, 0, 8).unwrap();
-        assert_eq!(slab, before.first_free_slab(disk));
+        assert_eq!(slab, before.first_free_slab(disk).unwrap());
         let mut model = before.clone();
         let record = crate::format::ExtentRecord {
             space_id: id,
@@ -1785,9 +1847,12 @@ mod tests {
     }
 
     /// Every crash state of a write that allocates a thin row: the database
-    /// copies are written one member after the other, each whole, so every
-    /// state opens (at most with a stale copy) and reads zeros or the data,
-    /// and the data once flushed.
+    /// copies are written one member after the other, each its entries
+    /// first and its header last, so every state opens (at most with stale
+    /// copies, or the copy being written torn under the old sequence and
+    /// outvoted by the others) and reads zeros or the data, and the data
+    /// once flushed; opening the space for writing brings every copy up to
+    /// date.
     #[test]
     fn a_crash_while_allocating_leaves_a_readable_pool() {
         use crate::io::{DeviceEvent, Recorder, WriteAt};
@@ -1822,7 +1887,9 @@ mod tests {
             }
             let pool = Pool::open(replay.iter().collect::<Vec<_>>()).unwrap();
             assert!(
-                pool.warnings.iter().all(|w| w.contains("stale pool database")),
+                pool.warnings
+                    .iter()
+                    .all(|w| w.contains("stale pool database") || w.contains("(torn write")),
                 "state {k}: {:?}",
                 pool.warnings
             );
@@ -1837,8 +1904,14 @@ mod tests {
             // Opening it for writing brings the stale copies up to date.
             drop(r);
             pool.open_space_rw(id).unwrap();
+            // As readers read them: the slots their headers count (a copy cut
+            // short after its entries may hold more past them).
+            let counted = |c: &crate::database::Database| {
+                let n = u32::from_be_bytes(c.bytes()[0x28..0x2c].try_into().unwrap()) as usize;
+                c.bytes()[..n * 0x40].to_vec()
+            };
             let copies = member_databases(&pool);
-            assert!(copies.iter().all(|c| c.bytes() == copies[0].bytes()), "state {k}");
+            assert!(copies.iter().all(|c| counted(c) == counted(&copies[0])), "state {k}");
             let again = Pool::open(replay.iter().collect::<Vec<_>>()).unwrap();
             assert!(again.warnings.is_empty(), "state {k}: {:?}", again.warnings);
         }
@@ -1963,5 +2036,280 @@ mod tests {
                 .map(|w| w.contains("not in a clean state")),
             Some(true)
         );
+    }
+
+    /// The shapes of a space's hidden structures are checked before it is
+    /// written, not trusted (audit 2026-10-16, writers): a write-back cache
+    /// whose chunks are half a stripe (destaging asserted whole stripes: a
+    /// panic) and a dirty region log of 4 KiB (its second header, 8 KiB
+    /// before its end, came before its start) are refused.
+    #[test]
+    fn hidden_structures_of_other_shapes_are_refused_for_writing() {
+        use crate::cache::SPCACHE_SIGNATURE;
+        use crate::format::SpaceRole;
+        use crate::io::WriteAt;
+        use crate::layout::Layout;
+        let pool = fixture("parity3_26100");
+        let id = pool.find_space("parity3_26100").unwrap().id();
+        let r = pool.open_space(id).unwrap();
+        let stripe = r.layout().data_columns * r.layout().interleave;
+        let mut header = r.cache().unwrap().header.clone();
+        drop(r);
+        header.chunk_size = (stripe / 2) as u32;
+        header.chunk_count *= 2;
+        let bytes = header.encode(SPCACHE_SIGNATURE);
+        let container = pool.children(id).find(|c| c.info.role == SpaceRole::Cache).unwrap();
+        let child = pool.children(container.id()).find(|c| !c.extents.is_empty()).unwrap();
+        let layout = Layout::with_base(
+            &child.info.policy.unwrap(),
+            &child.extents,
+            child.info.range.map_or(0, |r| r.0),
+        )
+        .unwrap();
+        for copy in 0..layout.copies {
+            let (disk, slab) = layout.physical(0, copy, 0).unwrap();
+            let (device, at) = pool.slab_location(disk, slab).unwrap().unwrap();
+            pool.devices[device].write_all_at(&bytes, at).unwrap();
+        }
+        let pool = Pool::open(pool.devices).unwrap();
+        let err = pool.open_space_rw(id).err().unwrap().to_string();
+        assert!(err.contains("chunks of"), "{err}");
+
+        let mut pool = fixture("drtdisc");
+        let id = pool.find_space("drtdisc").unwrap().id();
+        let container = pool
+            .children(id)
+            .find(|c| c.info.role == SpaceRole::Other(0x06))
+            .unwrap();
+        let child = pool
+            .children(container.id())
+            .find(|c| !c.extents.is_empty())
+            .unwrap()
+            .id();
+        let info = &mut pool.spaces.get_mut(&child).unwrap().info;
+        info.range = Some((info.range.map_or(0, |r| r.0), 0x1000));
+        let err = pool.open_space_rw(id).err().unwrap().to_string();
+        assert!(err.contains("dirty region log has 4096 bytes"), "{err}");
+    }
+
+    /// A page after the slots the header counts (readers ignore it) holds a
+    /// record's first fragment without its second, as a write a crash cut
+    /// short can leave it: that slot is free, and a new row of a thin space
+    /// goes to the first free slab, every copy of the database readable
+    /// afterwards. 1.2.2's model of the database took the fragment for a
+    /// record: the allocator, whose records no longer assembled, counted no
+    /// extents and put the row on slab 0 of each disk, over the metadata
+    /// space, and its update counted the slot, so that no copy of the
+    /// database could be read any more (audit 2026-10-16, writers). Records
+    /// that do not assemble now make the allocation fail.
+    #[test]
+    fn rows_are_not_placed_over_the_metadata_space() {
+        use crate::database::Database;
+        use crate::io::WriteAt;
+        use crate::ops::{BlankDisk, SpaceSpec, plan_create_pool, plan_create_space};
+        let images: Vec<SparseImage> = (0..2).map(|_| SparseImage::new(8 << 30)).collect();
+        let base: Vec<Overlay<&SparseImage>> = images.iter().map(Overlay::new).collect();
+        let blank = BlankDisk {
+            size: 8 << 30,
+            logical_sector: 512,
+            physical_sector: 4096,
+            manufacturer: "Linux".into(),
+            model: "test".into(),
+        };
+        let mut n = 0u64;
+        let mut guid = || {
+            n += 1;
+            crate::Guid([n as u8; 16])
+        };
+        let (plan, _) = plan_create_pool(&[blank.clone(), blank], "stray", None, &mut guid).unwrap();
+        plan.apply::<&Overlay<&SparseImage>, _>(&[], &base.iter().collect::<Vec<_>>())
+            .unwrap();
+        let pool = Pool::open(base.iter().collect::<Vec<_>>()).unwrap();
+        let spec = SpaceSpec {
+            name: "t".into(),
+            resiliency: 1,
+            size: 4 << 30,
+            thin: true,
+            copies: None,
+            columns: None,
+            interleave: None,
+            write_cache: None,
+        };
+        let (plan, _) = plan_create_space(&pool, &spec, &mut guid).unwrap();
+        drop(pool);
+        plan.apply::<_, &Overlay<&SparseImage>>(&base.iter().collect::<Vec<_>>(), &[])
+            .unwrap();
+        let pool = Pool::open(base.iter().collect::<Vec<_>>()).unwrap();
+        for m in &pool.members {
+            let at = m.partition.offset + crate::format::POOL_DB_OFFSET;
+            let len = Database::read_formatted(&base[m.device], at).unwrap().bytes().len();
+            let first = len / 0x40;
+            let mut page = vec![0u8; 0x1000];
+            for (k, slot) in page.chunks_mut(0x40).enumerate() {
+                slot[..4].copy_from_slice(b"SDBB");
+                slot[4..8].copy_from_slice(&((first + k) as u32).to_be_bytes());
+            }
+            page[8..12].copy_from_slice(&(first as u32).to_be_bytes());
+            page[14..16].copy_from_slice(&2u16.to_be_bytes());
+            page[16..24].copy_from_slice(&[4, 6, 0, 0, 0, 0, 0, 0x40]);
+            base[m.device].write_all_at(&page, at + len as u64).unwrap();
+        }
+        drop(pool);
+        let pool = Pool::open(base.iter().collect::<Vec<_>>()).unwrap();
+        assert!(pool.warnings.is_empty(), "{:?}", pool.warnings);
+        let id = pool.find_space("t").unwrap().id();
+        let w = pool.open_space_rw(id).unwrap();
+        let wrote = w.write_all_at(&[0x77; 4096], 2 << 30);
+        drop(w);
+        wrote.unwrap();
+        let pool = Pool::open(base.iter().collect::<Vec<_>>()).unwrap();
+        assert!(pool.warnings.is_empty(), "{:?}", pool.warnings);
+        let space = pool.find_space("t").unwrap();
+        assert_eq!(space.extents.len(), 4);
+        assert!(space.extents.iter().all(|e| e.physical_slab > 0), "{:?}", space.extents);
+    }
+
+    /// A device whose writes and flushes fail while `fail` is set.
+    struct Failing<D> {
+        inner: D,
+        fail: std::sync::atomic::AtomicBool,
+    }
+
+    impl<D: crate::io::ReadAt> crate::io::ReadAt for Failing<D> {
+        fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> std::io::Result<()> {
+            self.inner.read_exact_at(buf, offset)
+        }
+        fn size(&self) -> std::io::Result<u64> {
+            self.inner.size()
+        }
+    }
+
+    impl<D: crate::io::WriteAt> crate::io::WriteAt for Failing<D> {
+        fn write_all_at(&self, buf: &[u8], offset: u64) -> std::io::Result<()> {
+            if self.fail.load(std::sync::atomic::Ordering::Acquire) {
+                return Err(std::io::Error::other("injected write failure"));
+            }
+            self.inner.write_all_at(buf, offset)
+        }
+        fn flush(&self) -> std::io::Result<()> {
+            if self.fail.load(std::sync::atomic::Ordering::Acquire) {
+                return Err(std::io::Error::other("injected flush failure"));
+            }
+            self.inner.flush()
+        }
+    }
+
+    /// After a write or a flush that failed (here on the second disk), the
+    /// writer writes nothing more and reports no flush as done, even when
+    /// the disk works again: what reached which disk is not known. 1.2.2
+    /// carried on (audit 2026-10-16, M20).
+    #[test]
+    fn nothing_is_written_after_a_failed_write_or_flush() {
+        use std::sync::atomic::Ordering;
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/simple2c");
+        for what in ["write", "flush"] {
+            let disks: Vec<Failing<Overlay<SparseImage>>> = (0..2)
+                .map(|i| Failing {
+                    inner: Overlay::new(
+                        SparseImage::read_from(File::open(dir.join(format!("disk{i}.fixture"))).unwrap()).unwrap(),
+                    ),
+                    fail: false.into(),
+                })
+                .collect();
+            let pool = Pool::open(disks).unwrap();
+            let id = pool.find_space("simple2c").unwrap().id();
+            let w = pool.open_space_rw(id).unwrap();
+            let data = vec![0x5a; 1 << 20];
+            w.write_all_at(&data, 0).unwrap();
+            w.flush().unwrap();
+            pool.devices[1].fail.store(true, Ordering::Release);
+            let failed = match what {
+                "write" => w.write_all_at(&data, 0),
+                _ => w.flush(),
+            };
+            assert!(failed.is_err(), "{what}");
+            pool.devices[1].fail.store(false, Ordering::Release);
+            let e = w.write_all_at(&data, 0).unwrap_err().to_string();
+            assert!(e.contains("failed before"), "{what}: {e}");
+            assert!(w.flush().is_err(), "{what}");
+            assert!(w.discard(0, 1 << 20).is_ok(), "{what}: a fixed space ignores discards");
+        }
+    }
+
+    /// A run the dirty region log stops listing holds its data on every
+    /// copy before the header that drops it is written: a write into run 0
+    /// (aged here past the 30 s after which Windows drops a run), then one
+    /// into run 4. 1.2.2 wrote the header without run 0 before flushing
+    /// run 0's data, so that a crash could leave its copies differing
+    /// where the log no longer lists them (audit 2026-10-16, M20).
+    #[test]
+    fn a_run_leaves_the_dirty_region_log_once_its_data_is_durable() {
+        use crate::io::{DeviceEvent, Recorder};
+        use crate::ops::{BlankDisk, SpaceSpec, plan_create_pool, plan_create_space};
+        use std::sync::{Arc, Mutex};
+        let images: Vec<SparseImage> = (0..2).map(|_| SparseImage::new(8 << 30)).collect();
+        let base: Vec<Overlay<&SparseImage>> = images.iter().map(Overlay::new).collect();
+        let blank = BlankDisk {
+            size: 8 << 30,
+            logical_sector: 512,
+            physical_sector: 4096,
+            manufacturer: "Linux".into(),
+            model: "test".into(),
+        };
+        let mut n = 0u64;
+        let mut guid = || {
+            n += 1;
+            crate::Guid([n as u8; 16])
+        };
+        let (plan, _) = plan_create_pool(&[blank.clone(), blank], "drt", None, &mut guid).unwrap();
+        plan.apply::<&Overlay<&SparseImage>, _>(&[], &base.iter().collect::<Vec<_>>())
+            .unwrap();
+        let pool = Pool::open(base.iter().collect::<Vec<_>>()).unwrap();
+        let spec = SpaceSpec {
+            name: "m".into(),
+            resiliency: 2,
+            size: 2 << 30,
+            thin: false,
+            copies: None,
+            columns: None,
+            interleave: None,
+            write_cache: None,
+        };
+        let (plan, _) = plan_create_space(&pool, &spec, &mut guid).unwrap();
+        drop(pool);
+        plan.apply::<_, &Overlay<&SparseImage>>(&base.iter().collect::<Vec<_>>(), &[])
+            .unwrap();
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let disks: Vec<Recorder<&Overlay<&SparseImage>>> = base
+            .iter()
+            .enumerate()
+            .map(|(i, d)| Recorder::new(d, i, log.clone()))
+            .collect();
+        let pool = Pool::open(disks).unwrap();
+        let id = pool.find_space("m").unwrap().id();
+        let w = pool.open_space_rw(id).unwrap();
+        let data = vec![0x6d; 1 << 20];
+        w.write_all_at(&data, 0).unwrap();
+        for t in w.drt.as_ref().unwrap().log.lock().unwrap().1.values_mut() {
+            *t = t.checked_sub(std::time::Duration::from_secs(31)).unwrap();
+        }
+        let mark = log.lock().unwrap().len();
+        w.write_all_at(&data, 1 << 30).unwrap();
+        let events = log.lock().unwrap()[mark..].to_vec();
+        let header = events
+            .iter()
+            .position(|e| matches!(e, DeviceEvent::Write { data, .. } if data.starts_with(b"SPACEDRT")))
+            .unwrap();
+        let DeviceEvent::Write { data: page, .. } = &events[header] else {
+            unreachable!()
+        };
+        assert_eq!(page[0x10..0x14], 1u32.to_le_bytes(), "one run listed");
+        assert_eq!(page[0x18..0x20], 4u64.to_le_bytes(), "run 4 listed");
+        for device in 0..2 {
+            assert!(
+                events[..header].contains(&DeviceEvent::Flush { device }),
+                "device {device} not flushed before run 0 left the log"
+            );
+        }
     }
 }

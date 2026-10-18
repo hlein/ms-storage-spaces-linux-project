@@ -340,6 +340,13 @@ impl CacheWriter {
             || self.next_block as u64 + new > self.header.chunk_count as u64
             || (self.header.checkpoint_count > 0
                 && self.checkpoint_may_overflow((offset / chunk..(offset + len).div_ceil(chunk)).count() as u64))
+            // An entry takes one slot at most, and a write adds two runs to
+            // a chunk at most: cut off at the end of its slot, an entry made
+            // the log unreadable (audit 2026-10-16, M20).
+            || (offset / chunk..(offset + len).div_ceil(chunk)).any(|c| {
+                let runs = self.chunks.get(&c).map_or(1, |(_, valid)| run_count(valid));
+                0x38 + 16 + 2 * (runs + 2) > self.header.slot_size as usize
+            })
     }
 
     /// Destaging `offsets` (owner offsets of cached chunks, whose data is in
@@ -577,9 +584,14 @@ pub(crate) fn encode_slot(
 /// Bytes the entry of a chunk with these valid sectors takes in a slot or
 /// checkpoint (8-byte aligned).
 fn entry_len(valid: &[bool]) -> usize {
-    let runs = valid.windows(2).filter(|w| w[0] != w[1]).count() + 1;
+    let runs = run_count(valid);
     let counted = if runs == 1 { 0 } else { 2 * runs };
     (16 + counted).next_multiple_of(8)
+}
+
+/// Runs of equally valid sectors a chunk has.
+fn run_count(valid: &[bool]) -> usize {
+    valid.windows(2).filter(|w| w[0] != w[1]).count() + 1
 }
 
 /// Runs of equally valid sectors, from the chunk start.
@@ -1369,6 +1381,51 @@ mod tests {
             w.write(offset, len);
             check(&w);
         }
+    }
+
+    /// The entry of a chunk of many runs never outgrows a slot (audit
+    /// 2026-10-16, M20): 512-byte writes into every other sector of a
+    /// chunk of 1 MiB (2048 sectors of 512 bytes) made the 1007th write's
+    /// entry 4044 bytes, more than a slot of 4 KiB holds after its header;
+    /// it was cut off, and the log no longer loaded.
+    #[test]
+    fn entries_never_outgrow_a_slot() {
+        let header = CacheHeader::new(Guid([7; 16]), 1 << 30, 1 << 20);
+        let mut w = CacheWriter::new(header.clone(), 512, 64).unwrap();
+        let mut space = vec![0u8; header.data_offset as usize];
+        let put = |space: &mut Vec<u8>, records: Vec<LogWrite>| {
+            for r in records {
+                let (at, page) = match r {
+                    LogWrite::Slot(i, page) => (header.slot_offset + i as u64 * header.slot_size as u64, page),
+                    LogWrite::Checkpoint(a, page) => (
+                        header.checkpoint_offset + a as u64 * header.checkpoint_size as u64,
+                        page,
+                    ),
+                };
+                space[at as usize..][..page.len()].copy_from_slice(&page);
+            }
+        };
+        put(&mut space, vec![LogWrite::Slot(0, w.init_slot())]);
+        let mut destaged = 0;
+        for i in 0..1012u64 {
+            let at = i * 1024;
+            if w.is_full_for(at, 512) {
+                let cached: Vec<u64> = w.cached().iter().map(|c| c.0).collect();
+                put(&mut space, w.destage(&cached));
+                destaged += 1;
+            }
+            put(&mut space, w.write(at, 512));
+            if i % 100 == 0 || i >= 1000 {
+                let index = CacheIndex::load(header.clone(), 512, |off: u64, buf: &mut [u8]| {
+                    buf.copy_from_slice(&space[off as usize..off as usize + buf.len()]);
+                    Ok(())
+                })
+                .unwrap_or_else(|e| panic!("after write {}: {e}", i + 1));
+                assert!(matches!(index.lookup(at), Lookup::Hit { .. }), "write {}", i + 1);
+                assert!(matches!(index.lookup(at + 512), Lookup::Miss { .. }), "write {}", i + 1);
+            }
+        }
+        assert!(destaged > 0);
     }
 
     #[test]

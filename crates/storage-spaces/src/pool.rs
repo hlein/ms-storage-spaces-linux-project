@@ -158,6 +158,39 @@ impl Space {
     }
 }
 
+/// The writes that make the pool database `db` a copy in the pool
+/// partition `partition`, in the order they go to the disk, each made
+/// durable before the next: everything after the copy's header, then the
+/// header (its first 0x200 bytes) together with `head`, what the partition
+/// holds before the copy (a member's SPACEDB header page, or nothing). A
+/// write a crash tears leaves the old header and so the old sequence: such
+/// a copy never passes for the newest, and copies of one sequence that
+/// differ are reported torn ([`Issue::TornCopy`]). 1.2.2 wrote the header
+/// first, in one write with the rest, so that a torn copy was the newest
+/// (audit 2026-10-16, M20). Refused when the copy would reach past the end
+/// of the partition (1.2.2 wrote past it where a partition table said the
+/// partition was shorter than the database).
+pub(crate) fn database_copy(partition: &PartitionLocation, head: &[u8], db: &[u8]) -> Result<[(u64, Vec<u8>); 2]> {
+    const HEADER: usize = 0x200;
+    let fits = POOL_DB_OFFSET
+        .checked_add(db.len() as u64)
+        .is_some_and(|end| end <= partition.length);
+    if db.len() < HEADER || !(head.is_empty() || head.len() as u64 == POOL_DB_OFFSET) || !fits {
+        return Err(Error::Pool(format!(
+            "a pool database of {} bytes does not fit a pool partition of {} bytes",
+            db.len(),
+            partition.length
+        )));
+    }
+    let at = partition.offset + POOL_DB_OFFSET;
+    let mut first = head.to_vec();
+    first.extend_from_slice(&db[..HEADER]);
+    Ok([
+        (at + HEADER as u64, db[HEADER..].to_vec()),
+        (at - head.len() as u64, first),
+    ])
+}
+
 /// The records of one pool database copy.
 struct Decoded {
     pool_record: PoolRecord,
@@ -740,9 +773,21 @@ impl<D: ReadAt> Pool<D> {
     /// Why space `id` cannot be opened for writing, or `None` if it can
     /// (the checks [`Pool::open_space_rw`] makes, without writing).
     pub fn write_refusal(&self, id: u64) -> Result<Option<String>> {
-        // Stale database copies are brought up to date when a space is
-        // opened for writing ([`Pool::update_stale_copies`]).
-        let unclean: Vec<&String> = self.warnings.iter().filter(|w| !w.ends_with(STALE_COPY)).collect();
+        // Stale database copies, and torn ones most copies outvote, are
+        // brought up to date when a space is opened for writing
+        // ([`Pool::update_stale_copies`]). A crash while the first copy of
+        // an update is written leaves it torn under the old sequence.
+        let outvoted = self.torn_copies(true);
+        let unclean: Vec<String> = self
+            .issues
+            .iter()
+            .filter(|i| match i {
+                Issue::StaleCopy { .. } => false,
+                Issue::TornCopy { devices, .. } => !devices.iter().all(|d| outvoted.contains(d)),
+                _ => true,
+            })
+            .map(Issue::to_string)
+            .collect();
         if !unclean.is_empty() {
             return Ok(Some(format!(
                 "the pool is not in a clean state ({})",
@@ -785,9 +830,10 @@ impl<D: ReadAt> Pool<D> {
     }
 
     /// Writes `db` as the pool database of every member that carries a
-    /// copy, one member after the other, each flushed before the next is
-    /// written, so that a crash leaves every copy whole, either old or new
-    /// (Windows reads the copy with the newest sequence).
+    /// copy, one member after the other, each as [`database_copy`] says
+    /// and flushed before the next is written, so that a crash leaves at
+    /// most one copy torn, and that one under its old sequence (Windows
+    /// reads the copy with the newest sequence).
     pub(crate) fn write_database(&self, db: &crate::database::Database) -> Result<()>
     where
         D: WriteAt,
@@ -795,8 +841,20 @@ impl<D: ReadAt> Pool<D> {
         let mut members: Vec<&Member> = self.members.iter().filter(|m| m.db_sequence.is_some()).collect();
         members.sort_by_key(|m| m.device);
         for m in members {
-            let dev = &self.devices[m.device];
-            dev.write_all_at(db.bytes(), m.partition.offset + POOL_DB_OFFSET)?;
+            self.write_copy(m, db)?;
+        }
+        Ok(())
+    }
+
+    /// Writes `db` as the copy of the pool database on member `m`, its
+    /// header last ([`database_copy`]), each part made durable.
+    fn write_copy(&self, m: &Member, db: &crate::database::Database) -> Result<()>
+    where
+        D: WriteAt,
+    {
+        let dev = &self.devices[m.device];
+        for (offset, bytes) in database_copy(&m.partition, &[], db.bytes())? {
+            dev.write_all_at(&bytes, offset)?;
             dev.flush()?;
         }
         Ok(())
@@ -816,11 +874,14 @@ impl<D: ReadAt> Pool<D> {
                 .values()
                 .any(|d| d.member == Some(index) && d.usage == DiskUsage::Retired)
         };
+        let torn = self.torn_copies(true);
         let stale: Vec<&Member> = self
             .members
             .iter()
             .enumerate()
-            .filter(|(i, m)| m.db_sequence.is_some_and(|s| s < self.database.sequence) && !retired(*i))
+            .filter(|(i, m)| {
+                (m.db_sequence.is_some_and(|s| s < self.database.sequence) && !retired(*i)) || torn.contains(&m.device)
+            })
             .map(|(_, m)| m)
             .collect();
         if stale.is_empty() {
@@ -828,20 +889,36 @@ impl<D: ReadAt> Pool<D> {
         }
         let db = self.database_model()?;
         for m in stale {
-            let dev = &self.devices[m.device];
-            dev.write_all_at(db.bytes(), m.partition.offset + POOL_DB_OFFSET)?;
-            dev.flush()?;
+            self.write_copy(m, &db)?;
         }
         Ok(())
     }
 
+    /// The devices whose copies of the sequence used differ from the
+    /// version used (a write a crash tore: [`Issue::TornCopy`]); with
+    /// `outvoted`, only where most copies of that sequence hold the version
+    /// used, which can then be written over them as over stale copies (the
+    /// torn copy of a two-copy pool is not outvoted: which one is right is
+    /// not known).
+    fn torn_copies(&self, outvoted: bool) -> Vec<usize> {
+        self.issues
+            .iter()
+            .filter_map(|i| match i {
+                Issue::TornCopy { devices, held, .. } if !outvoted || held.0 * 2 > held.1 => Some(devices.clone()),
+                _ => None,
+            })
+            .flatten()
+            .collect()
+    }
+
     /// The pool database as the model of its updates, read from a member
-    /// that carries the current copy.
+    /// that carries the version used (not a torn copy of its sequence).
     pub(crate) fn database_model(&self) -> Result<crate::database::Database> {
+        let torn = self.torn_copies(false);
         let m = self
             .members
             .iter()
-            .find(|m| m.db_sequence == Some(self.database.sequence))
+            .find(|m| m.db_sequence == Some(self.database.sequence) && !torn.contains(&m.device))
             .ok_or_else(|| Error::Pool("no member carries the current pool database".into()))?;
         crate::database::Database::read_formatted(&self.devices[m.device], m.partition.offset + POOL_DB_OFFSET)
     }

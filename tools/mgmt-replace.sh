@@ -25,7 +25,9 @@ q space create --name rparity --resiliency parity --size 2G "$dir"/d{0,1,2}.img
 failed=$("$spaces" info "$dir"/d{0,1,2}.img | awk '/device 2$/ {print $1}')
 mv "$dir/d2.img" "$dir/failed.img"
 left=("$dir"/d0.img "$dir"/d1.img)
-"$spaces" pool health "${left[@]}" 2>/dev/null | head -1
+# (Not piped into head: under pipefail its early exit failed the script.)
+health=$("$spaces" pool health "${left[@]}" 2>/dev/null)
+echo "${health%%$'\n'*}"
 q disk add --new "$dir/d3.img" "${left[@]}"
 now=("$dir"/d0.img "$dir"/d1.img "$dir"/d3.img)
 q pool repair "${now[@]}"

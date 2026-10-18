@@ -115,7 +115,7 @@ impl NewPool {
                 extra: [String::new(), String::new()],
                 media: 0,
                 size: d.size,
-                data_size: table.pool_partition().length - DATA_AREA_OFFSET,
+                data_size: table.pool_partition()?.length - DATA_AREA_OFFSET,
             };
             records.push((DISK_RECORD, disk.encode()?));
         }
@@ -188,11 +188,8 @@ impl NewPool {
         let mut out = Vec::new();
         for d in &self.disks {
             let table = self.table(d);
-            let partition = table.pool_partition();
-            if partition.length <= DATA_AREA_OFFSET + SLAB_SIZE {
-                return Err(format_err!("a disk of {} bytes is too small for a pool", d.size));
-            }
-            let mut writes = table.regions();
+            let partition = table.pool_partition()?;
+            let mut writes = table.regions()?;
             let header = DiskHeader {
                 version: 3,
                 generation: 1,

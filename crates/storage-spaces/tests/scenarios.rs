@@ -315,7 +315,7 @@ fn replay_allocations_of(scenario: &str, space_id: u64, steps: &[Allocations], p
                         copy,
                         slab_count: 1,
                         disk_id,
-                        physical_slab: db.first_free_slab(disk_id),
+                        physical_slab: db.first_free_slab(disk_id).unwrap(),
                         flags: 0,
                         stale_marker: 0xffff_ffff,
                     }

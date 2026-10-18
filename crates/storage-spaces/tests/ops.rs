@@ -520,6 +520,339 @@ fn scrubbing_finds_differences_and_makes_them_agree() {
     assert!(row1.iter().all(|&b| b == 0));
 }
 
+/// A parity space of 4 MiB units, more than the MiB scrubbing reads at a
+/// time: a parity unit damaged in the last MiB of its slab is repaired
+/// inside its unit. 1.2.2 recomputed a whole unit from where the damaged
+/// MiB starts, past the end of the slab into the next one of each disk,
+/// where another space keeps its data (audit 2026-10-16, M20).
+#[test]
+fn scrubbing_repairs_units_larger_than_its_reads_inside_them() {
+    use storage_spaces::layout::Location;
+    use storage_spaces::ops::scrub;
+    use storage_spaces::plan::Action;
+    let mut new_guid = guids();
+    let (images, disks) = blank(3);
+    let base: Vec<Overlay<&SparseImage>> = images.iter().map(Overlay::new).collect();
+    let members = || base.iter().collect::<Vec<_>>();
+    let (plan, _) = plan_create_pool(&disks, "units", None, &mut new_guid).unwrap();
+    plan.apply::<&Overlay<&SparseImage>, _>(&[], &members()).unwrap();
+    let mut wide = spec("wide", 3, 1024, false);
+    wide.interleave = Some(4 << 20);
+    for s in [wide, spec("after", 1, 3072, false)] {
+        let pool = Pool::open(members()).unwrap();
+        let (plan, _) = plan_create_space(&pool, &s, &mut new_guid).unwrap();
+        drop(pool);
+        plan.apply::<_, &Overlay<&SparseImage>>(&members(), &[]).unwrap();
+    }
+    let pool = Pool::open(members()).unwrap();
+    let id = pool.find_space("wide").unwrap().id();
+    let w = pool.open_space_rw(id).unwrap();
+    w.write_all_at(&data(3, 16 << 20), 0).unwrap();
+    w.destage().unwrap();
+    w.flush().unwrap();
+    drop(w);
+    // Every slab of the simple space holds data.
+    let after = pool.find_space("after").unwrap().id();
+    let w = pool.open_space_rw(after).unwrap();
+    let size = w.size();
+    for at in (0..size).step_by(64 << 20) {
+        w.write_all_at(&data(at as u8, 64 << 20), at).unwrap();
+    }
+    w.flush().unwrap();
+    drop(w);
+    // The parity unit of the last stripe of row 0, in its last MiB.
+    let r = pool.open_space(id).unwrap();
+    let l = r.layout().clone();
+    assert_eq!(l.interleave, 4 << 20);
+    let last = Location {
+        column: 0,
+        row: 0,
+        offset_in_slab: SLAB - l.interleave,
+        contiguous: l.interleave,
+    };
+    let (disk, slab) = l.physical(l.parity_column(l.stripe_of(&last)), 0, 0).unwrap();
+    let (device, start) = pool.slab_location(disk, slab).unwrap().unwrap();
+    base[device]
+        .write_all_at(&[0xa5; 4096], start + SLAB - (512 << 10))
+        .unwrap();
+    drop(r);
+    let found = scrub(&pool).unwrap();
+    assert_eq!(found.mismatches + found.unsettled, 1, "{:?}", found.lines);
+    for a in found.plan.steps.iter().flat_map(|s| &s.actions) {
+        if let Action::Xor { to_offset, len, .. } = a {
+            assert!(
+                *to_offset >= start + SLAB - l.interleave && to_offset + len <= start + SLAB,
+                "repair at {to_offset:#x}, {len:#x} bytes: outside the unit"
+            );
+        }
+    }
+    drop(pool);
+    found.plan.apply::<_, &Overlay<&SparseImage>>(&members(), &[]).unwrap();
+    let pool = Pool::open(members()).unwrap();
+    let again = scrub(&pool).unwrap();
+    assert_eq!((again.mismatches, again.unsettled), (0, 0), "{:?}", again.lines);
+    let r = pool.open_space(after).unwrap();
+    let mut got = vec![0u8; 64 << 20];
+    for at in (0..size).step_by(64 << 20) {
+        r.read_exact_at(&mut got, at).unwrap();
+        assert!(got == data(at as u8, 64 << 20), "the simple space at {at:#x}");
+    }
+}
+
+const SLAB: u64 = 256 << 20;
+
+/// The disks of fixture `name`.
+fn fixture(name: &str) -> Vec<SparseImage> {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures")
+        .join(name);
+    (0..)
+        .map_while(|i| std::fs::File::open(dir.join(format!("disk{i}.fixture"))).ok())
+        .map(|f| SparseImage::read_from(f).unwrap())
+        .collect()
+}
+
+/// A write of a pool database copy torn by a crash never passes for the
+/// newest copy. A space is renamed (its record moves to other slots) on
+/// pools of five, four and two copies; every write of the plan is cut
+/// after each of its sectors (the first ones written, or the last ones),
+/// after everything before it was written. The pool always opens with the
+/// space as it was or as renamed, whole, unless copies of one sequence
+/// that differ hold no majority (reported torn: the guard calls that
+/// suspect, and the writer refuses it); otherwise opening the space for
+/// writing brings every copy up to date. 1.2.2 wrote a copy's header
+/// first, in one write with its entries: a torn copy was the newest, and
+/// the space vanished (audit 2026-10-16, M20).
+#[test]
+fn a_torn_database_copy_never_passes_for_the_newest() {
+    use std::sync::{Arc, Mutex};
+    use storage_spaces::Issue;
+    use storage_spaces::ops::plan_rename_space;
+    for name in ["mirror3", "parity4", "simple2c"] {
+        let images = fixture(name);
+        let pool = Pool::open(images.iter().collect::<Vec<_>>()).unwrap();
+        let space = pool.find_space(name).unwrap();
+        let (id, extents) = (space.id(), space.extents.len());
+        let plan = plan_rename_space(&pool, name, "renamed").unwrap();
+        drop(pool);
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let scratch: Vec<Overlay<&SparseImage>> = images.iter().map(Overlay::new).collect();
+        let recorders: Vec<Recorder<&Overlay<&SparseImage>>> = scratch
+            .iter()
+            .enumerate()
+            .map(|(i, d)| Recorder::new(d, i, log.clone()))
+            .collect();
+        plan.apply::<_, &Recorder<&Overlay<&SparseImage>>>(&recorders.iter().collect::<Vec<_>>(), &[])
+            .unwrap();
+        let events = log.lock().unwrap().clone();
+        let (mut states, mut apart, mut outvoted) = (0, 0, 0);
+        for (cut, event) in events.iter().enumerate() {
+            let DeviceEvent::Write { device, offset, data } = event else {
+                continue;
+            };
+            let sectors = data.len() / 512;
+            for (k, first) in (1..sectors).flat_map(|k| [(k, true), (k, false)]) {
+                let replay: Vec<Overlay<&SparseImage>> = images.iter().map(Overlay::new).collect();
+                for e in &events[..cut] {
+                    if let DeviceEvent::Write { device, offset, data } = e {
+                        replay[*device].write_all_at(data, *offset).unwrap();
+                    }
+                }
+                let part = if first {
+                    0..k * 512
+                } else {
+                    (sectors - k) * 512..data.len()
+                };
+                replay[*device]
+                    .write_all_at(&data[part.clone()], offset + part.start as u64)
+                    .unwrap();
+                let pool = Pool::open(replay.iter().collect::<Vec<_>>()).unwrap();
+                states += 1;
+                let torn_apart = pool
+                    .issues
+                    .iter()
+                    .any(|i| matches!(i, Issue::TornCopy { differs: true, held, .. } if held.0 * 2 <= held.1));
+                let refusal = pool.write_refusal(id).unwrap().unwrap_or_default();
+                if torn_apart {
+                    // Which copy is right is not known: nothing is written.
+                    assert!(refusal.contains("not in a clean state"), "{name}: {refusal}");
+                    apart += 1;
+                    continue;
+                }
+                let s = pool.spaces.get(&id);
+                assert!(
+                    s.is_some_and(|s| (s.name() == name || s.name() == "renamed") && s.extents.len() == extents),
+                    "{name}: write {cut} cut after {k} sectors ({}): sequence {}, {:?}",
+                    if first { "the first" } else { "the last" },
+                    pool.database.sequence,
+                    pool.warnings
+                );
+                // Opening the space for writing brings stale copies, and a
+                // torn one the others outvote, up to date.
+                assert!(!refusal.contains("not in a clean state"), "{name}: {refusal}");
+                if refusal.is_empty() {
+                    outvoted += pool.issues.iter().any(|i| matches!(i, Issue::TornCopy { .. })) as usize;
+                    drop(pool.open_space_rw(id).unwrap());
+                    let again = Pool::open(replay.iter().collect::<Vec<_>>()).unwrap();
+                    assert!(again.warnings.is_empty(), "{name}: {:?}", again.warnings);
+                }
+            }
+        }
+        assert!(
+            outvoted > 0 || name != "mirror3",
+            "{name}: no torn copy outvoted and written over"
+        );
+        assert!(states > 0, "{name}");
+        // Only the pool of two copies has no majority while one is torn.
+        assert_eq!(apart > 0, name == "simple2c", "{name}: {apart} of {states}");
+    }
+}
+
+/// The copies of the pool database stay inside their members' pool
+/// partitions: a partition table that makes the first member's pool
+/// partition 8 KiB long (its database takes 12 KiB) gets no write past
+/// it. 1.2.2 planned a rename that wrote the copy across the partition's
+/// end (audit 2026-10-16, M20).
+#[test]
+fn database_copies_stay_inside_their_partitions() {
+    use storage_spaces::ops::{plan_delete_space, plan_rename_pool};
+    use storage_spaces::plan::{Action, Target};
+    let mut new_guid = guids();
+    let (images, disks) = blank(3);
+    let base: Vec<Overlay<&SparseImage>> = images.iter().map(Overlay::new).collect();
+    let members = || base.iter().collect::<Vec<_>>();
+    let (plan, _) = plan_create_pool(&disks, "short", None, &mut new_guid).unwrap();
+    plan.apply::<&Overlay<&SparseImage>, _>(&[], &members()).unwrap();
+    // The database grows past a page, then its spaces go again.
+    for n in 0..24 {
+        let pool = Pool::open(members()).unwrap();
+        let (plan, _) = plan_create_space(&pool, &spec(&format!("s{n}"), 1, 512, true), &mut new_guid).unwrap();
+        drop(pool);
+        plan.apply::<_, &Overlay<&SparseImage>>(&members(), &[]).unwrap();
+    }
+    for n in 0..24 {
+        let pool = Pool::open(members()).unwrap();
+        let plan = plan_delete_space(&pool, &format!("s{n}")).unwrap();
+        drop(pool);
+        plan.apply::<_, &Overlay<&SparseImage>>(&members(), &[]).unwrap();
+    }
+    // The pool partition's last sector (the second entry of the table at
+    // LBA 2), 16 sectors after its first.
+    let first = 32768u64;
+    base[0]
+        .write_all_at(&(first + 15).to_le_bytes(), 1024 + 128 + 40)
+        .unwrap();
+    let pool = Pool::open(members()).unwrap();
+    let m = &pool.members[0];
+    assert_eq!(m.partition.length, 8192);
+    let end = m.partition.offset + m.partition.length;
+    match plan_rename_pool(&pool, "renamed") {
+        Err(e) => assert!(e.to_string().contains("does not fit"), "{e}"),
+        Ok(plan) => {
+            for a in plan.steps.iter().flat_map(|s| &s.actions) {
+                if let Action::Write {
+                    target: Target::Member(0),
+                    offset,
+                    bytes,
+                } = a
+                {
+                    assert!(
+                        offset + bytes.len() as u64 <= end,
+                        "a write up to {:#x}, past {end:#x}",
+                        offset + bytes.len() as u64
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// A space of local reconstruction codes (dual parity in local groups:
+/// Windows' `lrc11`, 11 columns in 2 groups, 8 data columns of 1 GiB
+/// units) grows by a row and opens, with its data as before. 1.2.2 counted
+/// the columns less the redundancy (9): the new extents started where no
+/// row does, and the space no longer opened (audit 2026-10-16, M20).
+#[test]
+fn a_space_of_local_groups_grows_and_opens() {
+    use storage_spaces::ops::plan_resize_space;
+    let images = fixture("lrc11");
+    let base: Vec<Overlay<&SparseImage>> = images.iter().map(Overlay::new).collect();
+    let members = || base.iter().collect::<Vec<_>>();
+    let pool = Pool::open(members()).unwrap();
+    let id = pool.find_space("lrc11").unwrap().id();
+    let r = pool.open_space(id).unwrap();
+    assert_eq!(r.size(), 8 << 30);
+    let read = |r: &storage_spaces::SpaceReader<'_, _>| {
+        [0u64, 3 << 30, (8 << 30) - (1 << 20)].map(|at| {
+            let mut b = vec![0u8; 1 << 20];
+            r.read_exact_at(&mut b, at).unwrap();
+            b
+        })
+    };
+    let before = read(&r);
+    drop(r);
+    let plan = plan_resize_space(&pool, "lrc11", 16 << 30).unwrap();
+    drop(pool);
+    plan.apply::<_, &Overlay<&SparseImage>>(&members(), &[]).unwrap();
+    let pool = Pool::open(members()).unwrap();
+    assert!(pool.warnings.is_empty(), "{:?}", pool.warnings);
+    check_pool(&pool).unwrap();
+    let r = pool.open_space(id).unwrap();
+    assert_eq!(r.size(), 16 << 30);
+    assert_eq!(r.condition(), storage_spaces::Condition::Healthy);
+    assert!(read(&r) == before);
+    let mut grown = vec![1u8; 1 << 20];
+    r.read_exact_at(&mut grown, 12 << 30).unwrap();
+}
+
+/// Every planner updates the database as readers read it: every slot its
+/// header counts. In 17 of the fixtures (pools of tiers, dual parity,
+/// local groups, several spaces) the second page of the pool database is
+/// formatted only up to its last slot in use, the fixtures keeping what
+/// the reader reads, and 1.2.2 read the database for an update up to its
+/// last page formatted whole: the update left out the records of that
+/// page, and spaces, their extents and disks vanished (found by
+/// `a_space_of_local_groups_grows_and_opens`; the pools of the corpus have
+/// whole pages). Renamed, every fixture that can be changed keeps them all.
+#[test]
+fn planners_keep_every_record_of_databases_formatted_in_part() {
+    use storage_spaces::ops::plan_rename_pool;
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+    let mut names: Vec<String> = std::fs::read_dir(dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .collect();
+    names.sort();
+    let what = |pool: &Pool<&Overlay<&SparseImage>>| {
+        let mut spaces: Vec<(u64, String, usize)> = pool
+            .spaces
+            .iter()
+            .map(|(id, s)| (*id, s.name().to_string(), s.extents.len()))
+            .collect();
+        spaces.sort();
+        (spaces, pool.disks.keys().copied().collect::<Vec<_>>())
+    };
+    let mut renamed = 0;
+    for name in names {
+        let images = fixture(&name);
+        let base: Vec<Overlay<&SparseImage>> = images.iter().map(Overlay::new).collect();
+        let members = || base.iter().collect::<Vec<_>>();
+        let Ok(pool) = Pool::open(members()) else { continue };
+        let Ok(plan) = plan_rename_pool(&pool, "renamed") else {
+            continue;
+        };
+        let old = what(&pool);
+        drop(pool);
+        plan.apply::<_, &Overlay<&SparseImage>>(&members(), &[]).unwrap();
+        let pool = Pool::open(members()).unwrap();
+        assert!(pool.warnings.is_empty(), "{name}: {:?}", pool.warnings);
+        assert_eq!(pool.name, "renamed", "{name}");
+        assert_eq!(what(&pool), old, "{name}");
+        renamed += 1;
+    }
+    assert!(renamed >= 50, "{renamed} renamed");
+}
+
 /// Sizes are rounded up to whole rows without wrapping: a size near 2^64
 /// once became a space of 0 bytes. Spaces hold at most 2^32 slabs (1 EiB),
 /// on creation and when grown.
@@ -707,6 +1040,68 @@ fn extents_beyond_their_disk_stop_the_planners() {
     let pool = Pool::open(members()).unwrap();
     let err = plan_create_space(&pool, &spec("t", 1, 1024, false), &mut new_guid).unwrap_err();
     assert!(err.to_string().contains("reach beyond"), "{err}");
+}
+
+/// Disks too small for a pool are refused as such, for a new pool and
+/// when added: of no bytes, one sector, 16 MiB (the reserved partition),
+/// 100, 600 and 785 MiB; 786 MiB holds the pool partition with its data
+/// area and a slab. So is a disk of sectors of no bytes. 1.2.2 computed
+/// the partitions with wrapping arithmetic (debug builds panicked) and
+/// took a disk of no bytes for one of 16 EiB (audit 2026-10-16, writers).
+#[test]
+fn disks_too_small_for_a_pool_are_refused() {
+    use storage_spaces::ops::plan_add_disk;
+    let mut new_guid = guids();
+    let (images, disks) = blank(3);
+    let base: Vec<Overlay<&SparseImage>> = images.iter().map(Overlay::new).collect();
+    let (plan, _) = plan_create_pool(&disks, "small", None, &mut new_guid).unwrap();
+    plan.apply::<&Overlay<&SparseImage>, _>(&[], &base.iter().collect::<Vec<_>>())
+        .unwrap();
+    let pool = Pool::open(base.iter().collect::<Vec<_>>()).unwrap();
+    let sized = |size: u64| BlankDisk {
+        size,
+        ..disks[0].clone()
+    };
+    for size in [0u64, 512, 16 << 20, 100 << 20, 600 << 20, 785 << 20] {
+        let e = plan_create_pool(&[sized(size)], "tiny", None, &mut new_guid)
+            .err()
+            .unwrap_or_else(|| panic!("a pool on {size} bytes"))
+            .to_string();
+        assert!(e.contains("too small"), "{size}: {e}");
+        let e = plan_add_disk(&pool, &sized(size), &mut new_guid)
+            .err()
+            .unwrap_or_else(|| panic!("{size} bytes added"))
+            .to_string();
+        assert!(e.contains("too small"), "{size}: {e}");
+    }
+    assert!(plan_create_pool(&[sized(786 << 20)], "tiny", None, &mut new_guid).is_ok());
+    assert!(plan_add_disk(&pool, &sized(786 << 20), &mut new_guid).is_ok());
+    let none = BlankDisk {
+        logical_sector: 0,
+        ..disks[0].clone()
+    };
+    assert!(plan_add_disk(&pool, &none, &mut new_guid).is_err());
+}
+
+/// Columns that overflow with their copies are refused for what they are:
+/// 1.2.2 multiplied them unchecked (2^63 + 1 columns of two copies made
+/// two, which three disks hold), and only the size of the rows refused the
+/// space later (debug builds panicked; audit 2026-10-16, writers).
+#[test]
+fn columns_beyond_the_disks_are_refused_without_overflow() {
+    let mut new_guid = guids();
+    let (images, disks) = blank(3);
+    let base: Vec<Overlay<&SparseImage>> = images.iter().map(Overlay::new).collect();
+    let (plan, _) = plan_create_pool(&disks, "cols", None, &mut new_guid).unwrap();
+    plan.apply::<&Overlay<&SparseImage>, _>(&[], &base.iter().collect::<Vec<_>>())
+        .unwrap();
+    let pool = Pool::open(base.iter().collect::<Vec<_>>()).unwrap();
+    for columns in [(1u64 << 63) + 1, u64::MAX, 4] {
+        let mut s = spec("wide", 2, 1024, true);
+        s.columns = Some(columns);
+        let e = plan_create_space(&pool, &s, &mut new_guid).err().unwrap().to_string();
+        assert!(e.contains(&format!("{columns} columns of 2 copies need")), "{e}");
+    }
 }
 
 #[test]

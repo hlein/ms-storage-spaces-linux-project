@@ -236,7 +236,12 @@ allocated (Windows does not clear it either), so the parts of a new row not
 written yet read whatever the disk held there. Thin spaces with other
 allocation units can be written only where they are allocated; writes
 elsewhere fail with an I/O error. When the pool has no free slab left, so do
-writes into rows not allocated yet. In a parity space the stripes not
+writes into rows not allocated yet. Once a write or a flush of a disk fails,
+nothing more is written to the space: every later write and flush fails
+with an I/O error until the space is attached again (what reached which
+disk, and what its logs say, is not known after such a failure; until 1.3
+the writes went on, and a later flush could report as durable what was
+lost). In a parity space the stripes not
 written yet hold whatever the disks held too (another space's data, where
 one was deleted), and their parity need not match it. The parity journal
 lists the stripes of an extent run (an allocation unit of every column:
@@ -378,10 +383,12 @@ sudo spaces disk retire --disk 2 --yes DISKS...                        # move ev
 sudo spaces disk remove --disk 2 --yes DISKS...                        # then take it out of the pool
 ```
 
-`disk add` takes a blank disk (`--wipe` takes one that is not, and unlike
-`pool create --wipe` clears nothing but what the new partition table
-overwrites) and a pool of at most
-four disks. `disk retire` moves every extent of the disk to the others
+`disk add` takes a blank disk (`--wipe` takes one that is not and clears
+its first 17 MiB and last MiB first, as `pool create --wipe` does; until
+1.3 it cleared nothing but what the new partition table overwrites) and a
+pool of at most four disks. Every management command carries its plan out
+on the devices it opened to make it (until 1.3 it opened the paths again,
+which by then could name other disks). `disk retire` moves every extent of the disk to the others
 (pools of up to five disks); it needs room there, and the rows of every
 space need enough other disks (a three-column parity space needs three
 disks besides the retired one). `disk remove` removes a disk that holds

@@ -177,6 +177,41 @@
   directory of more than 200 000 names, so every name looked up there read
   all of it again; it trims when the idle ones are more than it keeps, and
   keeps such a listing alone.
+* Storage Spaces writers and management (audit 2026-10-16): a copy of the
+  pool database was written header first, in one write with its entries,
+  so that a write torn by a crash made it the newest copy and could make a
+  space vanish; each copy is written entries first, the header last (a copy
+  torn so, which the others outvote, is written over when a space is
+  opened for writing, as stale copies are), and must fit its pool partition (a partition table that made the partition
+  shorter than its database got the copy written past it). The model the
+  updates are made on read the database only up to its last page
+  formatted whole: where a page in use was formatted only in part (17 of
+  the fixtures) an update lost that page's records; it reads every slot
+  the header counts. `space resize` of a space of local groups (dual parity
+  with local reconstruction codes) counted the columns less the
+  redundancy and placed the new rows where no row starts: the space no
+  longer opened. `pool scrub --repair` of a parity space whose units are
+  larger than 1 MiB recomputed whole units from the damaged MiB on, past
+  the end of the slab into other data. A write-back cache entry could
+  outgrow its slot (about the thousandth write apart from the others into
+  a chunk of 1 MiB in 512-byte sectors) and was cut off, and the log no
+  longer loaded; the cache is destaged first. The dirty region log stopped
+  listing a run before the data written there was flushed. After a write
+  or flush that failed the writer went on; it writes nothing more until
+  the space is opened again. Tiny disks were computed with wrapping
+  arithmetic (a disk of no bytes passed for a large one; debug builds
+  panicked), `columns * copies` could overflow, a write-back cache whose
+  chunks are not the space's stripes made destaging panic, a dirty region
+  log smaller than its two headers wrapped an offset, and records that do
+  not assemble made a thin space's new row land on slab 0, over the
+  metadata space (and the update made every copy of the database
+  unreadable): each is an error now. In `spaces`: `disk add --wipe` wiped
+  nothing; it clears the start and end of the disk as `pool create --wipe`
+  does. Plans were carried out on the paths opened again, which by then
+  could name other disks; they are carried out on the devices they were
+  made with. A path under `/dev` was taken for a block device and any
+  other for an image; the file's type decides. GUIDs panicked when
+  /dev/urandom could not be read.
 
 ### Testing
 

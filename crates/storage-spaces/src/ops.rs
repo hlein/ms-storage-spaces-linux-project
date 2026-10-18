@@ -315,20 +315,40 @@ fn metadata_disks<D: ReadAt>(pool: &Pool<D>) -> Option<Vec<u64>> {
     )
 }
 
-/// Turns the writes of a pool database update into steps: one per member
-/// carrying a copy, each flushed before the next (a crash leaves every copy
-/// whole, old or new).
-fn database_steps(plan: &mut Plan, writes: Vec<(usize, u64, Vec<u8>)>) {
-    for (device, offset, bytes) in writes {
-        plan.step(
-            format!("pool database on device {device}"),
-            vec![Action::Write {
-                target: Target::Member(device),
-                offset,
-                bytes,
-            }],
-        );
+/// Turns the writes of a pool database update (device, offset, bytes)
+/// into steps: those of [`copy_steps`] for each member carrying a copy.
+fn database_steps<D: ReadAt>(pool: &Pool<D>, plan: &mut Plan, writes: Vec<(usize, u64, Vec<u8>)>) -> Result<()> {
+    for (device, _, bytes) in writes {
+        let m = pool
+            .members
+            .iter()
+            .find(|m| m.device == device)
+            .ok_or_else(|| Error::Pool(format!("device {device} is no member")))?;
+        copy_steps(plan, "pool database", &[m], &bytes)?;
     }
+    Ok(())
+}
+
+/// Steps that write `db` as the pool database copy of each of `members`,
+/// one member after the other (each step is flushed before the next), in
+/// two steps each: its entries, then its header ([`crate::pool::database_copy`]).
+/// A crash leaves every copy whole, old or new, but the one being written,
+/// which keeps its old sequence.
+pub(crate) fn copy_steps(plan: &mut Plan, what: &str, members: &[&crate::Member], db: &[u8]) -> Result<()> {
+    for m in members {
+        let [entries, header] = crate::pool::database_copy(&m.partition, &[], db)?;
+        for (part, (offset, bytes)) in [("entries", entries), ("header", header)] {
+            plan.step(
+                format!("{what} on device {}: {part}", m.device),
+                vec![Action::Write {
+                    target: Target::Member(m.device),
+                    offset,
+                    bytes,
+                }],
+            );
+        }
+    }
+    Ok(())
 }
 
 /// `spaces space create`.
@@ -364,7 +384,9 @@ pub fn plan_create_space<D: ReadAt>(pool: &Pool<D>, spec: &SpaceSpec, guids: Gui
         3 => (1, spec.columns.unwrap_or(3), 1),
         r => return Err(Error::Pool(format!("resiliency {r}"))),
     };
-    if columns == 0 || columns * copies > n || (spec.resiliency == 3 && columns < 3) {
+    // (Checked: 1.2.2 multiplied unchecked, and 2^63 + 1 columns of two
+    // copies made two.)
+    if columns == 0 || columns.checked_mul(copies).is_none_or(|c| c > n) || (spec.resiliency == 3 && columns < 3) {
         return Err(Error::Pool(format!(
             "{columns} columns of {copies} copies need that many disks of the {n} eligible (parity: at least 3 columns)"
         )));
@@ -533,25 +555,20 @@ pub fn plan_create_space<D: ReadAt>(pool: &Pool<D>, spec: &SpaceSpec, guids: Gui
             })
             .collect(),
     );
-    database_steps(&mut plan, database);
+    database_steps(pool, &mut plan, database)?;
     Ok((plan, new))
 }
 
 /// A plan that writes `db` (one update of the pool's database) to every
 /// member carrying a copy, one after the other.
-fn database_plan<D: ReadAt>(pool: &Pool<D>, summary: String, db: &Database) -> Plan {
+fn database_plan<D: ReadAt>(pool: &Pool<D>, summary: String, db: &Database) -> Result<Plan> {
     let mut plan = Plan {
         summary: vec![summary],
         steps: Vec::new(),
     };
-    let writes = pool
-        .members
-        .iter()
-        .filter(|m| m.header.database_copy)
-        .map(|m| (m.device, m.partition.offset + POOL_DB_OFFSET, db.bytes().to_vec()))
-        .collect();
-    database_steps(&mut plan, writes);
-    plan
+    let copies: Vec<&crate::Member> = pool.members.iter().filter(|m| m.header.database_copy).collect();
+    copy_steps(&mut plan, "pool database", &copies, db.bytes())?;
+    Ok(plan)
 }
 
 /// The space a command names ([`Pool::select_space`]): a key that names
@@ -595,11 +612,7 @@ pub fn plan_rename_pool<D: ReadAt>(pool: &Pool<D>, name: &str) -> Result<Plan> {
     let db = check_pool(pool)?;
     check_name("the pool", name)?;
     let next = crate::manage::rename_pool(&db, name, filetime_now())?;
-    Ok(database_plan(
-        pool,
-        format!("rename pool \"{}\" to \"{name}\"", pool.name),
-        &next,
-    ))
+    database_plan(pool, format!("rename pool \"{}\" to \"{name}\"", pool.name), &next)
 }
 
 /// `spaces space rename`.
@@ -609,11 +622,7 @@ pub fn plan_rename_space<D: ReadAt>(pool: &Pool<D>, space: &str, name: &str) -> 
     check_name("the space", name)?;
     check_free_name(pool, name)?;
     let next = crate::manage::rename_space(&db, id, name, filetime_now())?;
-    Ok(database_plan(
-        pool,
-        format!("rename space \"{space}\" to \"{name}\""),
-        &next,
-    ))
+    database_plan(pool, format!("rename space \"{space}\" to \"{name}\""), &next)
 }
 
 /// `spaces space delete`: its data is lost.
@@ -621,11 +630,7 @@ pub fn plan_delete_space<D: ReadAt>(pool: &Pool<D>, space: &str) -> Result<Plan>
     let db = check_pool(pool)?;
     let id = space_id(pool, space)?;
     let next = crate::manage::delete_space(&db, id, filetime_now())?;
-    Ok(database_plan(
-        pool,
-        format!("delete space \"{space}\" and everything on it"),
-        &next,
-    ))
+    database_plan(pool, format!("delete space \"{space}\" and everything on it"), &next)
 }
 
 /// `spaces disk set`: media type (0 unspecified, 1 HDD, 2 SSD) and usage
@@ -641,11 +646,11 @@ pub fn plan_set_disk<D: ReadAt>(pool: &Pool<D>, disk_id: u64, media: Option<u8>,
         ));
     }
     let next = crate::manage::set_disk(&db, disk_id, media, usage, filetime_now())?;
-    Ok(database_plan(
+    database_plan(
         pool,
         format!("set disk {disk_id}: media {media:?}, usage {usage:?}"),
         &next,
-    ))
+    )
 }
 
 /// `spaces space resize` to a larger size: a fixed space gets the extents
@@ -662,14 +667,10 @@ pub fn plan_resize_space<D: ReadAt>(pool: &Pool<D>, space: &str, size: u64) -> R
     if pool.children(id).any(|c| c.info.is_child && !c.extents.is_empty()) {
         return Err(Error::Pool("resizing tiered spaces is not supported".into()));
     }
-    let data_columns = policy
-        .columns
-        .checked_sub(if policy.resiliency == crate::format::Resiliency::Parity {
-            policy.redundancy
-        } else {
-            0
-        })
-        .ok_or_else(|| Error::Pool("more parity than columns".into()))?;
+    // The layout's rule: a local reconstruction code has a parity unit per
+    // group and a global one (1.2.2 took the redundancy, and the extents of
+    // the new rows started where no row does: audit 2026-10-16, M20).
+    let data_columns = crate::layout::Layout::new(&policy, &[])?.data_columns;
     let unit = s.info.allocation_unit;
     let old = s.info.size.unwrap_or(0);
     let size = whole_rows(size, unit, data_columns)?;
@@ -705,11 +706,11 @@ pub fn plan_resize_space<D: ReadAt>(pool: &Pool<D>, space: &str, size: u64) -> R
         }
     }
     let next = crate::manage::resize_space(&db, id, size, &extents, filetime_now())?;
-    Ok(database_plan(
+    database_plan(
         pool,
         format!("resize space \"{space}\" from {old} to {size} bytes"),
         &next,
-    ))
+    )
 }
 
 /// `spaces pool remove`: a pool without spaces; each member keeps its
@@ -814,17 +815,8 @@ pub fn plan_remove_disk<D: ReadAt>(pool: &Pool<D>, disk_id: u64) -> Result<Plan>
         );
     }
     let copies: Vec<&crate::Member> = pool.members.iter().filter(|m| m.header.database_copy).collect();
-    for (what, db) in [("first", &first), ("second", &second)] {
-        for m in &copies {
-            plan.step(
-                format!("{what} update on device {}", m.device),
-                vec![Action::Write {
-                    target: Target::Member(m.device),
-                    offset: m.partition.offset + POOL_DB_OFFSET,
-                    bytes: db.bytes().to_vec(),
-                }],
-            );
-        }
+    for (what, db) in [("first update", &first), ("second update", &second)] {
+        copy_steps(&mut plan, what, &copies, db.bytes())?;
     }
     let Some(member) = member else {
         return Ok(plan);
@@ -885,26 +877,17 @@ pub fn plan_retire_disk<D: ReadAt>(pool: &Pool<D>, disk_id: u64) -> Result<Plan>
         .filter(|m| m.header.database_copy && m.device != member.device)
         .cloned()
         .collect();
-    let write_db = |plan: &mut Plan, what: &str, db: &Database, with_retired: bool| {
+    let write_db = |plan: &mut Plan, what: &str, db: &Database, with_retired: bool| -> Result<()> {
         let mut to: Vec<&crate::Member> = others.iter().collect();
         if with_retired {
             to.push(&member);
         }
-        for m in to {
-            plan.step(
-                format!("{what} on device {}", m.device),
-                vec![Action::Write {
-                    target: Target::Member(m.device),
-                    offset: m.partition.offset + POOL_DB_OFFSET,
-                    bytes: db.bytes().to_vec(),
-                }],
-            );
-        }
+        copy_steps(plan, what, &to, db.bytes())
     };
     // Retired (every copy, the disk's own last).
     if disk.usage != crate::format::DiskUsage::Retired {
         db = crate::manage::set_disk(&db, disk_id, None, Some(5), now)?;
-        write_db(&mut plan, "disk retired", &db, true);
+        write_db(&mut plan, "disk retired", &db, true)?;
     }
     // The moves.
     let metadata_id = pool
@@ -992,7 +975,7 @@ pub fn plan_retire_disk<D: ReadAt>(pool: &Pool<D>, disk_id: u64) -> Result<Plan>
     let body = record.encode()?;
     let (mut next, _) = db.updated(&[(old.kind, old.version, &body)], &[old.id])?;
     next.commit(sequence, now);
-    write_db(&mut plan, "disk without its database copy", &next, false);
+    write_db(&mut plan, "disk without its database copy", &next, false)?;
     let header = DiskHeader {
         generation: member.header.generation + 1,
         database_copy: false,
@@ -1000,15 +983,20 @@ pub fn plan_retire_disk<D: ReadAt>(pool: &Pool<D>, disk_id: u64) -> Result<Plan>
     };
     let mut page = header.encode().to_vec();
     page.resize(POOL_DB_OFFSET as usize, 0);
-    page.extend_from_slice(next.bytes());
-    plan.step(
-        format!("device {}: last database and header without the copy", member.device),
-        vec![Action::Write {
-            target: Target::Member(member.device),
-            offset: member.partition.offset,
-            bytes: page,
-        }],
-    );
+    let [entries, head] = crate::pool::database_copy(&member.partition, &page, next.bytes())?;
+    for (what, (offset, bytes)) in [
+        ("last database", entries),
+        ("its header and a header without the copy", head),
+    ] {
+        plan.step(
+            format!("device {}: {what}", member.device),
+            vec![Action::Write {
+                target: Target::Member(member.device),
+                offset,
+                bytes,
+            }],
+        );
+    }
     let _ = DATA_AREA_OFFSET;
     Ok(plan)
 }
@@ -1067,18 +1055,8 @@ pub fn plan_repair<D: ReadAt>(pool: &Pool<D>) -> Result<Plan> {
         .filter(|m| m.header.database_copy)
         .cloned()
         .collect();
-    let write_db = |plan: &mut Plan, what: &str, db: &Database| {
-        for m in &copies {
-            plan.step(
-                format!("{what} on device {}", m.device),
-                vec![Action::Write {
-                    target: Target::Member(m.device),
-                    offset: m.partition.offset + POOL_DB_OFFSET,
-                    bytes: db.bytes().to_vec(),
-                }],
-            );
-        }
-    };
+    let copies: Vec<&crate::Member> = copies.iter().collect();
+    let write_db = |plan: &mut Plan, what: &str, db: &Database| copy_steps(plan, what, &copies, db.bytes());
     let extents = |db: &Database| -> Result<Vec<(u32, ExtentRecord)>> {
         Ok(assemble_records(db.bytes(), 0x40)?
             .iter()
@@ -1108,7 +1086,7 @@ pub fn plan_repair<D: ReadAt>(pool: &Pool<D>) -> Result<Plan> {
             &mut plan,
             &format!("{} half regenerated copies dropped", partial.len()),
             &db,
-        );
+        )?;
     }
     let broken: Vec<(u32, ExtentRecord)> = extents(&db)?
         .into_iter()
@@ -1299,7 +1277,7 @@ fn relocate<D: ReadAt>(
     _next_copy: u64,
     (target, slab): (u64, u64),
     rebuild: &dyn Fn(Target, u64) -> Action,
-    write: &mut dyn FnMut(&mut Plan, &str, &Database),
+    write: &mut dyn FnMut(&mut Plan, &str, &Database) -> Result<()>,
 ) -> Result<()> {
     let (device, at) = pool
         .slab_location(target, slab)?
@@ -1320,8 +1298,7 @@ fn relocate<D: ReadAt>(
     let (mut next, _) = db.updated(&[(4, 6, &body)], &[old_id])?;
     next.commit(sequence, now);
     *db = next;
-    write(plan, &format!("space {} slab {} moved", e.space_id, e.virtual_slab), db);
-    Ok(())
+    write(plan, &format!("space {} slab {} moved", e.space_id, e.virtual_slab), db)
 }
 
 /// `spaces pool optimize` (as `Optimize-StoragePool`): moves extents from
@@ -1342,18 +1319,8 @@ pub fn plan_rebalance<D: ReadAt>(pool: &Pool<D>) -> Result<Plan> {
         .filter(|m| m.header.database_copy)
         .cloned()
         .collect();
-    let mut write = |plan: &mut Plan, what: &str, db: &Database| {
-        for m in &copies {
-            plan.step(
-                format!("{what} on device {}", m.device),
-                vec![Action::Write {
-                    target: Target::Member(m.device),
-                    offset: m.partition.offset + POOL_DB_OFFSET,
-                    bytes: db.bytes().to_vec(),
-                }],
-            );
-        }
-    };
+    let copies: Vec<&crate::Member> = copies.iter().collect();
+    let mut write = |plan: &mut Plan, what: &str, db: &Database| copy_steps(plan, what, &copies, db.bytes());
     let metadata = pool
         .spaces
         .values()
@@ -1541,6 +1508,12 @@ pub fn scrub_spaces<D: ReadAt>(pool: &Pool<D>, only: Option<u64>) -> Result<Scru
             }
         } else {
             let journal = reader.journal();
+            // A unit of more than a read (interleaves are powers of two) is
+            // compared a read at a time; its stripe counts once, and the
+            // repair stays inside the parts that differ (1.2.2 recomputed
+            // a whole unit from each, across units and the slab's end).
+            let piece = l.interleave.min(CHUNK);
+            let mut last = None;
             for row in (0..rows).filter(|&r| l.physical(0, 0, r).is_some()) {
                 let columns: Vec<(u64, u64)> = (0..l.columns)
                     .map(|c| l.physical(c, 0, row))
@@ -1552,33 +1525,46 @@ pub fn scrub_spaces<D: ReadAt>(pool: &Pool<D>, only: Option<u64>) -> Result<Scru
                         pool.read_slab(disk, slab, offset, &mut other)?;
                         first.iter_mut().zip(&other).for_each(|(a, u)| *a ^= u);
                     }
-                    for (k, unit) in first.chunks(l.interleave as usize).enumerate() {
+                    for (k, unit) in first.chunks(piece as usize).enumerate() {
                         if unit.iter().all(|&b| b == 0) {
                             continue;
                         }
-                        let at = offset + k as u64 * l.interleave;
+                        let at = offset + k as u64 * piece;
                         let loc = crate::layout::Location {
                             column: 0,
                             row,
                             offset_in_slab: at,
-                            contiguous: l.interleave,
+                            contiguous: l.interleave - at % l.interleave,
                         };
                         let stripe = l.stripe_of(&loc);
-                        let listed = journal.is_some_and(|j| j.is_dirty(l.run_start_offset(row), stripe));
-                        *if listed { &mut unsettled } else { &mut mismatches } += 1;
                         let parity = l.parity_column(stripe) as usize;
+                        let (to, to_offset) = location(columns[parity].0, columns[parity].1, at)?;
+                        if last == Some((row, stripe)) {
+                            // The part right after the last one repaired.
+                            if let Some(Action::Xor {
+                                to_offset: start, len, ..
+                            }) = repairs.last_mut()
+                                && *start + *len == to_offset
+                            {
+                                *len += piece;
+                                continue;
+                            }
+                        } else {
+                            let listed = journal.is_some_and(|j| j.is_dirty(l.run_start_offset(row), stripe));
+                            *if listed { &mut unsettled } else { &mut mismatches } += 1;
+                            last = Some((row, stripe));
+                        }
                         let from = columns
                             .iter()
                             .enumerate()
                             .filter(|&(c, _)| c != parity)
                             .map(|(_, &(disk, slab))| location(disk, slab, at))
                             .collect::<Result<Vec<_>>>()?;
-                        let (to, to_offset) = location(columns[parity].0, columns[parity].1, at)?;
                         repairs.push(Action::Xor {
                             from,
                             to,
                             to_offset,
-                            len: l.interleave,
+                            len: piece,
                         });
                     }
                 }
@@ -1645,7 +1631,7 @@ pub fn plan_create_tier<D: ReadAt>(
         interleave_log2: 18,
     };
     let new = crate::manage::create_tier(&db, &template, filetime_now())?;
-    Ok(database_plan(
+    database_plan(
         pool,
         format!(
             "create tier \"{name}\": {}, {}{}",
@@ -1654,7 +1640,7 @@ pub fn plan_create_tier<D: ReadAt>(
             columns.map_or(String::new(), |c| format!(", {c} columns"))
         ),
         &new,
-    ))
+    )
 }
 
 /// `spaces space create --tier NAME=SIZE ...`: a tiered space as
@@ -1751,7 +1737,7 @@ pub fn plan_create_tiered_space<D: ReadAt>(
                 _ => n.clamp(1, 8),
             }
         };
-        if columns * copies > n || (t.resiliency == 3 && columns < 3) {
+        if columns.checked_mul(copies).is_none_or(|c| c > n) || (t.resiliency == 3 && columns < 3) {
             return Err(Error::Pool(format!(
                 "tier \"{template_name}\": {columns} columns of {copies} copies need that many {} disks (there are {n})",
                 if ssd { "SSD" } else { "HDD" }
@@ -1947,6 +1933,6 @@ pub fn plan_create_tiered_space<D: ReadAt>(
             })
             .collect(),
     );
-    database_steps(&mut plan, database);
+    database_steps(pool, &mut plan, database)?;
     Ok((plan, new))
 }

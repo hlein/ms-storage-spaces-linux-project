@@ -107,7 +107,7 @@ fn a_removed_pool_leaves_the_reserved_partition() {
             pool_partition_guid: mixed(&gpt[1024 + 128 + 16..1024 + 128 + 32]),
             pool_name: "ss-c9ops".into(),
         };
-        for (offset, bytes) in table.regions_without_pool() {
+        for (offset, bytes) in table.regions_without_pool().unwrap() {
             let mut windows = vec![0u8; bytes.len()];
             new.read_exact_at(&mut windows, offset).unwrap();
             assert!(windows == bytes, "{offset:#x}");
@@ -335,7 +335,7 @@ fn crafted_partition_tables_are_not_rewritten() {
     };
     let disk = || {
         let mut d = SparseImage::new(8 << 30);
-        for (offset, bytes) in table.regions() {
+        for (offset, bytes) in table.regions().unwrap() {
             d.insert(offset, &bytes);
         }
         d

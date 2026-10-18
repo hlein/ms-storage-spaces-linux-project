@@ -42,7 +42,9 @@ fuzz_target!(|data: &[u8]| {
     };
     extent_round_trip(data);
     let disk = u64::from(data[0] % 4);
-    let free = db.first_free_slab(disk);
+    let Ok(free) = db.first_free_slab(disk) else {
+        return;
+    };
     for r in &records {
         if let Ok(Record::Extent(e)) = Record::decode(r)
             && e.disk_id == disk

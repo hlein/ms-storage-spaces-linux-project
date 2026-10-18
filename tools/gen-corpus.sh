@@ -123,5 +123,12 @@ drtkeep    -DiskCount 2 -Resiliency Mirror -DataCopies 2 -Columns 1 -SizeMB 1024
 # valid chunks (its run words count 4 KiB sectors); the backup GPT is in the
 # cache only. -Hashes records what Windows reads (tools/space-hashes.py).
 wc4k       -DiskCount 1 -SsdDisks 1 -Resiliency Simple -Columns 1 -Provisioning Thin -SizeMB 4096 -LogicalSectorSize 4096 -WriteCacheMB 1024 -Ntfs -NtfsFilesMB 256 -Hashes
+# Batch 11 (1.3, audit 2026-10-16 S9 and M13): a parity space whose column 0
+# was moved to a new disk (the copy number Windows gives it), dual parity on
+# 4096-byte sectors (read with two disks missing), a tier that starts at a
+# slab that is no multiple of its data columns
+replacedpar @New-DiskStatePool.ps1 -Scenario Replaced -Resiliency Parity
+dual7k4    -DiskCount 7 -Resiliency Parity -Redundancy 2 -Columns 7 -InterleaveKB 64 -SizeMB 2560 -LogicalSectorSize 4096
+tierodd    -DiskCount 5 -SsdDisks 2 -Tiers SSD,Mirror,1024;HDD,Simple,1536,3 -Provisioning Fixed
 LIST
 exit $status

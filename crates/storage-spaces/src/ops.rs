@@ -1514,9 +1514,9 @@ pub fn scrub_spaces<D: ReadAt>(pool: &Pool<D>, only: Option<u64>) -> Result<Scru
             // a whole unit from each, across units and the slab's end).
             let piece = l.interleave.min(CHUNK);
             let mut last = None;
-            for row in (0..rows).filter(|&r| l.physical(0, 0, r).is_some()) {
+            for row in (0..rows).filter(|&r| l.current(0, r).is_some()) {
                 let columns: Vec<(u64, u64)> = (0..l.columns)
-                    .map(|c| l.physical(c, 0, row))
+                    .map(|c| l.current(c, row))
                     .collect::<Option<_>>()
                     .ok_or_else(|| Error::Pool(format!("space \"{}\" row {row} lacks a column", space.name())))?;
                 for offset in (0..SLAB_SIZE).step_by(CHUNK as usize) {

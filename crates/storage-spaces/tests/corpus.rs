@@ -180,8 +180,13 @@ fn reads_fail_over_when_a_disk_disappears() {
     let base = [
         "mirror2", "mirror3", "parity3", "parity4", "parity5", "dual7", "mapar", "lrc11", "lrc12",
     ];
-    // The same configurations created by Windows 11 24H2.
-    let names = base.iter().flat_map(|n| [n.to_string(), format!("{n}_26100")]);
+    // The same configurations created by Windows 11 24H2; a parity space
+    // whose column 0 Windows moved to another disk (audit 2026-10-16, S9:
+    // reads that knew only copy 0 of column 0).
+    let names = base
+        .iter()
+        .flat_map(|n| [n.to_string(), format!("{n}_26100")])
+        .chain(["replacedpar".to_string()]);
     for name in names {
         let name = name.as_str();
         let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -226,6 +231,9 @@ fn dual_parity_survives_any_two_failed_disks() {
     for name in [
         "dual7",
         "dual7_26100",
+        // 4096-byte sectors (audit 2026-10-16, M13: Q was checked on
+        // 512-byte sectors only).
+        "dual7k4",
         "lrc11",
         "lrc12",
         "lrc13",

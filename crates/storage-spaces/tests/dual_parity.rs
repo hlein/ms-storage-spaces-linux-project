@@ -92,3 +92,58 @@ fn any_two_columns_are_rebuilt() {
         }
     }
 }
+
+/// The disks of fixture `name`.
+fn fixture(name: &str) -> (serde_json::Value, Vec<SparseImage>) {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures").join(name);
+    let images = (0..)
+        .map_while(|i| File::open(dir.join(format!("disk{i}.fixture"))).ok())
+        .map(|f| SparseImage::read_from(f).unwrap())
+        .collect();
+    (manifest(&dir), images)
+}
+
+/// Q of a space of 4096-byte sectors (`dual7k4`, Windows 11 build 26340,
+/// seven columns, five data units): its bit matrix works on chunks of a
+/// sector, four packets of 1024 bytes (of 128 on 512-byte sectors). The
+/// fixture holds the first 8 KiB of every unit of the first three stripes
+/// (the parity units in other columns in each), which hold the pattern:
+/// with any two disks failing they read back as written. 1.2.2 took chunks
+/// of 512 bytes everywhere and rebuilt wrong data (audit 2026-10-16, M13).
+#[test]
+fn q_of_4096_byte_sectors_is_rebuilt_as_windows_wrote_it() {
+    let (m, images) = fixture("dual7k4");
+    let n = images.len();
+    assert_eq!(m["space"]["logical_sector"], 4096);
+    for a in 0..n {
+        for b in a + 1..n {
+            let flags: Vec<Arc<AtomicBool>> = (0..n).map(|_| Arc::new(AtomicBool::new(false))).collect();
+            let devices: Vec<Failing> = images
+                .iter()
+                .zip(&flags)
+                .map(|(image, f)| Failing {
+                    image: image.clone(),
+                    broken: f.clone(),
+                })
+                .collect();
+            let pool = Pool::open(devices).unwrap();
+            let r = pool.open_space(pool.find_space("dual7k4").unwrap().id()).unwrap();
+            let (stripe, unit) = (5 * 0x10000, 0x10000);
+            flags[a].store(true, Ordering::Relaxed);
+            flags[b].store(true, Ordering::Relaxed);
+            for s in 0..3u64 {
+                for k in 0..5u64 {
+                    let at = s * stripe + k * unit;
+                    let mut v = vec![0u8; 8192];
+                    r.read_exact_at(&mut v, at)
+                        .unwrap_or_else(|e| panic!("disks {a}+{b} at {at:#x}: {e}"));
+                    assert_eq!(
+                        storage_spaces::testpattern::verify(&v, at, "dual7k4"),
+                        None,
+                        "disks {a}+{b} at {at:#x}"
+                    );
+                }
+            }
+        }
+    }
+}

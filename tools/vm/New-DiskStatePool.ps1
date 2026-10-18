@@ -1,12 +1,14 @@
 <#
 .SYNOPSIS
-Creates a mirror pool in a given disk or space state and records Windows'
-view of it (manifest as New-TestPool.ps1, plus the states of the disks and
+Creates a mirror pool (or with -Resiliency Parity a single parity pool of
+three columns) in a given disk or space state and records Windows' view of
+it (manifest as New-TestPool.ps1, plus the states of the disks and
 spaces).
 
 Scenarios:
-  Retired      the disk holding copy 0 is retired (Usage Retired) and the
-               space repaired onto the other disks; the disk stays a member
+  Retired      the disk holding copy 0 of column 0 is retired (Usage Retired)
+               and the space repaired onto the other disks; the disk stays a
+               member
   Interrupted  as Retired, but the member disks are detached a few seconds
                into the repair (copies still being regenerated); the manifest
                has no extent list, which was changing at that moment
@@ -22,6 +24,7 @@ Scenarios:
 param(
     [Parameter(Mandatory)] [string] $Name,
     [ValidateSet('Retired', 'Interrupted', 'Replaced', 'SpaceStates', 'Usages')] [string] $Scenario = 'Retired',
+    [ValidateSet('Mirror', 'Parity')] [string] $Resiliency = 'Mirror',
     [int] $DiskCount = 3,
     [int] $DiskSizeMB = 8192,
     [int] $SizeMB = 1024,
@@ -103,8 +106,13 @@ function Write-Pattern($vdName) {
     [SsPattern]::Fill("\\.\PhysicalDrive$($d.Number)", $v.Size, $vdName, [int64]$ThrottleMBps * 1MB)
 }
 function New-Space($vdName, [int]$mb) {
-    New-VirtualDisk -StoragePoolFriendlyName $poolName -FriendlyName $vdName -ResiliencySettingName Mirror `
-        -NumberOfDataCopies 2 -NumberOfColumns 1 -ProvisioningType Fixed -Size ([int64]$mb * 1MB) | Out-Null
+    if ($Resiliency -eq 'Parity') {
+        New-VirtualDisk -StoragePoolFriendlyName $poolName -FriendlyName $vdName -ResiliencySettingName Parity `
+            -PhysicalDiskRedundancy 1 -NumberOfColumns 3 -ProvisioningType Fixed -Size ([int64]$mb * 1MB) | Out-Null
+    } else {
+        New-VirtualDisk -StoragePoolFriendlyName $poolName -FriendlyName $vdName -ResiliencySettingName Mirror `
+            -NumberOfDataCopies 2 -NumberOfColumns 1 -ProvisioningType Fixed -Size ([int64]$mb * 1MB) | Out-Null
+    }
     Write-Pattern $vdName
 }
 function Wait-Repair {
@@ -122,8 +130,9 @@ New-StoragePool -FriendlyName $poolName -StorageSubSystemUniqueId $subsystem.Uni
 New-Space $Name $SizeMB
 $vd = Get-VirtualDisk -FriendlyName $Name
 
-# The member holding copy 0 of the start of the space.
-$first = $vd | Get-PhysicalExtent | Where-Object { $_.VirtualDiskOffset -eq 0 -and $_.CopyNumber -eq 0 } | Select-Object -First 1
+# The member holding copy 0 of column 0 at the start of the space.
+$first = $vd | Get-PhysicalExtent |
+    Where-Object { $_.VirtualDiskOffset -eq 0 -and $_.ColumnNumber -eq 0 -and $_.CopyNumber -eq 0 } | Select-Object -First 1
 $victim = Get-PhysicalDisk -UniqueId $first.PhysicalDiskUniqueId
 $extras = @()
 $extentsKnown = $true

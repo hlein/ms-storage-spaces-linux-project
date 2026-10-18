@@ -875,7 +875,7 @@ impl<'p, D: WriteAt> SpaceWriter<'p, D> {
 
     fn read_unit(&self, layout: &Layout, column: u64, row: u64, offset_in_slab: u64, buf: &mut [u8]) -> Result<()> {
         let (disk, slab) = layout
-            .physical(column, 0, row)
+            .current(column, row)
             .ok_or_else(|| Error::Pool(format!("row {row} of column {column} is not allocated")))?;
         if !self.reader.pool().read_slab(disk, slab, offset_in_slab, buf)? {
             return Err(Error::Pool(format!("disk {disk} of the space is not present")));
@@ -885,7 +885,7 @@ impl<'p, D: WriteAt> SpaceWriter<'p, D> {
 
     fn write_unit(&self, layout: &Layout, column: u64, row: u64, offset_in_slab: u64, buf: &[u8]) -> Result<()> {
         let (disk, slab) = layout
-            .physical(column, 0, row)
+            .current(column, row)
             .ok_or_else(|| Error::Pool(format!("row {row} of column {column} is not allocated")))?;
         if !self.reader.pool().write_slab(disk, slab, offset_in_slab, buf)? {
             return Err(Error::Pool(format!("disk {disk} of the space is not present")));
@@ -1083,8 +1083,7 @@ fn add_piece(pieces: &mut Vec<(u64, u64)>, (mut start, mut end): (u64, u64)) {
 /// Rows of the extent run holding `row`.
 fn run_rows(layout: &Layout, row: u64) -> Result<u64> {
     layout
-        .runs()
-        .get(&(0, 0))
+        .column_runs(0)
         .and_then(|runs| runs.iter().find(|r| r.first_row <= row && row < r.first_row + r.rows))
         .map(|r| r.rows)
         .ok_or_else(|| Error::Pool(format!("row {row} is not allocated")))
@@ -1115,7 +1114,7 @@ fn read_first_copy<D: ReadAt>(pool: &Pool<D>, layout: &Layout, mut offset: u64, 
 
 /// Whether every column of `row` is allocated.
 fn row_allocated(layout: &Layout, row: u64) -> bool {
-    (0..layout.columns).all(|c| layout.physical(c, 0, row).is_some())
+    (0..layout.columns).all(|c| layout.current(c, row).is_some())
 }
 
 /// Writes `buf` at `offset` of a space into every current copy.

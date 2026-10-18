@@ -12,8 +12,12 @@ use storage_spaces::report::{Check, Report, Status, Verdict};
 
 /// Volumes whose log holds records past the checkpoint (they were detached
 /// without being dismounted first: tools/vm/New-RefsVolume.ps1 took the
-/// disk offline first only later), so they are suspect.
-const LOG_PAST_THE_CHECKPOINT: &[&str] = &["r314integ", "r314mirror"];
+/// disk offline first only later), so they are suspect. `r314extend`, grown
+/// by Windows, was left so although the disk was taken offline: Windows
+/// replayed its log from 0x3:0x27 to 0x3:0x29 when it attached a copy
+/// ("Last Shutdown Was Dirty: true"); `r314extendc` is that copy, which
+/// Windows then took offline cleanly.
+const LOG_PAST_THE_CHECKPOINT: &[&str] = &["r314extend", "r314integ", "r314mirror"];
 
 fn manifest(dir: &Path) -> serde_json::Value {
     serde_json::from_str(
@@ -628,4 +632,24 @@ fn a_boot_sector_that_does_not_check_out() {
     assert!(c[0].summary.contains("ReFS 2."), "{}", c[0].summary);
     // Not ReFS: nothing to say.
     assert!(checks(&SparseImage::new(1 << 20), 0).is_empty());
+}
+
+/// A volume Windows grew (`r314extendc`: a Dev Drive grown by 1 GiB with
+/// `Resize-Partition`, its log replayed by Windows and the disk taken
+/// offline cleanly): the superblock's copies are at the new end and agree,
+/// and every quick check passes.
+#[test]
+fn a_volume_windows_grew_passes_its_checks() {
+    let (image, offset) = fixture("r314extendc");
+    let checks = checks(&image, offset);
+    for c in &checks {
+        assert_eq!(c.status, Status::Ok, "{c:#?}");
+    }
+    assert_eq!(verdict(&checks), Verdict::Healthy);
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/r314extendc");
+    let m = manifest(&dir);
+    assert_eq!(
+        (m["extended_mb"].as_u64(), m["volume_size"].as_u64()),
+        (Some(1024), Some(55_767_465_984))
+    );
 }

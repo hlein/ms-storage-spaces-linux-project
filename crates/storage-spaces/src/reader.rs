@@ -334,7 +334,7 @@ impl<D: ReadAt> Mapped<'_, D> {
         let mut acc = vec![0u8; len];
         let mut unit = vec![0u8; len];
         for column in (0..l.columns).filter(|&c| Some(c) != last) {
-            let Some((disk, slab)) = l.physical(column, 0, loc.row) else {
+            let Some((disk, slab)) = l.current(column, loc.row) else {
                 return Ok(None);
             };
             match self.pool.read_slab(disk, slab, loc.offset_in_slab, &mut unit) {
@@ -386,7 +386,7 @@ impl<D: ReadAt> Mapped<'_, D> {
     /// Reads `len` bytes of a column at `offset_in_slab` of `row`; `None`
     /// when its disk is missing or fails.
     fn read_column(&self, column: u64, row: u64, offset_in_slab: u64, len: usize) -> Result<Option<Vec<u8>>> {
-        let Some((disk, slab)) = self.layout.physical(column, 0, row) else {
+        let Some((disk, slab)) = self.layout.current(column, row) else {
             return Err(format_err!("parity stripe with an unallocated column {column}"));
         };
         let mut v = vec![0u8; len];
@@ -411,11 +411,19 @@ impl<D: ReadAt> Mapped<'_, D> {
             .collect();
         let target = data.iter().position(|&c| c == loc.column).ok_or_else(lost)?;
 
-        // Work on whole 512-byte chunks of the unit (the GF(16) code's granularity).
+        // Work on whole chunks of the unit, its logical sectors (the GF(16)
+        // code's granularity).
+        let chunk = u64::from(self.pool.logical_sector_size);
+        if !matches!(chunk, 512 | 4096) || !l.interleave.is_multiple_of(chunk) {
+            return Err(Error::Unsupported(format!(
+                "rebuilding parity units of {} bytes in sectors of {chunk}",
+                l.interleave
+            )));
+        }
         let within = loc.offset_in_slab % l.interleave;
         let unit_start = loc.offset_in_slab - within;
-        let from = within / gf16::CHUNK as u64 * gf16::CHUNK as u64;
-        let to = (within + buf.len() as u64).div_ceil(gf16::CHUNK as u64) * gf16::CHUNK as u64;
+        let from = within / chunk * chunk;
+        let to = (within + buf.len() as u64).div_ceil(chunk) * chunk;
         let (at, len) = (unit_start + from, (to.min(l.interleave) - from) as usize);
 
         // Data units read so far: Some(Some(bytes)) present, Some(None) lost.
@@ -451,7 +459,7 @@ impl<D: ReadAt> Mapped<'_, D> {
                     units[k] = Some(u);
                 }
                 if let Some(Some(u)) = &units[k] {
-                    gf16::mul_region_xor(code[k], u, &mut rhs);
+                    gf16::mul_region_xor(code[k], u, &mut rhs, chunk as usize);
                 }
             }
             let mut coef: Vec<u8> = unknowns.iter().map(|&k| code[k]).collect();
@@ -460,7 +468,7 @@ impl<D: ReadAt> Mapped<'_, D> {
                 if f != 0 {
                     coef.resize(unknowns.len(), 0);
                     coef.iter_mut().zip(row).for_each(|(c, r)| *c ^= gf16::mul(f, *r));
-                    gf16::mul_region_xor(f, row_rhs, &mut rhs);
+                    gf16::mul_region_xor(f, row_rhs, &mut rhs, chunk as usize);
                 }
             }
             let Some(pivot) = coef.iter().position(|&c| c != 0) else {
@@ -470,13 +478,13 @@ impl<D: ReadAt> Mapped<'_, D> {
             let inv = gf16::inv(coef[pivot]).ok_or_else(lost)?;
             let coef: Vec<u8> = coef.iter().map(|&c| gf16::mul(inv, c)).collect();
             let mut scaled = vec![0u8; len];
-            gf16::mul_region_xor(inv, &rhs, &mut scaled);
+            gf16::mul_region_xor(inv, &rhs, &mut scaled, chunk as usize);
             for (row, row_rhs) in &mut rows {
                 row.resize(unknowns.len(), 0);
                 let f = row[pivot];
                 if f != 0 {
                     row.iter_mut().zip(&coef).for_each(|(r, c)| *r ^= gf16::mul(f, *c));
-                    gf16::mul_region_xor(f, &scaled, row_rhs);
+                    gf16::mul_region_xor(f, &scaled, row_rhs, chunk as usize);
                 }
             }
             rows.push((coef, scaled));
@@ -1195,7 +1203,7 @@ impl<'p, D: ReadAt> SpaceReader<'p, D> {
             let width = l.data_columns * l.interleave;
             let per_row = SLAB_SIZE / l.interleave;
             let cost = l.columns * l.interleave;
-            let Some(runs) = l.runs().get(&(0, 0)) else {
+            let Some(runs) = l.column_runs(0) else {
                 continue;
             };
             for run in runs {

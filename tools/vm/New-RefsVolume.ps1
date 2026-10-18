@@ -31,6 +31,11 @@ Scenarios:
           of write experiments (tools/vm/Invoke-RefsSteps.ps1)
   empty   the freshly formatted volume only
 
+With -ExtendMB N the partition is made N MiB short of the disk, the
+volume grown by N MiB (Resize-Partition) once the tree is written, and the
+file after_extend.bin written after that: a volume Windows extended (its
+superblock copies near the end are written anew).
+
 With -PoolDisks N the volume is made inside a space instead: N dynamic
 VHDX files of 40 GiB (disk0.vhdx ...) form the pool "ss-<Name>" with the
 thin space <Name> of 53 GiB (-Resiliency Simple or Mirror), which holds
@@ -47,6 +52,7 @@ param(
     [switch] $IntegrityStreams,
     [int] $PoolDisks = 0,
     [ValidateSet('Simple', 'Mirror')] [string] $Resiliency = 'Simple',
+    [int] $ExtendMB = 0,
     [string] $Root = 'C:\sstest\refs'
 )
 $ErrorActionPreference = 'Stop'
@@ -103,7 +109,12 @@ try {
         $disk = Mount-Images
     }
     Initialize-Disk -Number $disk.Number -PartitionStyle GPT
-    $part = New-Partition -DiskNumber $disk.Number -UseMaximumSize -AssignDriveLetter
+    if ($ExtendMB -gt 0) {
+        $free = (Get-Disk -Number $disk.Number).LargestFreeExtent
+        $part = New-Partition -DiskNumber $disk.Number -Size ($free - [int64]$ExtendMB * 1MB) -AssignDriveLetter
+    } else {
+        $part = New-Partition -DiskNumber $disk.Number -UseMaximumSize -AssignDriveLetter
+    }
     $format = @{ Partition = $part; NewFileSystemLabel = $Name; AllocationUnitSize = $ClusterSize; Force = $true; Confirm = $false }
     if ($devDrive) { $format.DevDrive = $true } else { $format.FileSystem = 'ReFS' }
     if ($Sha256Checksums) { $format.SHA256Checksums = $true }
@@ -341,6 +352,13 @@ public static class RefsGen {
         New-File 'gone\old_name.txt' 5000; Rename-Item (Join-Path $drive 'gone\old_name.txt') 'new_name.txt'
     }
 
+    if ($ExtendMB -gt 0) {
+        Write-VolumeCache -DriveLetter $part.DriveLetter
+        $max = (Get-PartitionSupportedSize -DriveLetter $part.DriveLetter).SizeMax
+        Resize-Partition -DriveLetter $part.DriveLetter -Size $max
+        New-File 'after_extend.bin' (3MB + 1234)
+    }
+
     # Windows' view of what is on disk: ReFS updates a directory's entry in
     # its parent lazily, so the listing is taken after detaching and
     # attaching the volume again. Detaching the image does not wait for
@@ -428,6 +446,7 @@ public static class RefsGen {
         label = $vol.FileSystemLabel; volume_size = $vol.Size; free = $vol.SizeRemaining
         serial = (($info | Select-String 'Volume Serial Number') -replace '.*:\s*', '' | Select-Object -First 1)
         partition_offset = $part.Offset
+        extended_mb = $ExtendMB
         pool = if ($PoolDisks -gt 0) { [ordered]@{ name = $poolName; space = $Name; disks = $PoolDisks; resiliency = $Resiliency } } else { $null }
         refsinfo = ($info -join "`n")
         entries = $entries

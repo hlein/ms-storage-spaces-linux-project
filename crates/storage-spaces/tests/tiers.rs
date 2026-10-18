@@ -226,3 +226,41 @@ fn tiered_spaces_are_planned_as_windows_makes_them() {
         }
     }
 }
+
+/// Windows rounds a tier up to whole rows of the tier after it, so that
+/// each tier starts at a multiple of its data columns: asked for an SSD
+/// mirror tier of 1 GiB (one column, four slabs) under an HDD simple tier
+/// of three columns, it made both tiers 1.5 GiB (`tierodd`, Windows 11
+/// build 26340). `health()` lays the tiers of a space out from 0, which a
+/// tier off its rows would have made fail (audit 2026-10-16, M13 asked);
+/// none comes so, and the pool's health is worked out, healthy.
+#[test]
+fn windows_starts_tiers_at_whole_rows() {
+    use storage_spaces::Pool;
+    use storage_spaces::format::SLAB_SIZE;
+    use storage_spaces::layout::Layout;
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/tierodd");
+    let disks: Vec<SparseImage> = (0..)
+        .map_while(|i| File::open(dir.join(format!("disk{i}.fixture"))).ok())
+        .map(|f| SparseImage::read_from(f).unwrap())
+        .collect();
+    let pool = Pool::open(disks).unwrap();
+    let space = pool.find_space("tierodd").unwrap();
+    let mut tiers: Vec<(u64, u64, u64)> = pool
+        .children(space.id())
+        .filter(|c| c.info.is_child && !c.extents.is_empty())
+        .map(|c| {
+            let (start, len) = c.info.range.unwrap();
+            let columns = Layout::new(c.info.policy.as_ref().unwrap(), &[]).unwrap().data_columns;
+            (start, len, columns)
+        })
+        .collect();
+    tiers.sort();
+    assert_eq!(tiers, [(0, 6 * SLAB_SIZE, 1), (6 * SLAB_SIZE, 6 * SLAB_SIZE, 3)]);
+    for (start, _, columns) in &tiers {
+        assert!((start / SLAB_SIZE).is_multiple_of(*columns));
+    }
+    let h = storage_spaces::health::health(&pool).unwrap();
+    assert!(h.unknown.is_empty(), "{:?}", h.unknown);
+    assert!(h.spaces.iter().all(|s| s.state.to_string() == "Healthy / OK"), "{h:?}");
+}

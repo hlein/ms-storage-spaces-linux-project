@@ -396,10 +396,29 @@ impl Layout {
         stripe - self.run_first_row(stripe / per_row) * per_row
     }
 
+    /// The extent runs of the first current copy of `column`. A column of
+    /// one copy is numbered 0 until Windows moves it to another disk, which
+    /// numbers it 1 (**verified**: column 0 of the parity space of
+    /// `replacedpar`); 1.2.2 looked at copy 0 alone, and could not read
+    /// such a space degraded (audit 2026-10-16, S9).
+    pub fn column_runs(&self, column: u64) -> Option<&Vec<Run>> {
+        self.runs
+            .range((column, 0)..=(column, u64::MAX))
+            .next()
+            .map(|(_, runs)| runs)
+    }
+
+    /// Where `row` of `column` lives in its first current copy that maps
+    /// it: (disk, slab).
+    pub fn current(&self, column: u64, row: u64) -> Option<(u64, u64)> {
+        self.copies_of(column)
+            .into_iter()
+            .find_map(|copy| self.physical(column, copy, row))
+    }
+
     /// First row of the extent run holding `row` (0 if unallocated).
     pub fn run_first_row(&self, row: u64) -> u64 {
-        self.runs
-            .get(&(0, 0))
+        self.column_runs(0)
             .and_then(|runs| {
                 let i = runs.partition_point(|r| r.first_row + r.rows <= row);
                 runs.get(i).filter(|r| r.first_row <= row)
@@ -416,8 +435,7 @@ impl Layout {
     /// ends, if unallocated).
     pub fn run_end_offset(&self, row: u64) -> u64 {
         let end = self
-            .runs
-            .get(&(0, 0))
+            .column_runs(0)
             .and_then(|runs| {
                 let i = runs.partition_point(|r| r.first_row + r.rows <= row);
                 runs.get(i).filter(|r| r.first_row <= row)

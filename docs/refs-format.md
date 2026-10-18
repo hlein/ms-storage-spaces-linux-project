@@ -79,6 +79,19 @@ header's clusters (0x20) and the cluster and checksum of the reference to
 itself (**verified** on every corpus volume, 3.1 to 3.14, and on ReFS 1.2,
 whose copies are the last blocks but 2 and 3 and name themselves by the
 block number at 0). The guard's `fs.refs.superblock` compares them so.
+A volume Windows grew (`Resize-Partition`) has the copies at its new end
+(**verified**: `r314extend`, a Dev Drive grown by 1 GiB; the fixture
+`r314extendc` passes every quick check); the four clusters before the old
+end, where the copies were, and the container after them (16,384
+clusters) stay marked used with nothing referencing them that `refs
+check` follows (`refsutil leak` counts 8 leaked clusters there, `refs
+check` 16,544 used and unreferenced against about 156 on a volume never
+grown). Windows left that volume with a record past its checkpoint
+although the disk was taken offline, and replayed its log (0x3:0x27 to
+0x3:0x29, "Last Shutdown Was Dirty: true") when it attached a copy: the
+guard's `fs.refs.log` calls it suspect, rightly. A volume left by fast
+startup is not sampled: the test VM's firmware has no hibernation, so
+Windows offers no fast startup there.
 
 ### Checkpoint
 
@@ -924,9 +937,9 @@ table's rows for a text diff):
   every volume of the corpus has some (152 to 180 on 4 KiB clusters: 140
   in the area of the boot sector, the superblock, the log's control area
   and pages made when the volume was formatted, the rest a few pages; 55
-  on 64 KiB clusters; 528 on the compressed one), so they are counted, not
-  problems, and the tests and `refs_write` fuzzing require that a change
-  adds none.
+  on 64 KiB clusters; 528 on the compressed one; 16,544 on the volume
+  Windows grew, see "Superblock"), so they are counted, not problems, and
+  the tests and `refs_write` fuzzing require that a change adds none.
 * **A failed commit.** A write or flush that fails while committing
   ends the change with an error, and whether its checkpoint is down is
   not known then: the volume is read again from the disk (a change built

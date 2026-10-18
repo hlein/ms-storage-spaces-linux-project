@@ -300,7 +300,11 @@ four HDD disks and a four-column simple tier):
   role 1, parent the space, named `<space>-<template>`, range (1, start,
   size), the template's policy with the columns chosen (SSD mirror: one
   per two SSD disks), allocation unit one slab on HDD and a row of the HDD
-  tier on SSD (512 MiB over two data columns, 1 GiB over four).
+  tier on SSD (512 MiB over two data columns, 1 GiB over four), so that the
+  HDD tier starts at a whole row of its own: an SSD tier asked for with
+  1 GiB over an HDD tier of three columns (rows of 768 MiB) became 1.5 GiB
+  (**verified**: `tierodd`, test `windows_starts_tiers_at_whole_rows`; a
+  tier off its rows, which `health()` lays out from 0, does not come).
 * The cache's chunks are a data stripe of the HDD tier (512 KiB over two
   data columns, 1 MiB over four); the parity journal's runs are an HDD row
   (allocation unit times data columns), counted over the whole space
@@ -595,7 +599,13 @@ a different value (2 in the sample) and allocates a replacement copy with a
 copy number beyond the policy's copy count and flag 0x01 (**verified**: pool
 `stale3`, 2-way mirror on 3 disks; only the copy that stayed current holds the
 data written while the disk was away). Readers must use current copies only;
-a row with out-of-date copies only is lost.
+a row with out-of-date copies only is lost. A moved column of one copy (a
+parity column, rebuilt on another disk) becomes copy 1 (**verified**:
+`replacedpar`, where Windows rebuilt column 0 on a new disk, the old one
+retired and removed); readers and writers take a column's current copy
+whatever its number. 1.2.2 took copy 0 in the parity paths: such a space
+could not be read with a disk missing, nor written (tests of
+`crates/storage-spaces/tests/moved_columns.rs`).
 A disk that misses writes without a replacement (**verified** byte for byte
 by the test `a_returning_disk_is_updated_first_and_the_others_at_repair`
 on the scenario `m5stale`: two-way mirror on two disks, one detached while
@@ -709,10 +719,16 @@ Column offset `o` is in row `o / 256 MiB` of the column.
   `i` in column `(P + 2 + i) % C` (**verified**: pool `dual7`, 7 columns).
   The general rule for `r` parity units is `P = (C - r - r*s) mod C`.
   P is the XOR of the data units (**verified**). Q is a Reed-Solomon code
-  over GF(16) (polynomial x^4 + x + 1) in bit-matrix form: each 512-byte
-  chunk of a unit is four 128-byte packets, packet `j` holding bit `j` of
-  4-bit symbols, and Q = sum of `c_k * D_k` where multiplying by `c` XORs
-  input packet `j` into output packet `i` when bit `i` of `c * x^j` is set.
+  over GF(16) (polynomial x^4 + x + 1) in bit-matrix form: each chunk of a
+  unit, one logical sector of the space, is four packets of a quarter of
+  it (128 bytes of a 512-byte sector, 1024 of a 4096-byte one), packet `j`
+  holding bit `j` of 4-bit symbols, and Q = sum of `c_k * D_k` where
+  multiplying by `c` XORs input packet `j` into output packet `i` when bit
+  `i` of `c * x^j` is set. (**Verified** for 4096-byte sectors on
+  `dual7k4`: its Q units match chunks of 4096 bytes and not of 512, and
+  `dual7` the other way round. 1.2.2 took chunks of 512 bytes on every
+  space and rebuilt wrong data on the first with two disks missing: test
+  `q_of_4096_byte_sectors_is_rebuilt_as_windows_wrote_it`.)
   The coefficients depend on the number of data columns D and not on the
   physical column: D = 5: `9, 1, 8, 2, 11`; D = 6..8: the first D of
   `13, 9, 4, 1, 12, 8, 5, 2` (5 data columns use every second element of

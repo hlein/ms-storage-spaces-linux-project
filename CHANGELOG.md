@@ -212,8 +212,24 @@
   made with. A path under `/dev` was taken for a block device and any
   other for an image; the file's type decides. GUIDs panicked when
   /dev/urandom could not be read.
+* Dual parity on 4096-byte sectors read wrong data with two disks
+  missing: Q works on chunks of a logical sector (four packets of 1024
+  bytes there), not of 512 bytes, as Windows' Q units show (pool
+  `dual7k4`). A parity space whose column Windows rebuilt on another disk
+  (copy 1 then, pool `replacedpar`) could not be read with a disk missing,
+  nor written: columns are taken at their current copy, whatever its
+  number (audit 2026-10-16, S9 and M13).
 
 ### Testing
+
+* New corpus pools made by Windows (`tools/gen-corpus.sh`): `replacedpar`
+  (a parity column rebuilt on a new disk), `dual7k4` (dual parity on
+  4096-byte sectors), `tierodd` (an SSD tier over an HDD tier of three
+  columns: Windows rounds the SSD tier to whole HDD rows), with fixtures
+  of each; and ReFS volumes Windows grew (`r314extend`, left with a log
+  record past its checkpoint, and `r314extendc`, the copy Windows replayed
+  and took offline cleanly, also a fixture; `New-RefsVolume.ps1
+  -ExtendMB`).
 
 * `tools/refs-mount-check.sh --rw IMAGE` checks what writing through `refs
   mount --rw` does (the hold, listings while names go, open files whose name

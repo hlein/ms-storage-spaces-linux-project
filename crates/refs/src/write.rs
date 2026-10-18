@@ -3387,15 +3387,16 @@ impl<D: WriteAt> Volume<D> {
             }
             let attributes = (le32(&old, 0x48) & !SPARSE) | (le32(&record, 0x48) & SPARSE);
             record[0x48..0x4c].copy_from_slice(&attributes.to_le_bytes());
-            // Named streams stay, with the stream sets of those in clusters.
-            let streams: Vec<Vec<u8>> = embedded_rows(&old)?
-                .into_iter()
-                .filter(|r| is_named_stream(r) || is_set_row(r))
-                .collect();
-            if !streams.is_empty() {
+            // Every row but the data's stays: named streams, the stream
+            // sets of those in clusters, and rows this writer does not know
+            // (1.2.2 kept the named streams and their sets alone).
+            let kept: Vec<Vec<u8>> = embedded_rows(&old)?.into_iter().filter(|r| !is_data_row(r)).collect();
+            if !kept.is_empty() {
                 let mut rows = embedded_rows(&record)?;
-                for s in streams {
-                    insert_attribute(&mut rows, s);
+                for s in kept {
+                    if !rows.iter().any(|r| row_key(r) == row_key(&s)) {
+                        insert_attribute(&mut rows, s);
+                    }
                 }
                 record = record_with_rows(&record, &rows, le32(&record, 0x98))?;
             }
@@ -5397,6 +5398,13 @@ fn is_named_stream(r: &[u8]) -> bool {
         && le16(value, 0x10) == 0
 }
 
+/// Whether a record row is the default data stream's ($DATA, inline or a
+/// level of its extents).
+fn is_data_row(r: &[u8]) -> bool {
+    let key = row_key(r);
+    key.len() >= 0x10 && matches!(le32(key, 8), 0x8000_0001 | 0x8000_0002) && le32(key, 12) & 0xffff == 0x80
+}
+
 /// Whether a record row belongs to a stream set (the levels of named
 /// streams in clusters); its set id is at 0x30 of the key.
 fn is_set_row(r: &[u8]) -> bool {
@@ -5581,5 +5589,44 @@ mod tests {
         vol.store_record(&file, &record, &[]).unwrap();
         let problems = vol.check(&[]).unwrap().problems;
         assert!(problems.iter().any(|p| p.contains("which has no rows")), "{problems:?}");
+    }
+
+    /// A record row this writer does not know (here an $EA row, type
+    /// 0xe0) stays when the file's content is replaced, inline and in
+    /// clusters (1.2.2 kept named streams and their sets alone and dropped
+    /// it; audit 2026-10-16, M25).
+    #[test]
+    fn rows_the_writer_does_not_know_stay_when_a_file_is_rewritten() {
+        let mut vol = small();
+        let now = 135_900_000_000_000_000;
+        vol.create_file("/f.txt", b"hello", now).unwrap();
+        vol.write_stream("/f.txt", "a", &[0x41; 5000], now).unwrap();
+        let file = vol.file_at("/f.txt").unwrap();
+        let mut rows = embedded_rows(&file.record).unwrap();
+        let value = [0x5au8; 0x20];
+        let mut key = vec![0u8; 16];
+        key[0..8].copy_from_slice(&(value.len() as u64).to_le_bytes());
+        key[8..12].copy_from_slice(&0x8000_0001u32.to_le_bytes());
+        key[12..16].copy_from_slice(&0xe0u32.to_le_bytes());
+        let unknown = row(&key, &value, 0);
+        insert_attribute(&mut rows, unknown.clone());
+        let record = record_with_rows(&file.record, &rows, le32(&file.record, 0x98)).unwrap();
+        vol.store_record(&file, &record, &[]).unwrap();
+        for data in [&b"short"[..], &[0x42; 9000][..], &b"again"[..]] {
+            vol.write_file("/f.txt", data, now + 1).unwrap();
+            let rows = embedded_rows(&vol.file_at("/f.txt").unwrap().record).unwrap();
+            assert_eq!(
+                rows.iter().filter(|r| **r == unknown).count(),
+                1,
+                "after writing {} bytes",
+                data.len()
+            );
+            assert_eq!(rows.iter().filter(|r| is_named_stream(r)).count(), 1);
+            let f = vol.open_file(&vol.lookup("/f.txt").unwrap()).unwrap();
+            let mut buf = vec![0u8; data.len()];
+            vol.read_stream(f.data.as_ref().unwrap(), 0, &mut buf).unwrap();
+            assert!(buf == data);
+            assert_eq!(vol.check(&[]).unwrap().problems, Vec::<String>::new());
+        }
     }
 }

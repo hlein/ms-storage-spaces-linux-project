@@ -340,6 +340,11 @@ reads back with Windows' SHA-256):
   targets of an absolute and a relative file link, a directory link and
   a junction).
 
+Other rows than these are not read. A file whose content `refs` replaces
+gets a new record with a new $DATA row; every other row of the old record
+stays as it was (named streams, stream sets, and the rows not read; 1.2.2
+kept named streams and their sets alone).
+
 ### Data levels and stream snapshots
 
 A stream in extents is a chain of *levels*. Each level is a $DATA row

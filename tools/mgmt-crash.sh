@@ -12,10 +12,13 @@
 #             moving a mirror slab: its data copied to the new disk, the
 #             move recorded on one of the three pool database copies
 # Usage: tools/mgmt-crash.sh DIR
+# Build: cargo build --release -p spaces-cli --features test-hooks (the step
+# hook SPACES_STOP_AFTER_STEP is in test builds only).
 set -euo pipefail
 cd "$(dirname "$0")/.."
 dir=$1
 spaces=$PWD/target/release/spaces
+pattern=${SPACES_PATTERN:-${spaces%/*}/spaces-pattern}
 rm -rf -- "${dir:?}"
 mkdir -p "$dir/base"
 for i in 0 1 2; do truncate -s 8G "$dir/base/disk$i.img"; done
@@ -23,8 +26,8 @@ base=("$dir"/base/disk0.img "$dir"/base/disk1.img "$dir"/base/disk2.img)
 "$spaces" pool create --name ss-crash --yes "${base[@]}" | tail -1
 "$spaces" space create --name cmirror --resiliency mirror --size 1G --yes "${base[@]}" | tail -1
 "$spaces" space create --name cparity --resiliency parity --size 2G --yes "${base[@]}" | tail -1
-"$spaces" write-pattern "${base[@]}" --space cmirror --offset 0 --length $((1 << 30)) --tag cmirror | tail -1
-"$spaces" write-pattern "${base[@]}" --space cparity --offset 0 --length $((2 << 30)) --tag cparity --destage | tail -1
+"$pattern" "${base[@]}" --space cmirror --offset 0 --length $((1 << 30)) --tag cmirror | tail -1
+"$pattern" "${base[@]}" --space cparity --offset 0 --length $((2 << 30)) --tag cparity --destage | tail -1
 manifest() {
   python3 - "$1/manifest.json" <<'PY'
 import json, sys
@@ -32,6 +35,14 @@ json.dump({"name": "crash", "pattern": True, "pattern_size": 1 << 30, "pool": {"
            "space": {"name": "cmirror"}, "extra_spaces": [{"name": "cparity", "size": 2 << 30}]},
           open(sys.argv[1], "w"), indent=1)
 PY
+}
+stop() { # stop N COMMAND...: spaces COMMAND carried out up to step N
+  local n=$1 out
+  shift
+  out=$(SPACES_STOP_AFTER_STEP=$n "$spaces" "$@" || true)
+  grep -E "^stopped|^step (16|17|18):" <<<"$out" || true
+  grep -q "^stopped" <<<"$out" ||
+    { echo "$spaces carried the plan out whole: build it with --features test-hooks" >&2; exit 1; }
 }
 state() {
   local name=$1 steps=$2
@@ -44,7 +55,7 @@ state() {
     truncate -s 8G "$dir/$name/disk3.img"
     extra=(--new "$dir/$name/disk3.img")
   fi
-  SPACES_STOP_AFTER_STEP=$steps "$spaces" "$@" "${extra[@]}" --yes "${disks[@]}" | grep -E "^stopped" || true
+  stop "$steps" "$@" "${extra[@]}" --yes "${disks[@]}"
   manifest "$dir/$name"
   local all=("$dir/$name"/disk*.img)
   printf '%s: ' "$name"
@@ -64,7 +75,7 @@ truncate -s 8G "$dir/retire/disk3.img"
 "$spaces" disk add --new "$dir/retire/disk3.img" --yes "$dir"/retire/disk{0,1,2}.img | tail -1
 four=("$dir"/retire/disk{0,1,2,3}.img)
 retired=$("$spaces" info "${four[@]}" | awk '/device 0$/ {print $1}')
-SPACES_STOP_AFTER_STEP=18 "$spaces" disk retire --disk "$retired" --yes "${four[@]}" | grep -E "^stopped|^step (16|17|18):" || true
+stop 18 disk retire --disk "$retired" --yes "${four[@]}"
 manifest "$dir/retire"
 for s in cmirror cparity; do "$spaces" check-pattern "${four[@]}" --space "$s" --tag "$s" | tail -1; done
 echo "crash states: $dir/{create1,create2,adddisk,retire}"

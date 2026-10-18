@@ -134,21 +134,7 @@ fn attached_space(path: &Path) -> Option<(String, String, Option<String>)> {
 /// Writes `report` into the report directory as `<name>.txt` and `.json`
 /// when this process may (root); returns the text's path.
 pub fn write_report(report: &Report, name: &str) -> Option<PathBuf> {
-    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
-    let dir = Path::new(REPORT_DIR);
-    std::fs::DirBuilder::new()
-        .recursive(true)
-        .mode(0o755)
-        .create(dir)
-        .ok()?;
-    for (ext, text) in [("txt", report.to_text()), ("json", report.to_json())] {
-        let path = dir.join(format!("{name}.{ext}"));
-        let tmp = dir.join(format!("{name}.{ext}.tmp"));
-        std::fs::write(&tmp, text).ok()?;
-        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o644)).ok()?;
-        std::fs::rename(&tmp, &path).ok()?;
-    }
-    Some(dir.join(format!("{name}.txt")))
+    storage_spaces::report::write_files(report, Path::new(REPORT_DIR), name).ok()
 }
 
 /// The line a refusal or warning starts with: the verdict and the worst

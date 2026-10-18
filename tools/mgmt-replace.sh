@@ -13,6 +13,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 dir=$1
 spaces=$PWD/target/release/spaces
+pattern=${SPACES_PATTERN:-${spaces%/*}/spaces-pattern}
 rm -rf -- "${dir:?}"
 mkdir -p "$dir"
 for i in 0 1 2 3; do truncate -s 8G "$dir/d$i.img"; done
@@ -20,8 +21,8 @@ q() { "$spaces" "$@" --yes | grep -vE "^step [0-9]+:" || true; }
 q pool create --name ss-replace "$dir"/d{0,1,2}.img
 q space create --name rmirror --resiliency mirror --size 1G "$dir"/d{0,1,2}.img
 q space create --name rparity --resiliency parity --size 2G "$dir"/d{0,1,2}.img
-"$spaces" write-pattern "$dir"/d{0,1,2}.img --space rmirror --offset 0 --length $((1 << 30)) --tag rmirror | tail -1
-"$spaces" write-pattern "$dir"/d{0,1,2}.img --space rparity --offset 0 --length $((2 << 30)) --tag rparity --destage | tail -1
+"$pattern" "$dir"/d{0,1,2}.img --space rmirror --offset 0 --length $((1 << 30)) --tag rmirror | tail -1
+"$pattern" "$dir"/d{0,1,2}.img --space rparity --offset 0 --length $((2 << 30)) --tag rparity --destage | tail -1
 failed=$("$spaces" info "$dir"/d{0,1,2}.img | awk '/device 2$/ {print $1}')
 mv "$dir/d2.img" "$dir/failed.img"
 left=("$dir"/d0.img "$dir"/d1.img)

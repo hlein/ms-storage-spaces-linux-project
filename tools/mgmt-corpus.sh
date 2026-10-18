@@ -12,6 +12,7 @@ cd "$(dirname "$0")/.."
 name=$1 dir=$2
 src=testdata/pools/$name
 spaces=$PWD/target/release/spaces
+pattern=${SPACES_PATTERN:-${spaces%/*}/spaces-pattern}
 rm -rf -- "${dir:?}"
 mkdir -p "$dir"
 n=0
@@ -27,7 +28,7 @@ q disk add --new "$dir/d$n.img" "${pool[@]}"
 pool+=("$dir/d$n.img")
 # One column: its rows must fit the disks left after the retirement.
 q space create --name lnew --resiliency mirror --size 1G --columns 1 "${pool[@]}"
-"$spaces" write-pattern "${pool[@]}" --space lnew --offset 0 --length $((1 << 30)) --tag lnew | tail -1
+"$pattern" "${pool[@]}" --space lnew --offset 0 --length $((1 << 30)) --tag lnew | tail -1
 q space resize --space "$space" --size $((size + (2 << 30))) "${pool[@]}"
 first=$("$spaces" info "${pool[@]}" | awk '/device 0$/ {print $1}')
 q disk retire --disk "$first" "${pool[@]}"

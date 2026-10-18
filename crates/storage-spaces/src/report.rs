@@ -498,6 +498,41 @@ impl Report {
     }
 }
 
+/// Makes `dir`, and the directories missing above it, readable by
+/// everyone (0755) whatever the umask, and makes an existing `dir` so: the
+/// attach unit and `mount.refs`' sandbox run with `UMask=0077`.
+pub fn readable_dir(dir: &std::path::Path) -> std::io::Result<()> {
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+    let missing: Vec<&std::path::Path> = dir
+        .ancestors()
+        .skip(1)
+        .take_while(|d| !d.as_os_str().is_empty() && !d.exists())
+        .collect();
+    std::fs::DirBuilder::new().recursive(true).mode(0o755).create(dir)?;
+    for d in missing.into_iter().chain([dir]) {
+        std::fs::set_permissions(d, std::fs::Permissions::from_mode(0o755))?;
+    }
+    Ok(())
+}
+
+/// Writes `report` into `dir` (made [`readable_dir`]) as `<name>.txt` and
+/// `.json`, each written whole and renamed into place, 0644: a report
+/// names pools, spaces and disks, no data. Returns the text's path. (The
+/// one writer of `spaces` and `refs`: 1.2.2's `refs` made the directories
+/// under its sandbox's umask, 0700, and only root could read its reports.)
+pub fn write_files(report: &Report, dir: &std::path::Path, name: &str) -> std::io::Result<std::path::PathBuf> {
+    use std::os::unix::fs::PermissionsExt;
+    readable_dir(dir)?;
+    for (ext, text) in [("txt", report.to_text()), ("json", report.to_json())] {
+        let path = dir.join(format!("{name}.{ext}"));
+        let tmp = dir.join(format!("{name}.{ext}.tmp"));
+        std::fs::write(&tmp, text)?;
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o644))?;
+        std::fs::rename(&tmp, &path)?;
+    }
+    Ok(dir.join(format!("{name}.txt")))
+}
+
 /// Several reports as one JSON array.
 pub fn reports_to_json(reports: &[Report]) -> String {
     let mut s = String::new();

@@ -34,25 +34,18 @@ fn open(disks: &[String]) -> Pool<File> {
     Pool::open(disks.iter().map(|d| File::open(d).unwrap()).collect()).unwrap()
 }
 
-/// `spaces write-pattern` of `length` bytes at `offset` of space "tp",
-/// destaged, with `options` before the command.
+/// `spaces-pattern` of `length` bytes at `offset` of space "tp",
+/// destaged, with `options`.
 fn write(disks: &[String], options: &[&str], offset: u64, length: u64, tag: &str) -> Output {
     let (offset, length) = (offset.to_string(), length.to_string());
     let mut args = options.to_vec();
-    args.extend([
-        "write-pattern",
-        "--space",
-        "tp",
-        "--offset",
-        &offset,
-        "--length",
-        &length,
-        "--tag",
-        tag,
-    ]);
+    args.extend(["--space", "tp", "--offset", &offset, "--length", &length, "--tag", tag]);
     args.push("--destage");
     args.extend(disks.iter().map(String::as_str));
-    spaces(&args)
+    Command::new(env!("CARGO_BIN_EXE_spaces-pattern"))
+        .args(&args)
+        .output()
+        .unwrap()
 }
 
 #[test]

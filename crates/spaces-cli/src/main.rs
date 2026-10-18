@@ -1,7 +1,7 @@
 #![forbid(unsafe_code)]
 use std::fs::{File, OpenOptions};
 use std::io::{Seek, SeekFrom, Write};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
@@ -14,6 +14,7 @@ mod dump;
 #[cfg(all(target_os = "linux", feature = "fuse"))]
 mod fuse;
 mod manage;
+mod members;
 mod nbd;
 #[cfg(target_os = "linux")]
 mod scan;
@@ -22,6 +23,7 @@ mod snapshot;
 #[cfg(all(target_os = "linux", feature = "ublk"))]
 mod ublk;
 use clap::{Parser, Subcommand};
+pub(crate) use members::{Hold, open_member};
 use storage_spaces::format::{SLAB_SIZE, SpaceRole};
 use storage_spaces::io::ReadAt;
 use storage_spaces::segments::SegmentKind;
@@ -315,31 +317,6 @@ enum Command {
         #[arg(required = true)]
         snapshots: Vec<PathBuf>,
     },
-    /// Write the verification pattern with a tag into a space (tests of
-    /// write support: the member devices are written).
-    #[command(hide = true)]
-    WritePattern {
-        #[arg(required = true)]
-        devices: Vec<PathBuf>,
-        #[arg(short, long)]
-        space: String,
-        /// Byte offset (a multiple of 4096).
-        #[arg(long)]
-        offset: u64,
-        /// Bytes to write (a multiple of 4096).
-        #[arg(long)]
-        length: u64,
-        #[arg(long)]
-        tag: String,
-        /// Stop the process before the Nth write reaches a member, as a
-        /// power loss would (for crash tests); without a crash, the number
-        /// of member writes is printed.
-        #[arg(long)]
-        crash_after_writes: Option<usize>,
-        /// Destage the write-back cache after the writes.
-        #[arg(long)]
-        destage: bool,
-    },
     /// Pool management: create, rename, repair, optimize, scrub and remove
     /// pools.
     Pool {
@@ -569,15 +546,6 @@ fn main() -> Result<()> {
             }
             Ok(())
         }
-        Command::WritePattern {
-            devices,
-            space,
-            offset,
-            length,
-            tag,
-            crash_after_writes,
-            destage,
-        } => write_pattern(&devices, &space, offset, length, &tag, crash_after_writes, destage),
         Command::Pool { command } => manage::pool(command),
         Command::Space { command } => manage::space(command),
         Command::Disk { command } => manage::disk(command),
@@ -610,84 +578,6 @@ fn open_pool_rw(paths: &[PathBuf]) -> Result<Pool<File>> {
     open_pool_mode(paths, Hold::Exclusive, true)
 }
 
-/// How a process holds the members of a pool it opens.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Hold {
-    /// Reading them for a moment (`info`, `check`): no lock.
-    Read,
-    /// Serving or exporting a space read-only: a shared lock on every
-    /// member, which the servers of the pool's other spaces share and its
-    /// writers do not get.
-    Shared,
-    /// Writing them (`--rw` servers, management): `O_EXCL` on block devices
-    /// (also through a symlink), which fails while they are mounted,
-    /// assembled or held by device-mapper, and an exclusive lock on every
-    /// member, which fails while another process serves or writes them.
-    Exclusive,
-}
-
-/// Opens a member, held as `hold` says.
-pub(crate) fn open_member(p: &Path, write: bool, hold: Hold) -> Result<File> {
-    let mut options = std::fs::OpenOptions::new();
-    options.read(true).write(write);
-    #[cfg(target_os = "linux")]
-    {
-        use std::os::unix::fs::{FileTypeExt, OpenOptionsExt};
-        if hold == Hold::Exclusive && std::fs::metadata(p).is_ok_and(|m| m.file_type().is_block_device()) {
-            options.custom_flags(libc::O_EXCL);
-        }
-    }
-    let file = match options.open(p) {
-        Ok(f) => f,
-        Err(e) if e.raw_os_error() == Some(libc::EBUSY) => {
-            bail!("{} is in use by {}", p.display(), kernel_holders(p))
-        }
-        Err(e) => return Err(anyhow::Error::new(e).context(format!("cannot open {}", p.display()))),
-    };
-    let locked = match hold {
-        Hold::Read => return Ok(file),
-        Hold::Shared => file.try_lock_shared(),
-        Hold::Exclusive => file.try_lock(),
-    };
-    locked.map_err(|e| match e {
-        std::fs::TryLockError::WouldBlock => anyhow::anyhow!(
-            "{} is in use by {}",
-            p.display(),
-            storage_spaces::holders::of_lock(&file)
-        ),
-        std::fs::TryLockError::Error(e) => anyhow::Error::new(e).context(format!("cannot lock {}", p.display())),
-    })?;
-    Ok(file)
-}
-
-/// What holds block device `p` in the kernel (device-mapper tables, from
-/// /sys), as people read it.
-fn kernel_holders(p: &Path) -> String {
-    let held: Vec<String> = std::fs::canonicalize(p)
-        .ok()
-        .and_then(|real| Some(real.file_name()?.to_str()?.to_string()))
-        .and_then(|name| {
-            let dir = Path::new("/sys/class/block").join(&name).join("holders");
-            std::fs::read_dir(dir).ok()
-        })
-        .into_iter()
-        .flatten()
-        .filter_map(|e| {
-            let holder = e.ok()?.file_name().to_string_lossy().into_owned();
-            let dm = std::fs::read_to_string(format!("/sys/block/{holder}/dm/name")).ok();
-            Some(match dm {
-                Some(name) => format!("device-mapper {} ({holder})", name.trim()),
-                None => holder,
-            })
-        })
-        .collect();
-    if held.is_empty() {
-        "the kernel (mounted, assembled or opened exclusively)".into()
-    } else {
-        held.join(", ")
-    }
-}
-
 fn open_pool_mode(paths: &[PathBuf], hold: Hold, write: bool) -> Result<Pool<File>> {
     let files = paths
         .iter()
@@ -698,102 +588,6 @@ fn open_pool_mode(paths: &[PathBuf], hold: Hold, write: bool) -> Result<Pool<Fil
         eprintln!("warning: {w}");
     }
     Ok(pool)
-}
-
-/// A member that ends the process before a given write, as a power loss
-/// would leave the disks.
-struct CrashAfter {
-    file: File,
-    writes: std::sync::Arc<std::sync::atomic::AtomicUsize>,
-    limit: usize,
-}
-
-impl storage_spaces::io::ReadAt for CrashAfter {
-    fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> std::io::Result<()> {
-        self.file.read_exact_at(buf, offset)
-    }
-    fn size(&self) -> std::io::Result<u64> {
-        storage_spaces::io::ReadAt::size(&self.file)
-    }
-}
-
-impl storage_spaces::io::WriteAt for CrashAfter {
-    fn write_all_at(&self, buf: &[u8], offset: u64) -> std::io::Result<()> {
-        if self.writes.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1 >= self.limit {
-            eprintln!("crash before member write {}", self.limit);
-            std::process::exit(99);
-        }
-        storage_spaces::io::WriteAt::write_all_at(&self.file, buf, offset)
-    }
-    fn flush(&self) -> std::io::Result<()> {
-        storage_spaces::io::WriteAt::flush(&self.file)
-    }
-}
-
-fn write_pattern(
-    devices: &[PathBuf],
-    space: &str,
-    offset: u64,
-    length: u64,
-    tag: &str,
-    crash_after_writes: Option<usize>,
-    destage: bool,
-) -> Result<()> {
-    let block = testpattern::BLOCK as u64;
-    if !offset.is_multiple_of(block) || !length.is_multiple_of(block) {
-        bail!("offset and length must be multiples of {block}");
-    }
-    if let Some(limit) = crash_after_writes {
-        let writes = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let files = devices
-            .iter()
-            .map(|p| {
-                let file = std::fs::OpenOptions::new().read(true).write(true).open(p)?;
-                Ok(CrashAfter {
-                    file,
-                    writes: writes.clone(),
-                    limit,
-                })
-            })
-            .collect::<std::io::Result<Vec<_>>>()?;
-        let pool = Pool::open(files)?;
-        let id = pool
-            .find_space(space)
-            .map(|s| s.id())
-            .ok_or_else(|| anyhow::anyhow!("no space {space:?}"))?;
-        let writer = pool.open_space_rw_with(id, OPEN_OPTIONS.get().copied().unwrap_or_default())?;
-        write_pattern_with(&writer, offset, length, tag, destage)?;
-        eprintln!("member writes: {}", writes.load(std::sync::atomic::Ordering::SeqCst));
-        return Ok(());
-    }
-    let pool = open_pool_rw(devices)?;
-    let writer = open_space_rw(&pool, find_space(&pool, space)?.id())?;
-    write_pattern_with(&writer, offset, length, tag, destage)
-}
-
-fn write_pattern_with<D: storage_spaces::io::WriteAt>(
-    writer: &storage_spaces::SpaceWriter<'_, D>,
-    offset: u64,
-    length: u64,
-    tag: &str,
-    destage: bool,
-) -> Result<()> {
-    let mut buf = vec![0u8; 1 << 20];
-    let mut at = offset;
-    while at < offset + length {
-        let n = (offset + length - at).min(buf.len() as u64) as usize;
-        for (i, b) in buf[..n].chunks_mut(testpattern::BLOCK).enumerate() {
-            testpattern::fill_block(b, at + (i * testpattern::BLOCK) as u64, tag);
-        }
-        writer.write_all_at(&buf[..n], at)?;
-        at += n as u64;
-    }
-    writer.flush()?;
-    if destage {
-        writer.destage()?;
-    }
-    println!("wrote {} at {offset:#x} with tag {tag:?}", size(length));
-    Ok(())
 }
 
 fn find_space<'p>(pool: &'p Pool<File>, key: &str) -> Result<&'p Space> {

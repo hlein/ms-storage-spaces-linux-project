@@ -14,13 +14,20 @@ categories = ["command-line-utilities", "filesystem"]
 name = "spaces"
 path = "src/main.rs"
 
+# The write tests' pattern writer; the packages do not install it.
+[[bin]]
+name = "spaces-pattern"
+path = "src/bin/spaces-pattern.rs"
+
 [features]
 default = ["ublk", "fuse"]
 # The ublk backend needs libclang at build time (bindgen in libublk-rs-sys).
 ublk = ["dep:libublk"]
 fuse = ["dep:fuser"]
 # Crash tests only, never in packages: SPACES_ATTACH_STOP_AFTER=<step>
-# stops `spaces attach` there as a crash would (tools/attach-crash-check.sh).
+# stops `spaces attach` there as a crash would (tools/attach-crash-check.sh),
+# SPACES_STOP_AFTER_STEP=<n> a management plan after its first n steps
+# (tools/mgmt-crash.sh), SPACES_UBLK_* time or break a ublk server.
 test-hooks = []
 
 [dependencies]

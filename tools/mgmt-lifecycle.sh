@@ -12,6 +12,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 dir=$1
 spaces=$PWD/target/release/spaces
+pattern=${SPACES_PATTERN:-${spaces%/*}/spaces-pattern}
 rm -rf -- "${dir:?}"
 mkdir -p "$dir"
 for i in 0 1 2 3; do truncate -s 8G "$dir/d$i.img"; done
@@ -33,7 +34,7 @@ declare -A sizes
 while read -r name size; do sizes[$name]=$size; done < <(
   "$spaces" info "${pool[@]}" | awk '/"l[a-z0-9]+"/ {gsub(/"/, "", $3); name=$3} /^ +size / && name {print name, $2 * ($3 ~ /GiB/ ? 1073741824 : 1048576); name=""}')
 for name in lsimple2 lmirror lparity lthin; do
-  "$spaces" write-pattern "${pool[@]}" --space "$name" --offset 0 --length "${sizes[$name]}" --tag "$name" --destage | tail -1
+  "$pattern" "${pool[@]}" --space "$name" --offset 0 --length "${sizes[$name]}" --tag "$name" --destage | tail -1
 done
 added=$("$spaces" disk add --new "$dir/d3.img" --yes "${pool[@]}" | sed -n 's/.* as disk id \([0-9]*\)$/\1/p')
 pool+=("$dir/d3.img")

@@ -33,6 +33,9 @@
 #            attach scans every device, so not beside an install.sh
 #            installation's pool
 # Usage: [LINUX_VM_HOST=user@address] tools/guard-check.sh DEB [CASE...]
+# The damaged copies are written with spaces-pattern, which the package does
+# not install: SPACES_PATTERN (default the static build,
+# target/x86_64-unknown-linux-musl/release/spaces-pattern) is copied along.
 # Pools: testdata/pools/{wc4k,ntfstier} and testdata/refs/{r314integ,
 # r314mirror}, copied to the VM when missing (to /srv/spaces where the VM
 # has its corpus disk, as compressed tars at 8 MB/s); damaged copies only in
@@ -79,7 +82,10 @@ copy wc4k pools
 copy ntfstier pools
 copy r314integ refs
 copy r314mirror refs
+pattern=${SPACES_PATTERN:-target/x86_64-unknown-linux-musl/release/spaces-pattern}
+[[ -x $pattern ]] || { echo "no $pattern: cargo build --release --target x86_64-unknown-linux-musl -p spaces-cli" >&2; exit 1; }
 scp -q "${ssh_opts[@]}" "$deb" "$host:sstest/guard.deb"
+scp -q "${ssh_opts[@]}" "$pattern" "$host:sstest/spaces-pattern"
 vm "CASES='$cases' bash -s" <<'REMOTE'
 set -u
 pass=0 fail=0
@@ -121,7 +127,7 @@ cleanup() {
   done
 }
 cleanup # what an interrupted run left behind
-trap 'cleanup; sudo dpkg -r storage-spaces >/dev/null 2>&1; rm -f ~/sstest/guard.deb' EXIT
+trap 'cleanup; sudo dpkg -r storage-spaces >/dev/null 2>&1; rm -f ~/sstest/guard.deb ~/sstest/spaces-pattern' EXIT
 sudo dpkg -i ~/sstest/guard.deb >/dev/null
 rm -rf "${scratch:?}"
 mkdir -p "$scratch/wc4kbad"
@@ -129,7 +135,7 @@ mkdir -p "$scratch/wc4kbad"
 # A copy of wc4k whose backup GPT header is overwritten (the last 4 KiB of
 # its space of 4 GiB): suspect.
 cp --sparse=always $pools/wc4k/disk0.img "$scratch/wc4kbad/disk0.img"
-"$spaces" write-pattern "$scratch/wc4kbad/disk0.img" --space wc4k --offset $((4294967296 - 4096)) \
+~/sstest/spaces-pattern "$scratch/wc4kbad/disk0.img" --space wc4k --offset $((4294967296 - 4096)) \
   --length 4096 --tag guard >/dev/null
 # ntfstier without one of its disks whose loss leaves the data complete:
 # degraded.

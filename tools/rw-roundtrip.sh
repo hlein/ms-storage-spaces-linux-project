@@ -1,18 +1,18 @@
 #!/bin/bash
-# Write ranges into a copy of a corpus pool with spaces write-pattern and
+# Write ranges into a copy of a corpus pool with spaces-pattern and
 # check on the Windows VM that Windows accepts the pool and reads exactly
 # those ranges (tools/vm/Test-RoundTrip.ps1 -Written).
 # Usage: tools/rw-roundtrip.sh NAME POOL "OFFKB:LENKB:TAG;..."
 #   NAME   round-trip name (C:\sstest\roundtrip\NAME, testdata/work/NAME)
 #   POOL   corpus pool in testdata/pools (never written: a copy is made)
-# WRITE_ARGS adds arguments to every write-pattern call (e.g. --destage, or
+# WRITE_ARGS adds arguments to every spaces-pattern call (e.g. --destage, or
 # --crash-after-writes N to leave a crash state).
 # The result lands in testdata/work/NAME/roundtrip.json.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 name=$1 pool=$2 ranges=$3
 [[ $name =~ ^[a-z0-9_]+$ && $pool =~ ^[a-z0-9_]+$ ]] || { echo "bad name" >&2; exit 1; }
-spaces=${SPACES:-target/release/spaces}
+pattern=${SPACES_PATTERN:-target/release/spaces-pattern}
 work=testdata/work/$name
 rm -rf -- "${work:?}"
 mkdir -p "$work"
@@ -24,7 +24,7 @@ IFS=';' read -ra list <<<"$ranges"
 for r in "${list[@]}"; do
   IFS=':' read -r off len tag <<<"$r"
   rc=0
-  "$spaces" write-pattern "$work"/disk*.img --space "$space" --offset $((off * 1024)) --length $((len * 1024)) --tag "$tag" ${WRITE_ARGS:-} || rc=$?
+  "$pattern" "$work"/disk*.img --space "$space" --offset $((off * 1024)) --length $((len * 1024)) --tag "$tag" ${WRITE_ARGS:-} || rc=$?
   # 99: stopped by --crash-after-writes, as asked.
   [[ $rc == 0 || $rc == 99 ]] || exit "$rc"
 done

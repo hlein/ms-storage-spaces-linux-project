@@ -225,9 +225,33 @@
   at container 6): the control page is also looked for at the first
   cluster of the first 64 containers of the container table, by `refs`
   and by the guard's quick checks (audit 2026-10-16, M11).
+* `mount.ReFS` ran `refs` as root without its sandbox when `systemd-run`
+  failed (a unit of the same name left over, a systemd that refuses a
+  property): it mounts nothing then, and says why. The unit's name is its
+  own (process and time), and its log stays in `/run/refs-mount` while it
+  serves the mount (it was removed at once, and the unit wrote on into a
+  deleted file). `refs` made the report directory under the unit's
+  `UMask=0077`, 0700, so that only root could read the reports of the
+  volumes it refused: the directories are 0755 now, as `spaces` makes
+  them (one report writer for both; audit 2026-10-16, M24).
+* The packaged `spaces` carried test hooks: a hidden `write-pattern`
+  command, which wrote the members without a plan, `--yes` or the guard,
+  and `SPACES_STOP_AFTER_STEP`, which stopped a management plan after a
+  step as a crash would. The pattern writer is a separate binary,
+  `spaces-pattern`, which the packages do not install; the step hook is in
+  builds with the feature `test-hooks` only. `refs write` and the other
+  commands that replace a file's content dropped the rows of its record
+  the writer does not know (it kept named streams and their sets alone):
+  every row but the data's stays (audit 2026-10-16, M25).
 
 ### Testing
 
+* `tools/mount-vm-check.sh` cases `nosandbox` (`systemd-run` failing),
+  `unitlog` (the unit's log after a mount) and `reportmode` (the report
+  directory's mode). The write tests' scripts write their pattern with
+  `spaces-pattern` (`SPACES_PATTERN` names it; `tools/guard-check.sh`
+  copies it to the VM), `tools/mgmt-crash.sh` needs a build with
+  `--features test-hooks` and says so.
 * New corpus pools made by Windows (`tools/gen-corpus.sh`): `replacedpar`
   (a parity column rebuilt on a new disk), `dual7k4` (dual parity on
   4096-byte sectors), `tierodd` (an SSD tier over an HDD tier of three

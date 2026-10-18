@@ -57,7 +57,7 @@ disks are never written, unless a space is attached read-write
 | Debian/Ubuntu package: `contrib/deb/build-deb.sh && sudo apt install ./target/deb/storage-spaces_*.deb` | the same, as a package | Debian, Ubuntu |
 | Arch Linux: `(cd contrib/arch && makepkg -si)` | the same, as a package | Arch |
 | The releases page of the repository | static `spaces` and `refs` binaries (x86_64, musl) and a `.deb`, with `SHA256SUMS` (from 1.1.0; 1.0.0 had no `refs`) | trying it out; `sha256sum -c SHA256SUMS` first |
-| `cargo install --locked --path crates/spaces-cli` (and `crates/refs-cli`) | the binary only, no udev rule or unit | development |
+| `cargo install --locked --path crates/spaces-cli --bin spaces` (and `crates/refs-cli`) | the binary only, no udev rule or unit (without `--bin spaces` also `spaces-pattern`, the write tests' pattern writer, which writes member devices without a plan, `--yes` or the guard) | development |
 
 `contrib/install.sh` (as root; it takes the path of `spaces` if it was
 built elsewhere) puts `spaces` in `/usr/local/sbin`, `refs` and its man
@@ -885,7 +885,9 @@ compressed clusters lose a reference each, and those no file references
 any more are left for Windows' dedup job to reclaim, as Windows leaves
 them. `refs mkdir` creates a directory;
 `refs write` replaces a file's content (or appends to it with
-`--append`), keeping its creation time, attributes and permissions.
+`--append`), keeping its creation time, attributes and permissions, its
+named streams and every other row of its record that is not its data
+(1.2.2 dropped the rows it did not know).
 New data goes into the volume's data containers; when they are full
 `refs` hands out the next free container for data, as Windows does,
 and only then uses room in the metadata containers.
@@ -981,11 +983,14 @@ security`, scores 9.5 UNSAFE before, 5.1 MEDIUM after):
   device starts is no longer lost. `spaces detach` deletes the ublk device
   of a server that was killed before it could (1.2.2 left it DEAD).
 * `mount.ReFS` (what `mount -t ReFS` and udisks2 call, as root) runs
-  `refs mount` as a transient `refs-mount-<pid>.service` without network,
-  new privileges, namespaces or most capabilities. It keeps the host's
-  mounts (`PrivateMounts=no`: since systemd 254 a private network would
-  otherwise bring a private mount namespace, where the host never sees
-  the mount). Without systemd it falls back to a plain process. `refs`
+  `refs mount` as a transient `refs-mount-<pid>-<time>.service` without
+  network, new privileges, namespaces or most capabilities, its log in
+  `/run/refs-mount/<unit>.log` while it serves the mount. It keeps the
+  host's mounts (`PrivateMounts=no`: since systemd 254 a private network
+  would otherwise bring a private mount namespace, where the host never
+  sees the mount). Without systemd it runs a plain process; where systemd
+  runs but the unit cannot be started, it mounts nothing and says why
+  (1.2.2 ran `refs` as root without the limits then). `refs`
   mounts the block device itself (mount(2)) rather than through the
   setuid helper `fusermount3`, which only users' mounts need.
 

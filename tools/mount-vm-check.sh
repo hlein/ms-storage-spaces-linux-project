@@ -3,7 +3,8 @@
 # package (mount.ReFS, mount -t ReFS, udisks2), one line PASS or FAIL per case.
 # Usage: [LINUX_VM_HOST=user@address] tools/mount-vm-check.sh [--deb FILE] [CASE...]
 #   --deb FILE  install this package first (dpkg -i, the same version again too)
-#   CASE        image loop512 loop4k udisks kill9 wait slow early (default: all)
+#   CASE        image loop512 loop4k udisks kill9 wait slow early nosandbox unitlog
+#               reportmode (default: all)
 # The ReFS sample is testdata/refs/r314small (copied to ~/sstest on the VM
 # when missing); it is attached through read-only loop devices only.
 set -euo pipefail
@@ -13,7 +14,7 @@ if [[ ${1:-} == --deb ]]; then
   deb=$2
   shift 2
 fi
-cases=${*:-image loop512 loop4k udisks kill9 wait slow early}
+cases=${*:-image loop512 loop4k udisks kill9 wait slow early nosandbox unitlog reportmode}
 vm() { tools/linux-vm.sh "$@"; }
 host=${LINUX_VM_HOST:-192.168.189.142}
 [[ $host == *@* ]] || host=codex@$host
@@ -61,8 +62,9 @@ unit_pid() { # the refs process serving mount point $1 (its mount.ReFS unit or i
 cleanup() {
   umount_all
   sudo dmsetup remove --retry mc-slow 2>/dev/null || true
+  sudo dmsetup remove --retry mc-bad 2>/dev/null || true
   for l in "${loops[@]}"; do sudo losetup -d "$l" 2>/dev/null || true; done
-  sudo rm -f /tmp/mc-fake-refs /tmp/mc-zero.img
+  sudo rm -f /tmp/mc-fake-refs /tmp/mc-zero.img /tmp/mc-bad.img /tmp/mc-fake-sr/systemd-run
 }
 trap cleanup EXIT
 
@@ -179,6 +181,76 @@ FAKE
       result fail early "after $((SECONDS - t0)) s: ${out//$'\n'/ | }"
     fi
     umount_all ;;
+  nosandbox) # systemd-run failing for root: nothing mounted, not even
+    # outside the sandbox (1.2.2 ran refs unsandboxed then)
+    mkdir -p /tmp/mc-fake-sr
+    printf '#!/bin/sh\necho "Failed to start transient service unit: Unit refs-mount-1.service already exists." >&2\nexit 1\n' \
+      > /tmp/mc-fake-sr/systemd-run
+    chmod 755 /tmp/mc-fake-sr/systemd-run
+    loop 512
+    l=$LOOP
+    d=$(dir nosandbox)
+    if out=$(sudo env PATH=/tmp/mc-fake-sr:/usr/sbin:/usr/bin:/sbin:/bin /usr/sbin/mount.ReFS "$l" "$d" 2>&1); then
+      result fail nosandbox "mounted outside its sandbox: ${out//$'\n'/ | }"
+    elif mountpoint -q "$d"; then
+      result fail nosandbox "mounted, and failed: ${out//$'\n'/ | }"
+    elif [[ $out == *sandbox* ]]; then
+      result ok nosandbox "${out//$'\n'/ | }"
+    else
+      result fail nosandbox "${out//$'\n'/ | }"
+    fi
+    umount_all ;;
+  unitlog) # the unit's log stays a file while it serves the mount (1.2.2
+    # removed it at once: the unit wrote into a deleted file)
+    loop 512
+    l=$LOOP
+    d=$(dir unitlog)
+    if sudo mount -t ReFS "$l" "$d" >/dev/null 2>&1 && mountpoint -q "$d"; then
+      pid=$(unit_pid "$d")
+      target=$(sudo readlink "/proc/$pid/fd/1" 2>&1)
+      if [[ -z $pid || $pid == 0 ]]; then
+        result fail unitlog "no refs process found for $d"
+      elif [[ $target == *"(deleted)"* ]] || ! sudo test -f "$target"; then
+        result fail unitlog "its log: $target"
+      else
+        result ok unitlog "$target"
+      fi
+    else
+      result fail unitlog "could not mount"
+    fi
+    umount_all ;;
+  reportmode) # a refused volume's report is readable by everyone, though
+    # refs runs with UMask=0077 (1.2.2 made its directory 0700): the sample
+    # with its superblock copies (the volume's last clusters but 2 and 3;
+    # the volume ends before its partition) read as zeros through
+    # device-mapper, suspect
+    loop 512
+    vsec=$(od -An -t u8 -j $((off + 24)) -N 8 "$sample" | tr -d ' ')
+    read -r bps spc < <(od -An -t u4 -j $((off + 32)) -N 8 "$sample")
+    cs=$((bps * spc / 512))
+    a=$(((vsec * bps / (bps * spc) - 3) * cs)) b=$((2 * cs))
+    total=$(sudo blockdev --getsz "$LOOP")
+    printf '0 %d linear %s 0\n%d %d zero\n%d %d linear %s %d\n' "$a" "$LOOP" "$a" "$b" $((a + b)) \
+      $((total - a - b)) "$LOOP" $((a + b)) | sudo dmsetup create mc-bad --readonly
+    l=/dev/mapper/mc-bad
+    reports=/run/storage-spaces/reports saved=
+    if sudo test -e "$reports"; then sudo mv "$reports" "$reports.mc-saved"; saved=1; fi
+    d=$(dir reportmode)
+    if out=$(sudo mount -t ReFS "$l" "$d" 2>&1); then
+      result fail reportmode "mounted a suspect volume"
+    else
+      modes=$(sudo stat -c %a /run/storage-spaces "$reports" 2>&1 | tr '\n' ' ')
+      files=$(sudo sh -c "stat -c %a $reports/*.txt $reports/*.json" 2>&1 | sort -u | tr '\n' ' ')
+      if [[ $modes == "755 755 " && $files == "644 " ]]; then
+        result ok reportmode "directories $modes, reports $files"
+      else
+        result fail reportmode "directories $modes, reports $files: ${out//$'\n'/ | }"
+      fi
+    fi
+    umount_all
+    sudo dmsetup remove --retry mc-bad
+    sudo rm -rf -- "${reports:?}"
+    if [[ -n $saved ]]; then sudo mv "$reports.mc-saved" "$reports"; fi ;;
   *) result fail "$c" "unknown case" ;;
   esac
 done

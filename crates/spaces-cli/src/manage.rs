@@ -425,9 +425,10 @@ fn is_blank(file: &File) -> Result<bool> {
     Ok(buf.iter().all(|&b| b == 0))
 }
 
-/// Prints the plan; carries it out only with `yes`. With the environment
-/// variable SPACES_STOP_AFTER_STEP=N (crash tests) only the first N steps
-/// are carried out, as a crash after them would leave the disks.
+/// Prints the plan; carries it out only with `yes`. Test builds (the
+/// feature test-hooks) carry out only the first N steps with the
+/// environment variable SPACES_STOP_AFTER_STEP=N, as a crash after them
+/// would leave the disks (tools/mgmt-crash.sh).
 fn run<M: storage_spaces::io::WriteAt, N: storage_spaces::io::WriteAt>(
     plan: &Plan,
     yes: bool,
@@ -439,6 +440,7 @@ fn run<M: storage_spaces::io::WriteAt, N: storage_spaces::io::WriteAt>(
         println!("nothing written (add --yes to carry the plan out)");
         return Ok(false);
     }
+    #[cfg(feature = "test-hooks")]
     if let Some(n) = std::env::var("SPACES_STOP_AFTER_STEP")
         .ok()
         .and_then(|v| v.parse().ok())

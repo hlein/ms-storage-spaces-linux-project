@@ -18,9 +18,11 @@
 #   (kinds: simple mirror parity thin recycled; default all)
 set -euo pipefail
 cd "$(dirname "$0")/.."
-# SPACES: the spaces binary to check (default target/release/spaces).
+# SPACES: the spaces binary to check (default target/release/spaces);
+# SPACES_PATTERN: the pattern writer (default spaces-pattern beside it).
 export SPACES=${SPACES:-$PWD/target/release/spaces}
 spaces=$SPACES
+pattern=${SPACES_PATTERN:-${spaces%/*}/spaces-pattern}
 export POOLS=/srv/spaces/work/lnxpools
 pattern_mib=256
 kinds=("$@")
@@ -41,11 +43,11 @@ make_pool() {
   "$spaces" pool create --name "ss-lnx_$kind" --yes "${disks[@]}" | tail -1
   if [[ $kind == recycled ]]; then
     "$spaces" space create --name old --resiliency simple --size 6G --yes "${disks[@]}" | tail -1
-    "$spaces" write-pattern "${disks[@]}" --space old --offset 0 --length $((6 << 30)) --tag old | tail -1
+    "$pattern" "${disks[@]}" --space old --offset 0 --length $((6 << 30)) --tag old | tail -1
     "$spaces" space delete --space old --yes "${disks[@]}" | tail -1
   fi
   "$spaces" space create --name "lnx_$kind" "${args[@]}" --yes "${disks[@]}" | tail -1
-  "$spaces" write-pattern "${disks[@]}" --space "lnx_$kind" --offset 0 --length $((pattern_mib << 20)) \
+  "$pattern" "${disks[@]}" --space "lnx_$kind" --offset 0 --length $((pattern_mib << 20)) \
     --tag "lnx_$kind" --destage | tail -1
   # Healthy after its first session (1.2.2 left the recycled one suspect).
   if ! "$spaces" check "${disks[@]}" >/dev/null; then

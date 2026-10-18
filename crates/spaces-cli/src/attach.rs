@@ -39,6 +39,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
+use storage_spaces::report::readable_dir;
 
 use anyhow::{Context, Result, bail};
 use storage_spaces::gpt::Partition;
@@ -265,13 +266,7 @@ fn load_states(dir: &Path) -> Result<Vec<State>> {
 /// and makes an existing one so. What it holds is not secret: which spaces
 /// are attached and how; the NBD sockets in it are 0600 themselves.
 fn ensure_state_dir() -> Result<()> {
-    ensure_readable_dir(Path::new(STATE_DIR)).with_context(|| format!("cannot make {STATE_DIR}"))
-}
-
-fn ensure_readable_dir(dir: &Path) -> std::io::Result<()> {
-    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
-    fs::DirBuilder::new().recursive(true).mode(0o755).create(dir)?;
-    fs::set_permissions(dir, fs::Permissions::from_mode(0o755))
+    readable_dir(Path::new(STATE_DIR)).with_context(|| format!("cannot make {STATE_DIR}"))
 }
 
 /// Writes `report` (on one space) as `<space guid>.txt` and `.json` into
@@ -282,17 +277,8 @@ pub fn write_report(report: &Report) -> Result<PathBuf> {
 }
 
 fn write_report_in(dir: &Path, report: &Report) -> Result<PathBuf> {
-    use std::os::unix::fs::PermissionsExt;
     let guid = &report.space.as_ref().context("a report on no space")?.1;
-    ensure_readable_dir(dir)?;
-    for (ext, text) in [("txt", report.to_text()), ("json", report.to_json())] {
-        let path = dir.join(format!("{guid}.{ext}"));
-        let tmp = dir.join(format!("{guid}.{ext}.tmp"));
-        fs::write(&tmp, text)?;
-        fs::set_permissions(&tmp, fs::Permissions::from_mode(0o644))?;
-        fs::rename(&tmp, &path)?;
-    }
-    Ok(dir.join(format!("{guid}.txt")))
+    Ok(storage_spaces::report::write_files(report, dir, guid)?)
 }
 
 /// Removes the report on space `guid`.
@@ -353,7 +339,7 @@ fn write_props(name: &str, state: &State, backend: bool) -> Result<()> {
 
 fn write_props_in(dir: &Path, name: &str, state: &State, backend: bool) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
-    ensure_readable_dir(dir)?;
+    readable_dir(dir)?;
     let path = dir.join(format!("{name}.props"));
     let tmp = dir.join(format!("{name}.props.tmp"));
     fs::write(&tmp, props_text(state, backend))?;
@@ -1542,10 +1528,10 @@ mod state_tests {
     #[test]
     fn the_state_directory_is_readable() {
         let dir = scratch("mode");
-        ensure_readable_dir(&dir).unwrap();
+        readable_dir(&dir).unwrap();
         assert_eq!(fs::metadata(&dir).unwrap().permissions().mode() & 0o777, 0o755);
         fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
-        ensure_readable_dir(&dir).unwrap();
+        readable_dir(&dir).unwrap();
         assert_eq!(fs::metadata(&dir).unwrap().permissions().mode() & 0o777, 0o755);
         fs::remove_dir_all(&dir).unwrap();
     }

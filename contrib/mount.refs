@@ -78,20 +78,32 @@ if [ $allow_other = 1 ]; then set -- "$@" --allow-other; fi
 # (ProtectSystem and the like would hide the mount in a private namespace,
 # and since systemd 254 PrivateNetwork implies one unless PrivateMounts=no:
 # the mount would be made where the host never sees it.)
+#
+# A root that has systemd and cannot start the unit (systemd-run failing)
+# mounts nothing: 1.2.2 fell back to an unsandboxed refs then. The unit's
+# name is its own (pid and time), and its log stays in /run/refs-mount
+# while it serves the mount (1.2.2 removed it at once: the unit wrote on
+# into a deleted file).
 work=$(mktemp -d)
 log=$work/log
 status=$work/status
 unit=
-if [ "$(id -u)" = 0 ] && [ -d /run/systemd/system ] && command -v systemd-run >/dev/null 2>&1; then
-  unit=refs-mount-$$
-  if ! systemd-run --quiet --collect --unit="$unit" \
+if [ "$(id -u)" = 0 ] && [ -d /run/systemd/system ]; then
+  unit=refs-mount-$$-$(date +%s%N)
+  logs=/run/refs-mount
+  mkdir -p "$logs"
+  log=$logs/$unit.log
+  if ! command -v systemd-run >/dev/null 2>&1 || ! err=$(systemd-run --quiet --collect --unit="$unit" \
     -p NoNewPrivileges=yes -p PrivateNetwork=yes -p PrivateMounts=no -p RestrictNamespaces=yes \
     -p RestrictRealtime=yes -p RestrictSUIDSGID=yes -p LockPersonality=yes \
     -p MemoryDenyWriteExecute=yes -p SystemCallArchitectures=native -p UMask=0077 \
     -p "CapabilityBoundingSet=CAP_SYS_ADMIN CAP_DAC_OVERRIDE CAP_DAC_READ_SEARCH CAP_CHOWN CAP_FOWNER CAP_SETUID CAP_SETGID" \
     -p "StandardOutput=file:$log" -p "StandardError=file:$log" \
-    -- "$refs" mount --status-file "$status" "$@" "$source" "$dir"; then
-    unit=
+    -- "$refs" mount --status-file "$status" "$@" "$source" "$dir" 2>&1); then
+    echo "mount.refs: refs cannot be started in its sandbox (systemd-run: ${err:-not found}); not mounting it without one" >&2
+    rm -rf "$work"
+    rm -f "$log"
+    exit 32
   fi
 fi
 if [ -z "$unit" ]; then
@@ -114,6 +126,7 @@ while :; do
   case $(field state) in
     mounted)
       if mountpoint -q "$dir"; then
+        # (The unit's log stays: it writes on into it.)
         rm -rf "$work"
         exit 0
       fi
@@ -141,6 +154,7 @@ done
 cat "$log" >&2
 if [ -n "$unit" ]; then
   systemctl stop "$unit" 2>/dev/null || true
+  rm -f "$log"
 else
   kill "$pid" 2>/dev/null || true
 fi

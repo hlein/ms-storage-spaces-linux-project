@@ -295,7 +295,12 @@ pub fn quick_checks_in<D: ReadAt + ?Sized>(
     checks.push(if v1 {
         Check::skipped("fs.refs.log", format!("{label}: the log of ReFS 1.x is not read"))
     } else {
-        match log_state(dev, offset, unit, size, current.n, &[]) {
+        // Where the volume opens, its container table tells where the log
+        // may be ([`log_state`]): 1.2.2 tried two starts seen only.
+        let containers = crate::Volume::open(dev, offset)
+            .map(|v| v.container_pages())
+            .unwrap_or_default();
+        match log_state(dev, offset, unit, size, current.n, &containers) {
             Ok(log) if log.needs_replay() => {
                 let newest = log.newest.unwrap();
                 Check::new(
@@ -341,9 +346,6 @@ pub fn quick_checks_in<D: ReadAt + ?Sized>(
                 ),
             )
             .truth(Truth::CrossCheck),
-            Err(_) if boot.major == 3 && boot.minor == 1 => {
-                Check::skipped("fs.refs.log", format!("{label}: the log of ReFS 3.1 is not read"))
-            }
             Err(crate::Error::NotFound(e)) => {
                 // Records written since the volume was made move the low
                 // half of the checkpoint's log sequence number on.

@@ -610,22 +610,29 @@ impl<D: ReadAt> Volume<D> {
         if self.v1 {
             return Err(Error::Unsupported("the log of ReFS 1.x".into()));
         }
-        // The log starts with container 7.
-        let start: Vec<u64> = self
-            .containers
-            .get(&7)
-            .and_then(|&c| c.checked_mul(self.cluster))
-            .map(|b| b / 4096)
-            .into_iter()
-            .collect();
         log_state(
             &self.dev,
             self.offset,
             self.cluster,
             self.boot.volume_size(),
             self.checkpoint.lcn,
-            &start,
+            &self.container_pages(),
         )
+    }
+
+    /// Where the containers start, in 4 KiB pages from the volume's start,
+    /// in order: the log's region begins at one of them and its control
+    /// page, where not among the first clusters, at the first cluster of
+    /// the one after the region ([`log_state`]).
+    pub(crate) fn container_pages(&self) -> Vec<u64> {
+        let mut pages: Vec<u64> = self
+            .containers
+            .values()
+            .filter_map(|&c| c.checked_mul(self.cluster))
+            .map(|b| b / 4096)
+            .collect();
+        pages.sort_unstable();
+        pages
     }
 
     /// Reads `count` clusters from physical cluster `lcn`.
@@ -1058,12 +1065,17 @@ impl<D: ReadAt> Volume<D> {
 }
 
 /// Where the log's region began on the volumes seen so far, in 4 KiB
-/// pages: the first cluster of container 7, where the log starts (a volume
-/// passes its own, [`Volume::log_state`]).
+/// pages, tried where the container table is not at hand: the first
+/// cluster of a container (7 on ReFS 3.7 and 3.14, 6 on 3.4, 10 on 3.1 of
+/// 4 KiB clusters and 13 of 64 KiB), see [`log_state`].
 pub(crate) const LOG_STARTS: [u64; 2] = [0x24000, 0x8000];
-/// The sizes of the log's region seen so far, in 4 KiB pages (512 MiB; 1 GiB
-/// on volumes of several TiB), and the next larger.
-const LOG_SIZES: [u64; 3] = [0x20000, 0x40000, 0x80000];
+/// The sizes of the log's region seen so far, in 4 KiB pages (256 MiB on
+/// ReFS 3.1; 512 MiB; 1 GiB on volumes of several TiB), and the next larger.
+const LOG_SIZES: [u64; 4] = [0x10000, 0x20000, 0x40000, 0x80000];
+/// The containers whose first clusters are read for the log's control
+/// page, the first in physical order: the log is made with the volume,
+/// among its first containers (in the 13th on every sample).
+const LOG_CONTAINERS: usize = 64;
 /// Pages read at a time from the checkpoint's position in the log on.
 const LOG_WINDOW: u64 = 16;
 /// Pages looked back from the checkpoint's position for the record before
@@ -1076,18 +1088,24 @@ const LOG_WHOLE_READ: u64 = 2 << 30;
 
 /// The log's state of the ReFS 3.x volume at byte `offset` of `dev`
 /// (clusters of `cluster` bytes, `volume_size` bytes) whose current
-/// checkpoint is at physical cluster `checkpoint_lcn`, its log's region
-/// starting at one of the 4 KiB pages `starts` or as on the volumes seen
-/// so far: see [`Volume::log_state`].
+/// checkpoint is at physical cluster `checkpoint_lcn`: see
+/// [`Volume::log_state`]. Its control page is among the volume's first
+/// clusters (ReFS 3.7 and 3.14 plain volumes), or right after the log's
+/// region, at the first cluster of a container: of those whose first
+/// pages are `containers` (in physical order, [`Volume::container_pages`];
+/// none where the table is not at hand), else after a region of a size
+/// seen from a start seen ([`LOG_STARTS`]). Until 1.3 only the start of
+/// container 7 was tried besides those (ReFS 3.4 starts its log at
+/// container 6), and no region of 256 MiB (ReFS 3.1).
 pub(crate) fn log_state<D: ReadAt + ?Sized>(
     dev: &D,
     offset: u64,
     cluster: u64,
     volume_size: u64,
     checkpoint_lcn: u64,
-    starts: &[u64],
+    containers: &[u64],
 ) -> Result<LogState> {
-    read_log(dev, offset, cluster, volume_size, checkpoint_lcn, starts, false)
+    read_log(dev, offset, cluster, volume_size, checkpoint_lcn, containers, false)
 }
 
 /// [`log_state`], reading the whole region with `full` (the tests compare).
@@ -1097,7 +1115,7 @@ fn read_log<D: ReadAt + ?Sized>(
     cluster: u64,
     volume_size: u64,
     checkpoint_lcn: u64,
-    starts: &[u64],
+    containers: &[u64],
     full: bool,
 ) -> Result<LogState> {
     const PAGE: u64 = 4096;
@@ -1146,8 +1164,30 @@ fn read_log<D: ReadAt + ?Sized>(
         }
         lcn += n;
     }
+    // The first cluster of each of the first containers: a control page
+    // there that names a region ending where it is.
+    for &page in containers.iter().take(LOG_CONTAINERS) {
+        if !copies.is_empty() {
+            break;
+        }
+        let len = 2 * cluster.max(PAGE);
+        let Some(at) = page
+            .checked_mul(PAGE)
+            .filter(|a| a.checked_add(len).is_some_and(|e| e <= volume_size))
+        else {
+            continue;
+        };
+        let Ok(pages) = read(at, len) else {
+            continue;
+        };
+        for (i, c) in (0..).zip(pages.chunks_exact(cluster.max(PAGE) as usize)) {
+            if is_control(c) && le64(c, 0xb8) < le64(c, 0xc0) && le64(c, 0xc0) == page {
+                copies.push((page + i * cluster.max(PAGE) / PAGE, c[..PAGE as usize].to_vec()));
+            }
+        }
+    }
     let mut tried = Vec::new();
-    for &start in starts.iter().chain(&LOG_STARTS) {
+    for &start in &LOG_STARTS {
         if !copies.is_empty() || tried.contains(&start) {
             continue;
         }
@@ -1178,8 +1218,9 @@ fn read_log<D: ReadAt + ?Sized>(
     let Some((control_page, control)) = copies.into_iter().max_by_key(|(_, c)| le64(c, 0xb0)) else {
         let tried: Vec<String> = tried.iter().map(|p| format!("{p:#x}")).collect();
         return Err(Error::NotFound(format!(
-            "no log control page among the first {first:#x} clusters nor after a log of 512 MiB to 2 GiB \
-             from page {}",
+            "no log control page among the first {first:#x} clusters, at the first cluster of {} containers, \
+             nor after a log of 256 MiB to 2 GiB from page {}",
+            containers.len().min(LOG_CONTAINERS),
             tried.join(" or ")
         )));
     };
@@ -1526,7 +1567,7 @@ mod log_tests {
         let e = read_log(&v, 0, 4096, SIZE, CHECKPOINT_LCN, &[0x10000], false)
             .unwrap_err()
             .to_string();
-        for part in ["first 0x400 clusters", "0x10000 or 0x24000 or 0x8000"] {
+        for part in ["first 0x400 clusters", "of 1 containers", "0x24000 or 0x8000"] {
             assert!(e.contains(part), "{e}");
         }
     }
@@ -1572,12 +1613,7 @@ mod log_tests {
             if vol.v1 {
                 continue;
             }
-            let start: Vec<u64> = vol
-                .containers
-                .get(&7)
-                .map(|&c| c * vol.cluster / 4096)
-                .into_iter()
-                .collect();
+            let start = vol.container_pages();
             let args = (offset as u64, vol.cluster, vol.boot.volume_size(), vol.checkpoint.lcn);
             let full = read_log(&file, args.0, args.1, args.2, args.3, &start, true);
             let counted = Pages {

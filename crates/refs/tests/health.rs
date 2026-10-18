@@ -94,7 +94,8 @@ fn corpus_volumes_pass_as_windows_left_them() {
         let version = m["refs_version"].as_str().unwrap();
         let expected = if LOG_PAST_THE_CHECKPOINT.contains(&name.as_str()) {
             Status::Suspect
-        } else if version.starts_with("1.") || version == "3.1" {
+        } else if version.starts_with("1.") {
+            // (ReFS 3.1's log is read since 1.3: 1.2.2 skipped it.)
             Status::Skipped
         } else {
             Status::Ok
@@ -652,4 +653,69 @@ fn a_volume_windows_grew_passes_its_checks() {
         (m["extended_mb"].as_u64(), m["volume_size"].as_u64()),
         (Some(1024), Some(55_767_465_984))
     );
+}
+
+/// ReFS 3.1's log is checked (`r31presmall`, Windows Server 2016): its
+/// control page sits after a region of 256 MiB (pages 0x24000..0x34000).
+/// 1.2.2 skipped "the log of ReFS 3.1", which it did not find.
+#[test]
+fn the_log_of_refs_3_1_is_checked() {
+    let (image, offset) = fixture("r31presmall");
+    let checks = checks(&image, offset);
+    let log = status(&checks, "fs.refs.log");
+    assert_eq!(log.status, Status::Ok, "{log:#?}");
+    let v = refs::Volume::open(&image, offset).unwrap();
+    let state = v.log_state().unwrap();
+    assert_eq!((state.region, state.control_page), ((0x24000, 0x34000), 0x34000));
+}
+
+/// A log that is not where the volumes seen so far keep it: on a ReFS 3.4
+/// volume (`r34small`) the log's region (pages 0x24000..0x44000, from
+/// container 6) and its control pages are moved to containers 30 to 38
+/// (pages 0x68000..0x88000, the control pages at 0x88000, where the volume
+/// keeps nothing), their region rewritten. The first clusters of the containers find it, in the quick
+/// checks and in `Volume::log_state`. 1.2.2 tried pages 0x24000 and
+/// 0x8000 and the start of container 7 (3.4 starts its log at container
+/// 6), and found no log (audit 2026-10-16, M11).
+#[test]
+fn a_log_away_from_the_starts_seen_is_found_by_the_container_table() {
+    let (mut image, offset) = fixture("r34small");
+    let (from, to, len) = (0x24000u64, 0x68000u64, 0x20002u64);
+    let page = |p: u64| offset + p * 4096;
+    // Nothing of the volume is where the log goes.
+    assert!(
+        image
+            .ranges()
+            .iter()
+            .all(|&(at, n)| at + n as u64 <= page(to) || at >= page(to + len))
+    );
+    let moved: Vec<(u64, Vec<u8>)> = image
+        .ranges()
+        .iter()
+        .filter(|&&(at, n)| at < page(from + len) && at + n as u64 > page(from))
+        .flat_map(|&(at, n)| {
+            let lo = at.max(page(from));
+            let hi = (at + n as u64).min(page(from + len));
+            (lo..hi)
+                .step_by(4096)
+                .map(|p| (p, read(&image, p, 4096)))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    assert!(moved.len() > 10, "{} pages of the log", moved.len());
+    for (at, bytes) in &moved {
+        image.insert(*at, &vec![0u8; 4096]);
+        let mut bytes = bytes.clone();
+        if &bytes[0..4] == b"MLog" && le64(&bytes, 0x28) == 0 {
+            bytes[0xb8..0xc0].copy_from_slice(&to.to_le_bytes());
+            bytes[0xc0..0xc8].copy_from_slice(&(to + 0x20000).to_le_bytes());
+        }
+        image.insert(at - page(from) + page(to), &bytes);
+    }
+    let checks = checks(&image, offset);
+    let log = status(&checks, "fs.refs.log");
+    assert_eq!(log.status, Status::Ok, "{log:#?}");
+    let state = refs::Volume::open(&image, offset).unwrap().log_state().unwrap();
+    assert_eq!((state.region, state.control_page), ((to, to + 0x20000), to + 0x20000));
+    assert!(!state.needs_replay());
 }

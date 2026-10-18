@@ -611,6 +611,10 @@ Server 2012 R2 made before and after its updates, `r12*`, read and mounted
 with every file and named stream as Windows listed it, damaged data of an
 integrity stream refused, `refs check` clean; fixtures in CI).
 
+The log of ReFS 1.x is not read (a limitation, not decoded): the guard's
+`fs.refs.log` is skipped on it, so a 1.x volume Windows did not dismount
+reads as its checkpoint, older than what Windows shows, without notice.
+
 ## Writing (Track B4)
 
 `refs::write` commits the way described below (`refs set`, `overwrite`,
@@ -974,19 +978,30 @@ past the checkpoint (every volume `New-RefsVolume.ps1` made before it
 took the disk offline first had some); taking the disk offline makes
 ReFS write a checkpoint that covers the log (**verified**).
 
-* The log's region starts at the first cluster of container 7 (the
-  row's physical cluster): 4 KiB page 0x24000 on every corpus volume,
-  0x8000 on volumes a user's Windows made (a plain one of some hundred
-  GiB, two of several TiB in a space). It is 512 MiB, or 1 GiB on the
-  volumes of several TiB; where the size changes is not known.
+* The log's region starts at the first cluster of a container: 4 KiB
+  page 0x24000 on every corpus volume, 0x8000 on volumes a user's Windows
+  made (a plain one of some hundred GiB, two of several TiB in a space).
+  Which container differs: 7 on ReFS 3.7 and 3.14, 6 on 3.4, 10 on 3.1
+  of 4 KiB clusters and 13 of 64 KiB (**verified** on the corpus). It is
+  512 MiB, 256 MiB on ReFS 3.1, or 1 GiB on the volumes of several TiB;
+  where the size changes is not known.
 * The control page ("MLog", the volume signature at 4, zero at 0x28) is
   kept twice, in two clusters one after the other: among the volume's
   first clusters (cluster 0x30 on 4 KiB, 0x27 on 64 KiB clusters: 3.7 and
   3.14 plain corpus volumes, and the user's plain one) or right after the
-  log's region (3.4 plain corpus volumes, every volume inside a space so
-  far: page 0x44000, or 0x48000 after a log of 1 GiB). Nothing found so
-  far points at it; the region it names confirms a candidate after a
-  region. It gives the log's epoch (0x20) and its region, from 0xb8 to
+  log's region, at the first cluster of the container after it (3.1 and
+  3.4 plain corpus volumes, every volume inside a space so far: page
+  0x34000 after a log of 256 MiB, 0x44000 after one of 512 MiB, 0x48000
+  after one of 1 GiB). Nothing found so far points at it; the region it
+  names confirms a candidate. `refs` looks among the first clusters, then
+  at the first cluster of each of the 64 containers that come first in
+  the container table (where the volume opens: the guard's quick checks
+  open it for that), then after regions of the sizes seen from the starts
+  seen. Until 1.3 it tried the start of container 7 and the two starts
+  only, and no region of 256 MiB: ReFS 3.1's log was not found (the guard
+  skipped it), nor one of 3.4 away from page 0x24000 (test
+  `a_log_away_from_the_starts_seen_is_found_by_the_container_table`, a
+  sample's log moved to containers 30 to 38). It gives the log's epoch (0x20) and its region, from 0xb8 to
   0xc0 in 4 KiB pages. The copies are written in turn: the newer counts
   higher at 0xb0 (and 0xf4); 0x80 differs too, and on a volume with
   records past the checkpoint so does 0xc8, the checkpoint's LSN as of

@@ -522,8 +522,8 @@ volume in a space attached with `--degraded` or `--force` mounts only with
 * `fs.refs.boot`, `fs.refs.superblock`, `fs.refs.checkpoint`,
   `fs.refs.log`: the ReFS boot sector (the volume fits its partition), the
   superblock and its two copies, both checkpoints, and that the log holds
-  nothing newer than the checkpoint (ReFS 1.x and 3.1 keep logs `refs`
-  does not read). A log whose control page is not found is suspect when
+  nothing newer than the checkpoint (ReFS 1.x keeps a log `refs` does not
+  read; 3.1's is read since 1.3). A log whose control page is not found is suspect when
   the checkpoint shows records written to it (whether Windows would
   replay some is not known), a warning when it shows none.
 * `fs`: a partition of neither file system (skipped: not checked).

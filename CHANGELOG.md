@@ -219,6 +219,12 @@
   (copy 1 then, pool `replacedpar`) could not be read with a disk missing,
   nor written: columns are taken at their current copy, whatever its
   number (audit 2026-10-16, S9 and M13).
+* ReFS 3.1's log was not checked (the guard skipped it; its region of
+  256 MiB was not among the sizes tried), and a log away from the two
+  starts seen and from container 7 was not found (ReFS 3.4 starts its log
+  at container 6): the control page is also looked for at the first
+  cluster of the first 64 containers of the container table, by `refs`
+  and by the guard's quick checks (audit 2026-10-16, M11).
 
 ### Testing
 

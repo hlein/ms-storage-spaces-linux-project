@@ -316,7 +316,9 @@ Experimental; only with
 .B create
 Create a file with the content of
 .I local-file
-(empty without), up to 64 GiB, named in printable ASCII,
+(empty without), up to 64 GiB, named in printable ASCII (not ending in
+a dot or a space, and no device name such as CON or COM1, also before an
+extension: Windows programs could not open such a file),
 read from it piece by piece. It takes the
 permissions of the files beside it. Experimental; only with
 .BR \-\-yes .

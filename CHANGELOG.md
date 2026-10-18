@@ -251,6 +251,23 @@
   `spaces serve-nbd` was made 0600 after `bind`, which listens at once: it
   is bound in a directory of its own and moved into place once it is 0600
   (audit 2026-10-16, Low "spaces CLI").
+* The ReFS writer ordered and compared names by Unicode's upper case;
+  Windows orders a directory's names by the volume's upcase table
+  (objects 0x7 and 0x8), which differs at 424 units (pool-less sample
+  `r314fold`, made by Windows 11): a new name in a directory of non-ASCII
+  names could go where Windows does not look for it. The table decides
+  now, and `refs check` finds names out of its order. `refs check` also
+  reads the table's pages, which it had left out and counted among the
+  clusters nothing references (68 on a new volume, not 156).
+* The ReFS writer made names Windows programs cannot open: ending in a
+  dot or a space, or a device name (`CON`, `con.txt`, `COM1.log`); they are
+  refused. A parent path in another case than its directory's name
+  failed after the work ("row in table Object(1536)"). Writing, renaming,
+  moving and linking a file now set its archive attribute, as on Windows.
+  A cluster a file maps at two places lost one reference when the file
+  went and stayed allocated with a count of 0: a file's clusters are let
+  go of once per reference, as clones count them (audit 2026-10-16, Low
+  "ReFS writer").
 
 ### Testing
 
@@ -267,7 +284,11 @@
   of each; and ReFS volumes Windows grew (`r314extend`, left with a log
   record past its checkpoint, and `r314extendc`, the copy Windows replayed
   and took offline cleanly, also a fixture; `New-RefsVolume.ps1
-  -ExtendMB`).
+  -ExtendMB`), and `r314fold` (`-Scenario casefold`: names Windows' upcase
+  table and Unicode's upper case order differently, names folded to them,
+  reserved names and names with a last dot or space, what Windows made of
+  each in its manifest; also a fixture). The ReFS fixtures carry the
+  upcase table's pages.
 
 * `tools/refs-mount-check.sh --rw IMAGE` checks what writing through `refs
   mount --rw` does (the hold, listings while names go, open files whose name

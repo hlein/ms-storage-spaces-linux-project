@@ -876,7 +876,15 @@ file (up to 1 KiB kept in its record; larger ones in clusters near the
 data of the files around it, read from the local file piece by piece,
 up to 64 GiB) with a printable ASCII name, in a directory
 of any size (its pages split as it grows and merge as it shrinks); it
-takes the permissions of the files beside it. `refs rename` renames a
+takes the permissions of the files beside it. Names Windows programs
+could not open are refused: a name ending in a dot or a space, and the
+device names (CON, PRN, AUX, NUL, COM0 to COM9 and LPT0 to LPT9, also
+before an extension, as in `con.txt`). Names are ordered and compared as
+the volume's upcase table says, as Windows does (1.2.2 took Unicode's
+upper case, and a new name in a directory of non-ASCII names could go
+where Windows does not look for it); a path may name its directories in
+any case. Writing a file, a named stream, renaming, moving or linking it
+sets its archive attribute, as on Windows. `refs rename` renames a
 file or directory within its directory and `refs delete` deletes a file
 (for a hard-linked file: the one name; also symbolic links, junctions
 and files with stream snapshots) or an empty directory; deleting a

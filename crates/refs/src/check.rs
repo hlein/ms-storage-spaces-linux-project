@@ -87,6 +87,8 @@ struct Table {
     rows: u64,
     descriptor: Option<(u64, u64)>,
     last_key: Option<Vec<u8>>,
+    /// A directory's last name (upcased), from the leaf walked last.
+    last_name: Option<Vec<u16>>,
     broken: bool,
 }
 
@@ -149,7 +151,7 @@ fn subtract(a: &[(u64, u64)], b: &[(u64, u64)]) -> Vec<(u64, u64)> {
 /// place, past the last place): the places of each shift joined, so that
 /// views of a stream mapping a cluster at one place (a snapshot and the
 /// live data) give it one reference.
-fn references(mut placed: Vec<(u64, u64, u64)>) -> Vec<(u64, u64, u64)> {
+pub(crate) fn references(mut placed: Vec<(u64, u64, u64)>) -> Vec<(u64, u64, u64)> {
     placed.sort_unstable();
     let mut out: Vec<(u64, u64, u64)> = Vec::with_capacity(placed.len());
     for (shift, from, to) in placed {
@@ -519,8 +521,7 @@ impl<D: ReadAt> Volume<D> {
             todo.push((r.clone(), physical, allocator, format!("root {i}"), None));
         }
         for oid in self.object_ids().collect::<Vec<_>>() {
-            // Objects 7 and 8 name the container tables' physical clusters.
-            if oid != 7 && oid != 8 && !skip.contains(&oid) {
+            if !skip.contains(&oid) {
                 todo.push((
                     self.object(oid)?.clone(),
                     false,
@@ -534,6 +535,15 @@ impl<D: ReadAt> Volume<D> {
         // make the walk read it as often, or forever. Children come off the
         // stack in key order, a table's pages one after the other.
         let mut seen = std::collections::HashSet::new();
+        // Directories (objects from the root directory on) keep their
+        // names in the order of the upcase table, where Windows looks for
+        // them (`Volume::upcase`; none to compare by on ReFS 1.x).
+        let up = if self.v1 { None } else { Some(self.upcase()?) };
+        let directory = |what: &str| {
+            what.strip_prefix("object 0x")
+                .and_then(|h| u64::from_str_radix(h, 16).ok())
+                .is_some_and(|oid| oid >= crate::volume::ROOT_DIRECTORY)
+        };
         while let Some((r, physical, allocator, what, parent)) = todo.pop() {
             let table = tables.entry(what.clone()).or_default();
             if !seen.insert((physical, r.lcns[0])) {
@@ -603,6 +613,27 @@ impl<D: ReadAt> Volume<D> {
                 table.rows += keys.len() as u64;
                 if let Some(k) = keys.last() {
                     table.last_key = Some(k.to_vec());
+                }
+                if let Some(up) = up.as_deref().filter(|_| directory(&what)) {
+                    let names = keys.iter().filter(|k| k.len() > 4 && le16(k, 0) == 0x30).map(|k| {
+                        let units: Vec<u16> = k[4..]
+                            .as_chunks::<2>()
+                            .0
+                            .iter()
+                            .map(|c| up[u16::from_le_bytes(*c) as usize])
+                            .collect();
+                        (units, *k)
+                    });
+                    for (name, key) in names {
+                        if table.last_name.as_ref().is_some_and(|last| *last > name) {
+                            report.problem(format!(
+                                "{what}: page {:#x}: the name {:?} out of the upcase table's order",
+                                r.lcns[0],
+                                utf16(&key[4..])
+                            ));
+                        }
+                        table.last_name = Some(name);
+                    }
                 }
             }
             let depth = match parent {

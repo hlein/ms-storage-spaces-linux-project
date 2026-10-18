@@ -2851,3 +2851,58 @@ fn a_commit_reads_no_table_it_left_alone() {
         .collect();
     assert!(read.is_empty(), "container table clusters read: {read:x?}");
 }
+
+/// The names of directory `path`, upcased by the volume's upcase table
+/// (object 0x7: from row 2 on its units), in the order of its rows.
+fn upcased_names<D: ReadAt>(vol: &Volume<D>, path: &str) -> Vec<(String, Vec<u16>)> {
+    let mut table = vol.object_rows(7).unwrap();
+    table.sort_by_key(|(k, _)| u32::from_le_bytes(k[..4].try_into().unwrap()));
+    let bytes: Vec<u8> = table
+        .iter()
+        .filter(|(k, _)| u32::from_le_bytes(k[..4].try_into().unwrap()) >= 2)
+        .flat_map(|(_, v)| v.clone())
+        .collect();
+    let up: Vec<u16> = bytes.chunks(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+    assert_eq!(up.len(), 0x10000);
+    vol.object_rows(vol_dir(vol, path))
+        .unwrap()
+        .into_iter()
+        .filter(|(k, _)| k.len() > 4 && u16::from_le_bytes([k[0], k[1]]) == 0x30)
+        .map(|(k, _)| {
+            let units: Vec<u16> = k[4..].chunks(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+            (
+                String::from_utf16_lossy(&units),
+                units.iter().map(|&u| up[u as usize]).collect(),
+            )
+        })
+        .collect()
+}
+
+/// Windows orders a directory's names by the volume's upcase table
+/// (`r314fold`, Windows 11 build 26340: fold\ holds names that table and
+/// Unicode's upper case order differently, in the table's order), and
+/// looks names up in that order. A name refs makes goes where the table
+/// puts it: with S, µ, ÿ and Ā gone, K.txt goes before ıa.txt (1.2.2
+/// compared by Unicode's upper case, IA before K, and put it after).
+#[test]
+fn new_names_go_where_the_upcase_table_puts_them() {
+    let (image, manifest, _) = load("r314fold");
+    let disk = Overlay::new(image);
+    let mut vol = Volume::open(&disk, manifest["partition_offset"].as_u64().unwrap()).unwrap();
+    let now = 135_900_000_000_000_000;
+    let in_order = |names: &[(String, Vec<u16>)]| names.windows(2).all(|w| w[0].1 < w[1].1);
+    assert!(in_order(&upcased_names(&vol, "/fold")));
+    for name in ["S.txt", "\u{b5}.txt", "\u{ff}.txt", "\u{100}.txt"] {
+        vol.delete_file(&format!("/fold/{name}"), now).unwrap();
+    }
+    for name in ["K.txt", "T.txt", "IB.txt"] {
+        vol.create_file(&format!("/fold/{name}"), b"new", now).unwrap();
+    }
+    let names = upcased_names(&vol, "/fold");
+    let shown: Vec<&str> = names.iter().map(|n| n.0.as_str()).collect();
+    assert!(in_order(&names), "{shown:?}");
+    for name in ["K.txt", "t.TXT", "\u{131}a.txt", "\u{17f}.txt"] {
+        assert!(vol.lookup(&format!("/fold/{name}")).is_ok(), "{name}");
+    }
+    assert_eq!(vol.check(&[]).unwrap().problems, Vec::<String>::new());
+}

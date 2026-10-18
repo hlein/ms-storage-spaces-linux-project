@@ -23,6 +23,8 @@ pub const ROOT_CONTAINERS_COPY: usize = 8;
 pub const ROOT_CONTAINER_INDEX: usize = 10;
 /// Object ids.
 pub const ROOT_DIRECTORY: u64 = 0x600;
+/// Windows' upcase table ("Upcase Table"; 0x8 its copy).
+pub const UPCASE_TABLE: u64 = 0x7;
 /// Deepest tree walked (real trees have a few levels).
 pub(crate) const MAX_DEPTH: usize = 16;
 /// The most clusters a container may have: Windows makes containers of 64
@@ -75,6 +77,8 @@ pub struct Volume<D> {
     pub(crate) container_classes: BTreeMap<u64, u32>,
     /// The log's state, read once (commits by `refs` leave the log alone).
     log: std::sync::OnceLock<LogState>,
+    /// The upcase table (`Volume::upcase`), read when first asked for.
+    upcase: std::sync::OnceLock<std::sync::Arc<[u16]>>,
     objects: BTreeMap<u64, PageRef>,
     /// The clock of the first checkpoint `refs` wrote through this value
     /// (0: none yet).
@@ -190,6 +194,7 @@ impl<D: ReadAt> Volume<D> {
             objects: BTreeMap::new(),
             checkpoint_lcns: Vec::new(),
             log: std::sync::OnceLock::new(),
+            upcase: std::sync::OnceLock::new(),
             own_since: std::sync::atomic::AtomicU64::new(0),
             compacted: BTreeMap::new(),
             units: std::sync::Mutex::new(Vec::new()),
@@ -1027,6 +1032,43 @@ impl<D: ReadAt> Volume<D> {
             Ok(())
         })?;
         Ok(free)
+    }
+
+    /// Windows' upcase table of the volume (object 0x7): what Windows
+    /// orders a directory's names by and takes names for the same by
+    /// (`r314fold`: its names in that order and not in Unicode's upper
+    /// case; names the table folds together refused as existing, names
+    /// Unicode's upper case folds and the table does not made). Rows keyed
+    /// by a u32: 0 the table's name, 1 its units (0x10000), from 2 on the
+    /// units (UTF-16LE) cut into rows of about 341 bytes. The same on every
+    /// 3.x volume of the corpus, from Windows Server 2016 to Windows 11.
+    pub fn upcase(&self) -> Result<std::sync::Arc<[u16]>> {
+        if let Some(t) = self.upcase.get() {
+            return Ok(t.clone());
+        }
+        let mut rows = self.object_rows(UPCASE_TABLE)?;
+        rows.sort_by_key(|(k, _)| k.get(..4).map(|_| le32(k, 0)));
+        let count = rows
+            .iter()
+            .find(|(k, v)| k.len() >= 4 && le32(k, 0) == 1 && v.len() >= 4);
+        let bytes: Vec<u8> = rows
+            .iter()
+            .filter(|(k, _)| k.len() >= 4 && le32(k, 0) >= 2)
+            .flat_map(|(_, v)| v.iter().copied())
+            .collect();
+        if count.map(|(_, v)| le32(v, 0)) != Some(0x10000) || bytes.len() != 0x20000 {
+            return Err(format_err!(
+                "the upcase table (object {UPCASE_TABLE:#x}) holds {} bytes, not 0x10000 units",
+                bytes.len()
+            ));
+        }
+        let table: std::sync::Arc<[u16]> = bytes
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|c| u16::from_le_bytes(*c))
+            .collect();
+        Ok(self.upcase.get_or_init(|| table).clone())
     }
 
     pub fn object_rows(&self, oid: u64) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {

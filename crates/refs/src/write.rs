@@ -630,7 +630,8 @@ impl<'v, D: WriteAt> Transaction<'v, D> {
                     .map(|(&(c, _), _)| (c, 1)),
             );
         }
-        self.release_runs(ROOT_MEDIUM_ALLOCATOR, &free)
+        // A cluster the table does not count is referenced once.
+        self.release_runs(ROOT_MEDIUM_ALLOCATOR, &merged(&free))
     }
 
     /// Lets go of a file's clusters in compacted (compressed) containers
@@ -2197,6 +2198,7 @@ impl<D: WriteAt> Volume<D> {
             }
             v[0x30..0x38].copy_from_slice(&now.to_le_bytes());
             v[0x38..0x40].copy_from_slice(&now.to_le_bytes());
+            archive(v);
         })
     }
 
@@ -2211,9 +2213,10 @@ impl<D: WriteAt> Volume<D> {
     /// Creates a file as `create_file` does, its data read from `data` run
     /// by run.
     pub fn create_file_from(&mut self, path: &str, data: &dyn Source, now: u64) -> Result<()> {
+        let up = self.upcase()?;
         let trimmed = path.trim_end_matches('/');
         let (parent, name) = trimmed.rsplit_once('/').unwrap_or(("", trimmed));
-        check_name(name)?;
+        check_file_name(name)?;
         if data.len() > MAX_CREATED {
             return Err(Error::Unsupported(format!("files of more than {MAX_CREATED} bytes")));
         }
@@ -2261,14 +2264,16 @@ impl<D: WriteAt> Volume<D> {
             let utf16: Vec<u8> = name.encode_utf16().flat_map(|c| c.to_le_bytes()).collect();
             // The file id row.
             let (key, value) = file_id_row(next_id, &utf16);
-            tx.insert_sorted(Tree::Object(dir), &row(&key, &value, 0), &directory_key_order)?;
+            tx.insert_sorted(Tree::Object(dir), &row(&key, &value, 0), &|a: &[u8], b: &[u8]| {
+                directory_key_order(&up, a, b)
+            })?;
             // The name row with the record.
             let mut key = vec![ROW_NAME as u8, 0, 1, 0];
             key.extend(&utf16);
             tx.insert_sorted(
                 Tree::Object(dir),
                 &row(&key, &record, ROW_EMBEDS_NODE),
-                &directory_key_order,
+                &|a: &[u8], b: &[u8]| directory_key_order(&up, a, b),
             )?;
             self.touch_directory(&mut tx, parent, dir, now)?;
             tx.commit()
@@ -2775,6 +2780,7 @@ impl<D: WriteAt> Volume<D> {
             for at in [0x30, 0x38] {
                 record[at..at + 8].copy_from_slice(&now.to_le_bytes());
             }
+            archive(&mut record);
             store_in(&mut tx, &fa, &record)?;
             tx.commit()
         };
@@ -2972,6 +2978,7 @@ impl<D: WriteAt> Volume<D> {
             for at in [0x30, 0x38] {
                 record[at..at + 8].copy_from_slice(&now.to_le_bytes());
             }
+            archive(&mut record);
             store_in(&mut tx, &fa, &record)?;
             tx.commit()
         };
@@ -3159,6 +3166,7 @@ impl<D: WriteAt> Volume<D> {
             for at in [0x30, 0x38] {
                 record[at..at + 8].copy_from_slice(&now.to_le_bytes());
             }
+            archive(&mut record);
             store_in(&mut tx, &fa, &record)?;
             tx.commit()
         };
@@ -3330,6 +3338,7 @@ impl<D: WriteAt> Volume<D> {
         shared: Option<&[(u64, u64)]>,
         make: &dyn Fn(&Self, &mut Transaction<'_, D>, Option<u64>, NewRecord) -> Result<Vec<u8>>,
     ) -> Result<()> {
+        let up = self.upcase()?;
         let FileAt {
             parent,
             name,
@@ -3361,7 +3370,7 @@ impl<D: WriteAt> Volume<D> {
         let committed = {
             let mut tx = Transaction::begin(&*self)?;
             // The old data clusters become free (kept until the commit).
-            tx.free_runs(&merged(&runs))?;
+            tx.free_runs(&runs)?;
             tx.free_compacted(&clusters_of(&compacted))?;
             if let Some(shared) = shared {
                 tx.add_references(shared)?;
@@ -3385,7 +3394,7 @@ impl<D: WriteAt> Volume<D> {
             if let (Some(to), Some(last)) = (record.get_mut(0x9c..0xa0), old.get(0x9c..0xa0)) {
                 to.copy_from_slice(last);
             }
-            let attributes = (le32(&old, 0x48) & !SPARSE) | (le32(&record, 0x48) & SPARSE);
+            let attributes = (le32(&old, 0x48) & !SPARSE) | (le32(&record, 0x48) & SPARSE) | ARCHIVE;
             record[0x48..0x4c].copy_from_slice(&attributes.to_le_bytes());
             // Every row but the data's stays: named streams, the stream
             // sets of those in clusters, and rows this writer does not know
@@ -3395,7 +3404,7 @@ impl<D: WriteAt> Volume<D> {
                 let mut rows = embedded_rows(&record)?;
                 for s in kept {
                     if !rows.iter().any(|r| row_key(r) == row_key(&s)) {
-                        insert_attribute(&mut rows, s);
+                        insert_attribute(&up, &mut rows, s);
                     }
                 }
                 record = record_with_rows(&record, &rows, le32(&record, 0x98))?;
@@ -3405,7 +3414,7 @@ impl<D: WriteAt> Volume<D> {
                 // the name written through gets a fresh index entry.
                 let (names, _) = record_names(&old)?;
                 let (_, rows) = record_names(&record)?;
-                let record = record_with_names(&record, names, rows)?;
+                let record = record_with_names(&up, &record, names, rows)?;
                 put_record(&mut tx, home, id, &record)?;
                 refresh_entry(&mut tx, dir, &name, &record)?;
                 let committed = tx.commit();
@@ -3418,7 +3427,7 @@ impl<D: WriteAt> Volume<D> {
             tx.insert_sorted(
                 Tree::Object(dir),
                 &row(&key, &record, ROW_EMBEDS_NODE),
-                &directory_key_order,
+                &|a: &[u8], b: &[u8]| directory_key_order(&up, a, b),
             )?;
             self.touch_directory(&mut tx, &parent, dir, now)?;
             tx.commit()
@@ -3482,7 +3491,7 @@ impl<D: WriteAt> Volume<D> {
         let committed = {
             let mut tx = Transaction::begin(&*self)?;
             // Its data clusters become free (kept until the commit).
-            tx.free_runs(&merged(&runs))?;
+            tx.free_runs(&runs)?;
             tx.free_compacted(&clusters_of(&compacted))?;
             tx.remove_row(Tree::Object(dir), &|k| is_name_row(k, &name))?;
             tx.remove_row(Tree::Object(dir), &|k| {
@@ -3496,13 +3505,14 @@ impl<D: WriteAt> Volume<D> {
 
     /// Renames a file or directory within its directory.
     pub fn rename(&mut self, path: &str, new_name: &str, now: u64) -> Result<()> {
+        let up = self.upcase()?;
         let trimmed = path.trim_end_matches('/');
         if let Target::Directory(_) = self.lookup(trimmed)?.target {
             let parent = trimmed.rsplit_once('/').map_or("", |(p, _)| p);
             return self.move_directory(path, &format!("{parent}/{new_name}"), now);
         }
         let file = self.file_at(path)?;
-        check_name(new_name)?;
+        check_file_name(new_name)?;
         let target = format!("{}/{new_name}", file.parent.trim_end_matches('/'));
         if new_name == file.name {
             return Ok(());
@@ -3527,6 +3537,7 @@ impl<D: WriteAt> Volume<D> {
         } = file;
         let id = le64(&record, 0x80);
         record[0x38..0x40].copy_from_slice(&now.to_le_bytes());
+        archive(&mut record);
         let utf16: Vec<u8> = new_name.encode_utf16().flat_map(|c| c.to_le_bytes()).collect();
         let committed = {
             let mut tx = Transaction::begin(&*self)?;
@@ -3535,13 +3546,15 @@ impl<D: WriteAt> Volume<D> {
                 k.len() >= 16 && le16(k, 0) == ROW_FILE_ID && le64(k, 8) == id
             })?;
             let (key, value) = file_id_row(id, &utf16);
-            tx.insert_sorted(Tree::Object(dir), &row(&key, &value, 0), &directory_key_order)?;
+            tx.insert_sorted(Tree::Object(dir), &row(&key, &value, 0), &|a: &[u8], b: &[u8]| {
+                directory_key_order(&up, a, b)
+            })?;
             let mut key = vec![ROW_NAME as u8, 0, 1, 0];
             key.extend(&utf16);
             tx.insert_sorted(
                 Tree::Object(dir),
                 &row(&key, &record, ROW_EMBEDS_NODE),
-                &directory_key_order,
+                &|a: &[u8], b: &[u8]| directory_key_order(&up, a, b),
             )?;
             self.touch_directory(&mut tx, &parent, dir, now)?;
             tx.commit()
@@ -3561,6 +3574,7 @@ impl<D: WriteAt> Volume<D> {
         let (path, to) = (path.trim_end_matches('/'), to.trim_end_matches('/'));
         let parent = |p: &str| p.rsplit_once('/').map_or("", |(parent, _)| parent).to_string();
         let to_name = to.rsplit_once('/').map_or(to, |(_, name)| name).to_string();
+        check_file_name(&to_name)?;
         self.in_one_commit(|v| {
             let source = v.lookup(path)?;
             let same_dir = v.directory_of(&parent(path))? == v.directory_of(&parent(to))?;
@@ -3683,6 +3697,7 @@ impl<D: WriteAt> Volume<D> {
     /// parents get new times. Moving a directory below itself, and junctions,
     /// are refused.
     fn move_directory(&mut self, path: &str, to: &str, now: u64) -> Result<()> {
+        let up = self.upcase()?;
         let trimmed = path.trim_end_matches('/');
         let parent = trimmed.rsplit_once('/').map_or("", |(p, _)| p);
         let entry = self.lookup(trimmed)?;
@@ -3694,7 +3709,7 @@ impl<D: WriteAt> Volume<D> {
         }
         let to = to.trim_end_matches('/');
         let (to_parent, to_name) = to.rsplit_once('/').unwrap_or(("", to));
-        check_name(to_name)?;
+        check_file_name(to_name)?;
         match self.lookup(to) {
             Err(Error::NotFound(_)) => {}
             // The directory itself: only the case of its name changes.
@@ -3707,15 +3722,15 @@ impl<D: WriteAt> Volume<D> {
         }
         let from = self.directory_of(parent)?;
         let target = self.directory_of(to_parent)?;
-        let mut up = target;
+        let mut above = target;
         for _ in 0..4096 {
-            if up == oid {
+            if above == oid {
                 return Err(Error::Unsupported(format!("{path}: moving a directory below itself")));
             }
-            if up == ROOT_DIRECTORY {
+            if above == ROOT_DIRECTORY {
                 break;
             }
-            up = self.parent_of(up)?;
+            above = self.parent_of(above)?;
         }
         let name = entry.name.as_str();
         let committed = {
@@ -3725,13 +3740,15 @@ impl<D: WriteAt> Volume<D> {
             tx.remove_row(Tree::Object(from), &|k| is_entry_row(k, name))?;
             let mut key = vec![ROW_NAME as u8, 0, 2, 0];
             key.extend(utf16_bytes(to_name));
-            tx.insert_sorted(Tree::Object(target), &row(&key, &value, 0), &directory_key_order)?;
+            tx.insert_sorted(Tree::Object(target), &row(&key, &value, 0), &|a: &[u8], b: &[u8]| {
+                directory_key_order(&up, a, b)
+            })?;
             // Its own record names its parent and name.
             let own = (ROW_OWN as u32).to_le_bytes();
             let at = tx.find(Tree::Object(oid), &|k| k == own)?;
             let record = tx.pages[at.page].data[at.value..at.value + at.len].to_vec();
             let (_, rows) = record_names(&record)?;
-            let record = record_with_names(&record, vec![(target, utf16_bytes(to_name))], rows)?;
+            let record = record_with_names(&up, &record, vec![(target, utf16_bytes(to_name))], rows)?;
             if record.len() == at.len {
                 tx.value_mut(at).copy_from_slice(&record);
             } else {
@@ -3739,7 +3756,7 @@ impl<D: WriteAt> Volume<D> {
                 tx.insert_sorted(
                     Tree::Object(oid),
                     &row(&own, &record, ROW_EMBEDS_NODE),
-                    &directory_key_order,
+                    &|a: &[u8], b: &[u8]| directory_key_order(&up, a, b),
                 )?;
             }
             if target != from {
@@ -3826,10 +3843,11 @@ impl<D: WriteAt> Volume<D> {
     }
 
     fn split_file(&mut self, path: &str, to: &str, keep: bool, now: u64) -> Result<()> {
+        let up = self.upcase()?;
         let file = self.file_at(path)?;
         let to = to.trim_end_matches('/');
         let (to_parent, to_name) = to.rsplit_once('/').unwrap_or(("", to));
-        check_name(to_name)?;
+        check_file_name(to_name)?;
         match self.lookup(to) {
             Err(Error::NotFound(_)) => {}
             Ok(_) => return Err(Error::Unsupported(format!("{to} exists"))),
@@ -3862,6 +3880,7 @@ impl<D: WriteAt> Volume<D> {
         }
         names.sort();
         record[0x38..0x40].copy_from_slice(&now.to_le_bytes());
+        archive(&mut record);
         let mut rows: Vec<Vec<u8>> = names.iter().map(|(d, n)| link_row(*d, n)).collect();
         rows.extend(embedded_rows(&record)?);
         let record = record_with_rows(&record, &rows, names.len() as u32)?;
@@ -3872,7 +3891,9 @@ impl<D: WriteAt> Volume<D> {
                 k.len() >= 16 && le16(k, 0) == ROW_FILE_ID && le64(k, 8) == id
             })?;
             let (key, value) = split_id_row(id, home);
-            tx.insert_sorted(Tree::Object(home), &row(&key, &value, 0), &directory_key_order)?;
+            tx.insert_sorted(Tree::Object(home), &row(&key, &value, 0), &|a: &[u8], b: &[u8]| {
+                directory_key_order(&up, a, b)
+            })?;
             let mut key = vec![0u8; 24];
             key[0..4].copy_from_slice(&[ROW_RECORD as u8, 0, 0, 0x80]);
             key[8..16].copy_from_slice(&id.to_le_bytes());
@@ -3880,7 +3901,7 @@ impl<D: WriteAt> Volume<D> {
             tx.insert_sorted(
                 Tree::Object(home),
                 &row(&key, &record, ROW_EMBEDS_NODE),
-                &directory_key_order,
+                &|a: &[u8], b: &[u8]| directory_key_order(&up, a, b),
             )?;
             for (dir, n) in &names {
                 let mut key = vec![ROW_NAME as u8, 0, 2, 0];
@@ -3888,7 +3909,7 @@ impl<D: WriteAt> Volume<D> {
                 tx.insert_sorted(
                     Tree::Object(*dir),
                     &row(&key, &index_entry(id, home, &record), 0),
-                    &directory_key_order,
+                    &|a: &[u8], b: &[u8]| directory_key_order(&up, a, b),
                 )?;
             }
             self.touch_directory(&mut tx, &parent, home, now)?;
@@ -3912,6 +3933,7 @@ impl<D: WriteAt> Volume<D> {
     }
 
     fn write_stream_now(&mut self, path: &str, stream: &str, data: &[u8], now: u64) -> Result<()> {
+        let up = self.upcase()?;
         check_name(stream)?;
         if data.len() as u64 > MAX_CREATED {
             return Err(Error::Unsupported(format!("streams of more than {MAX_CREATED} bytes")));
@@ -3922,8 +3944,8 @@ impl<D: WriteAt> Volume<D> {
         let mut kept = (stream.to_owned(), None);
         if let Some(r) = embedded_rows(&file.record)?.iter().find(|r| {
             is_named_stream(r)
-                && !is_stream_row(r, None)
-                && upcased(&row_key(r)[0x10..]) == upcased(&utf16_bytes(stream))
+                && !is_stream_row(&up, r, None)
+                && upcased(&up, &row_key(r)[0x10..]) == upcased(&up, &utf16_bytes(stream))
         }) {
             kept = (utf16(&row_key(r)[0x10..]), Some(le64(row_value(r), 0x3c)));
             self.delete_stream(path, stream, now)?;
@@ -3932,7 +3954,7 @@ impl<D: WriteAt> Volume<D> {
         if data.len() > MAX_INLINE {
             let stream = embedded_rows(&file.record)?
                 .iter()
-                .find(|r| is_stream_row(r, Some(stream)))
+                .find(|r| is_stream_row(&up, r, Some(stream)))
                 .map_or(kept.0, |r| utf16(&row_key(r)[0x10..]));
             return self.write_stream_clusters(file, &stream, data, kept.1, now);
         }
@@ -3940,14 +3962,15 @@ impl<D: WriteAt> Volume<D> {
         // A stream of that name (without case) keeps its name.
         let name = rows
             .iter()
-            .find(|r| is_stream_row(r, Some(stream)))
+            .find(|r| is_stream_row(&up, r, Some(stream)))
             .map_or_else(|| stream.to_owned(), |r| utf16(&row_key(r)[0x10..]));
-        rows.retain(|r| !is_stream_row(r, Some(stream)));
-        insert_attribute(&mut rows, stream_row(&name, data));
+        rows.retain(|r| !is_stream_row(&up, r, Some(stream)));
+        insert_attribute(&up, &mut rows, stream_row(&name, data));
         let mut record = record_with_rows(&file.record, &rows, le32(&file.record, 0x98))?;
         for at in [0x30, 0x38, 0x40] {
             record[at..at + 8].copy_from_slice(&now.to_le_bytes());
         }
+        archive(&mut record);
         self.store_record(&file, &record, &[])
     }
 
@@ -3964,6 +3987,7 @@ impl<D: WriteAt> Volume<D> {
         set: Option<u64>,
         now: u64,
     ) -> Result<()> {
+        let up = self.upcase()?;
         if le32(&file.record, 0x48) & INTEGRITY != 0 {
             return Err(Error::Unsupported(format!(
                 "{}: named streams in clusters of integrity streams",
@@ -3991,8 +4015,9 @@ impl<D: WriteAt> Volume<D> {
             let mut tx = Transaction::begin(&*self)?;
             let (extents, allocated) = self.write_data(&mut tx, band, &data, false)?;
             let mut rows = embedded_rows(&file.record)?;
-            rows.retain(|r| !is_stream_row(r, Some(stream)));
+            rows.retain(|r| !is_stream_row(&up, r, Some(stream)));
             insert_attribute(
+                &up,
                 &mut rows,
                 stream_clusters_row(stream, data.len() as u64, allocated, set),
             );
@@ -4008,7 +4033,7 @@ impl<D: WriteAt> Volume<D> {
                 k
             };
             let header = level_set_header();
-            insert_attribute(&mut rows, row(&set_key(header.len(), 8, 1), &header, 0));
+            insert_attribute(&up, &mut rows, row(&set_key(header.len(), 8, 1), &header, 0));
             let live = self.map_value(
                 &mut tx,
                 file.home.unwrap_or(file.dir),
@@ -4017,6 +4042,7 @@ impl<D: WriteAt> Volume<D> {
                 &extents,
             )?;
             insert_attribute(
+                &up,
                 &mut rows,
                 row(&set_key(live.len(), LIVE_STREAM, 0), &live, ROW_EMBEDS_NODE),
             );
@@ -4026,6 +4052,7 @@ impl<D: WriteAt> Volume<D> {
             for at in [0x30, 0x38, 0x40] {
                 record[at..at + 8].copy_from_slice(&now.to_le_bytes());
             }
+            archive(&mut record);
             store_in(&mut tx, &file, &record)?;
             tx.commit()
         };
@@ -4037,9 +4064,11 @@ impl<D: WriteAt> Volume<D> {
     /// (refused on volumes with shared clusters); the file's change time
     /// becomes `now`.
     pub fn delete_stream(&mut self, path: &str, stream: &str, now: u64) -> Result<()> {
+        let up = self.upcase()?;
         let file = self.file_at(path)?;
         let rows = embedded_rows(&file.record)?;
-        let named = |r: &Vec<u8>| is_named_stream(r) && upcased(&row_key(r)[0x10..]) == upcased(&utf16_bytes(stream));
+        let named =
+            |r: &Vec<u8>| is_named_stream(r) && upcased(&up, &row_key(r)[0x10..]) == upcased(&up, &utf16_bytes(stream));
         let value = rows
             .iter()
             .find(|r| named(r))
@@ -4089,6 +4118,7 @@ impl<D: WriteAt> Volume<D> {
     /// directory `home` a new directory and name, as Windows does: its
     /// index entry moves and its link row changes.
     fn move_name(&mut self, file: FileAt, home: u64, to_parent: &str, to_name: &str, now: u64) -> Result<()> {
+        let up = self.upcase()?;
         let FileAt {
             parent,
             name,
@@ -4106,7 +4136,8 @@ impl<D: WriteAt> Volume<D> {
             .ok_or_else(|| format_err!("{parent}/{name}: no link row for the name"))?;
         names[at] = (target, utf16_bytes(to_name));
         record[0x38..0x40].copy_from_slice(&now.to_le_bytes());
-        let record = record_with_names(&record, names, rows)?;
+        archive(&mut record);
+        let record = record_with_names(&up, &record, names, rows)?;
         let committed = {
             let mut tx = Transaction::begin(&*self)?;
             tx.remove_row(Tree::Object(dir), &|k| is_entry_row(k, &name))?;
@@ -4116,7 +4147,7 @@ impl<D: WriteAt> Volume<D> {
             tx.insert_sorted(
                 Tree::Object(target),
                 &row(&key, &index_entry(id, home, &record), 0),
-                &directory_key_order,
+                &|a: &[u8], b: &[u8]| directory_key_order(&up, a, b),
             )?;
             self.touch_directory(&mut tx, &parent, dir, now)?;
             if target != dir {
@@ -4130,22 +4161,27 @@ impl<D: WriteAt> Volume<D> {
     /// Gives a file whose record is a row of type 0x40 of directory `home`
     /// another name: a link row and an index entry.
     fn add_name(&mut self, file: FileAt, home: u64, to_parent: &str, to_name: &str, now: u64) -> Result<()> {
+        let up = self.upcase()?;
         let mut record = file.record;
         let target = self.directory_of(to_parent)?;
         let id = le64(&record, 0x80);
         let (mut names, rows) = record_names(&record)?;
         names.push((target, utf16_bytes(to_name)));
         record[0x38..0x40].copy_from_slice(&now.to_le_bytes());
-        let record = record_with_names(&record, names, rows)?;
+        archive(&mut record);
+        let record = record_with_names(&up, &record, names, rows)?;
         let committed = {
             let mut tx = Transaction::begin(&*self)?;
             put_record(&mut tx, home, id, &record)?;
+            // The name linked through shows the record's attributes too,
+            // as on Windows.
+            refresh_entry(&mut tx, file.dir, &file.name, &record)?;
             let mut key = vec![ROW_NAME as u8, 0, 2, 0];
             key.extend(utf16_bytes(to_name));
             tx.insert_sorted(
                 Tree::Object(target),
                 &row(&key, &index_entry(id, home, &record), 0),
-                &directory_key_order,
+                &|a: &[u8], b: &[u8]| directory_key_order(&up, a, b),
             )?;
             self.touch_directory(&mut tx, to_parent, target, now)?;
             tx.commit()
@@ -4158,6 +4194,7 @@ impl<D: WriteAt> Volume<D> {
     /// the record, its file id row and its data clusters go too (refused
     /// on volumes with shared clusters).
     fn unlink(&mut self, file: FileAt, home: u64, now: u64) -> Result<()> {
+        let up = self.upcase()?;
         let FileAt {
             parent,
             name,
@@ -4185,7 +4222,7 @@ impl<D: WriteAt> Volume<D> {
             tx.remove_row(Tree::Object(dir), &|k| is_entry_row(k, &name))?;
             let key = record_key(id, home);
             if last {
-                tx.free_runs(&merged(&runs))?;
+                tx.free_runs(&runs)?;
                 tx.free_compacted(&clusters_of(&compacted))?;
                 tx.remove_row(Tree::Object(home), &|k| k == key)?;
                 tx.remove_row(Tree::Object(home), &|k| {
@@ -4193,7 +4230,7 @@ impl<D: WriteAt> Volume<D> {
                 })?;
             } else {
                 record[0x38..0x40].copy_from_slice(&now.to_le_bytes());
-                put_record(&mut tx, home, id, &record_with_names(&record, names, rows)?)?;
+                put_record(&mut tx, home, id, &record_with_names(&up, &record, names, rows)?)?;
             }
             self.touch_directory(&mut tx, &parent, dir, now)?;
             tx.commit()
@@ -4214,8 +4251,13 @@ impl<D: WriteAt> Volume<D> {
         };
         let file = self.open_file(&entry)?;
         // The physical runs of its data and of its named streams: what
-        // every level maps (the live one, and those snapshots keep), and the
-        // pages of extent maps kept outside the record.
+        // every level maps (the live one, and those snapshots keep), a run
+        // per reference as the block reference count table counts them (a
+        // cluster at one place of a stream in several levels once, at two
+        // places twice: `check::references`; 1.2.2 freed each cluster
+        // once, though a clone counts it per place), and the pages of
+        // extent maps kept outside the record.
+        let (mut placed, mut set_placed) = (Vec::new(), BTreeMap::<u64, Vec<(u64, u64, u64)>>::new());
         let (mut runs, mut stream_runs) = (Vec::new(), Vec::new());
         let (mut compacted, mut stream_compacted) = (Vec::new(), Vec::new());
         let cpc = self.clusters_per_container;
@@ -4246,10 +4288,26 @@ impl<D: WriteAt> Volume<D> {
                         to.push((x.vlcn, x.clusters));
                         continue;
                     }
-                    to.push((self.translate(x.vlcn)?, x.clusters));
+                    let lcn = self.translate(x.vlcn)?;
+                    let at = (lcn.wrapping_sub(x.vcn), x.vcn, x.vcn.saturating_add(x.clusters));
+                    if data_level {
+                        placed.push(at);
+                    } else {
+                        set_placed.entry(le64(key, 0x30)).or_default().push(at);
+                    }
                 }
                 to.extend(self.extent_map_pages(row_value(&r))?.into_iter().map(|c| (c, 1)));
             }
+        }
+        let physical = |placed: Vec<(u64, u64, u64)>| {
+            crate::check::references(placed)
+                .into_iter()
+                .map(|(shift, from, to)| (shift.wrapping_add(from), to - from))
+                .collect::<Vec<_>>()
+        };
+        runs.extend(physical(placed));
+        for (_, placed) in set_placed {
+            stream_runs.extend(physical(placed));
         }
         // Runs inside the volume, and not more of them than levels sharing
         // clusters explain (freeing lists every cluster).
@@ -4296,11 +4354,13 @@ impl<D: WriteAt> Volume<D> {
         }
         let trimmed = path.trim_end_matches('/');
         if dir != ROOT_DIRECTORY
-            && let Some((grand, name)) = trimmed.rsplit_once('/')
+            && let Some((grand, _)) = trimmed.rsplit_once('/')
         {
+            // The name as stored: `path` may name it in another case.
+            let name = &self.lookup(trimmed)?.name;
             let parent = self.directory_of(grand)?;
             let at = tx.find(Tree::Object(parent), &|k| {
-                k.len() > 4 && le16(k, 0) == ROW_NAME && le16(k, 2) == 2 && utf16(&k[4..]) == name
+                k.len() > 4 && le16(k, 0) == ROW_NAME && le16(k, 2) == 2 && utf16(&k[4..]) == *name
             })?;
             let v = tx.value_mut(at);
             if v.len() >= 0x30 {
@@ -4362,9 +4422,10 @@ impl<D: WriteAt> Volume<D> {
     /// and name, an empty $I30 index), rows in both object tables, a
     /// parent-child row, and an entry in the parent directory.
     pub fn create_directory(&mut self, path: &str, now: u64) -> Result<()> {
+        let up = self.upcase()?;
         let trimmed = path.trim_end_matches('/');
         let (parent, name) = trimmed.rsplit_once('/').unwrap_or(("", trimmed));
-        check_name(name)?;
+        check_file_name(name)?;
         match self.lookup(trimmed) {
             Err(Error::NotFound(_)) => {}
             Ok(_) => return Err(Error::Unsupported(format!("{path} exists"))),
@@ -4422,7 +4483,11 @@ impl<D: WriteAt> Volume<D> {
                 entry[at..at + 8].copy_from_slice(&now.to_le_bytes());
             }
             entry[0x40..0x44].copy_from_slice(&REFS_DIRECTORY_BIT.to_le_bytes());
-            tx.insert_sorted(Tree::Object(parent_oid), &row(&key, &entry, 0), &directory_key_order)?;
+            tx.insert_sorted(
+                Tree::Object(parent_oid),
+                &row(&key, &entry, 0),
+                &|a: &[u8], b: &[u8]| directory_key_order(&up, a, b),
+            )?;
             self.touch_directory(&mut tx, parent, parent_oid, now)?;
             tx.commit()
         };
@@ -4635,6 +4700,19 @@ const MAP_NODE_MIN: usize = 0x70;
 const ROW_RECORD: u16 = 0x40;
 /// The sparse file attribute.
 const SPARSE: u32 = 0x200;
+/// FILE_ATTRIBUTE_ARCHIVE.
+const ARCHIVE: u32 = 0x20;
+
+/// Sets a file record's archive attribute, as Windows does when the file's
+/// data or a named stream is written, it is renamed or moved, or it gets
+/// another name (Windows 11 build 26340 on a Dev Drive: after `attrib -a`,
+/// each of these set it again; setting a time did not, and directories
+/// never had it). Backups that copy what has it changed see the change
+/// (1.2.2 left the attribute as it was).
+fn archive(record: &mut [u8]) {
+    let a = le32(record, 0x48) | ARCHIVE;
+    record[0x48..0x4c].copy_from_slice(&a.to_le_bytes());
+}
 const ROOT_PARENT_CHILD: usize = 4;
 /// ReFS's directory bit in a directory entry's attributes.
 const REFS_DIRECTORY_BIT: u32 = 0x1000_0000;
@@ -4750,33 +4828,27 @@ fn resident_record(data: &[u8], now: u64, id: u64, common: u64) -> Vec<u8> {
 }
 
 /// The order of a directory's rows: by type, file id rows by id, name rows
-/// by name compared without case (UTF-16 units after upcasing).
-fn directory_key_order(a: &[u8], b: &[u8]) -> std::cmp::Ordering {
+/// by name compared without case (UTF-16 units through the upcase table).
+fn directory_key_order(up: &[u16], a: &[u8], b: &[u8]) -> std::cmp::Ordering {
     let (ta, tb) = (le16(a, 0), le16(b, 0));
     if ta != tb {
         return ta.cmp(&tb);
     }
     match ta {
-        ROW_NAME if a.len() >= 4 && b.len() >= 4 => upcased(&a[4..]).cmp(&upcased(&b[4..])),
+        ROW_NAME if a.len() >= 4 && b.len() >= 4 => upcased(up, &a[4..]).cmp(&upcased(up, &b[4..])),
         ROW_FILE_ID | 0x40 if a.len() >= 16 && b.len() >= 16 => le64(a, 8).cmp(&le64(b, 8)),
         _ => a.cmp(b),
     }
 }
 
-fn upcased(name: &[u8]) -> Vec<u16> {
+/// A name's UTF-16 units through the volume's upcase table `up`
+/// (`Volume::upcase`; 1.2.2 took Unicode's upper case, which orders and
+/// folds names otherwise than Windows: `r314fold`).
+fn upcased(up: &[u16], name: &[u8]) -> Vec<u16> {
     name.as_chunks::<2>()
         .0
         .iter()
-        .map(|c| {
-            let u = u16::from_le_bytes(*c);
-            match char::from_u32(u as u32).map(|c| c.to_uppercase()) {
-                Some(mut up) if up.len() == 1 => {
-                    let c = up.next().unwrap() as u32;
-                    if c <= 0xffff { c as u16 } else { u }
-                }
-                _ => u,
-            }
-        })
+        .map(|c| up[u16::from_le_bytes(*c) as usize])
         .collect()
 }
 
@@ -4817,8 +4889,8 @@ struct FileAt {
     reparse: bool,
 }
 
-/// Names `refs` creates for now: printable ASCII, no characters Windows
-/// forbids.
+/// Names `refs` creates for now (of streams too): printable ASCII, no
+/// characters Windows forbids.
 fn check_name(name: &str) -> Result<()> {
     if name.is_empty()
         || name.len() > 255
@@ -4830,6 +4902,34 @@ fn check_name(name: &str) -> Result<()> {
     {
         return Err(Error::Unsupported(format!(
             "{name:?}: names of printable ASCII only, for now"
+        )));
+    }
+    Ok(())
+}
+
+/// A name for a file or directory: `check_name`, and none that Windows
+/// programs could not open under that name (`r314fold`, Windows 11 build
+/// 26340): a name ending in a dot or a space
+/// (Win32 drops them: `trail.` became `trail`), or a device name, alone or
+/// before an extension (Win32 made files named `CON`, `CON.txt`,
+/// `COM1.log` and `PRN.x` but opened the devices for those names after;
+/// the names Microsoft documents as reserved: CON, PRN, AUX, NUL, COM0 to
+/// COM9, LPT0 to LPT9). 1.2.2 made such names.
+fn check_file_name(name: &str) -> Result<()> {
+    check_name(name)?;
+    if name.ends_with(['.', ' ']) {
+        return Err(Error::Unsupported(format!(
+            "{name:?}: Windows drops a name's last dots and spaces, and could not open it"
+        )));
+    }
+    let base = name.split('.').next().unwrap_or(name).to_ascii_uppercase();
+    let device = matches!(base.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || (base.len() == 4
+            && (base.starts_with("COM") || base.starts_with("LPT"))
+            && base.as_bytes()[3].is_ascii_digit());
+    if device {
+        return Err(Error::Unsupported(format!(
+            "{name:?}: a device name for Windows, which could not open a file of that name"
         )));
     }
     Ok(())
@@ -5246,12 +5346,13 @@ fn record_key(id: u64, home: u64) -> Vec<u8> {
 
 /// Replaces the record of file `id` kept apart in directory `home`.
 fn put_record<D: WriteAt>(tx: &mut Transaction<'_, D>, home: u64, id: u64, record: &[u8]) -> Result<()> {
+    let up = tx.vol.upcase()?;
     let key = record_key(id, home);
     tx.remove_row(Tree::Object(home), &|k| k == key)?;
     tx.insert_sorted(
         Tree::Object(home),
         &row(&key, record, ROW_EMBEDS_NODE),
-        &directory_key_order,
+        &|a: &[u8], b: &[u8]| directory_key_order(&up, a, b),
     )
 }
 
@@ -5277,8 +5378,8 @@ fn record_names(record: &[u8]) -> Result<(Names, Vec<Vec<u8>>)> {
 
 /// A record with `names` (sorted by directory, then name without case)
 /// as its link rows before its other rows.
-fn record_with_names(record: &[u8], mut names: Names, rows: Vec<Vec<u8>>) -> Result<Vec<u8>> {
-    names.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| upcased(&a.1).cmp(&upcased(&b.1))));
+fn record_with_names(up: &[u16], record: &[u8], mut names: Names, rows: Vec<Vec<u8>>) -> Result<Vec<u8>> {
+    names.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| upcased(up, &a.1).cmp(&upcased(up, &b.1))));
     let mut all: Vec<Vec<u8>> = names.iter().map(|(d, n)| link_row(*d, n)).collect();
     all.extend(rows);
     record_with_rows(record, &all, names.len() as u32)
@@ -5292,6 +5393,7 @@ fn utf16_bytes(name: &str) -> Vec<u8> {
 /// row, or for a moved or linked file in its home (and the index entry of
 /// the name used).
 fn store_in<D: WriteAt>(tx: &mut Transaction<'_, D>, file: &FileAt, record: &[u8]) -> Result<()> {
+    let up = tx.vol.upcase()?;
     match file.home {
         Some(home) => {
             put_record(tx, home, le64(record, 0x80), record)?;
@@ -5304,7 +5406,7 @@ fn store_in<D: WriteAt>(tx: &mut Transaction<'_, D>, file: &FileAt, record: &[u8
             tx.insert_sorted(
                 Tree::Object(file.dir),
                 &row(&key, record, ROW_EMBEDS_NODE),
-                &directory_key_order,
+                &|a: &[u8], b: &[u8]| directory_key_order(&up, a, b),
             )
         }
     }
@@ -5376,7 +5478,7 @@ fn stream_row(name: &str, data: &[u8]) -> Vec<u8> {
 
 /// Whether a record row is a named stream kept in the record (any, or the
 /// one named `name`, compared without case).
-fn is_stream_row(r: &[u8], name: Option<&str>) -> bool {
+fn is_stream_row(up: &[u16], r: &[u8], name: Option<&str>) -> bool {
     let (key, value) = (row_key(r), row_value(r));
     key.len() >= 0x10
         && le32(key, 8) == 0x8000_0002
@@ -5384,7 +5486,7 @@ fn is_stream_row(r: &[u8], name: Option<&str>) -> bool {
         && value.len() >= 0x3c
         && le16(value, 0x10) == 0
         && le16(value, 2) & 0x1000 == 0
-        && name.is_none_or(|n| upcased(&key[0x10..]) == upcased(&utf16_bytes(n)))
+        && name.is_none_or(|n| upcased(up, &key[0x10..]) == upcased(up, &utf16_bytes(n)))
 }
 
 /// Whether a record row is a named stream (inline or in clusters; not a
@@ -5414,12 +5516,12 @@ fn is_set_row(r: &[u8]) -> bool {
 
 /// Inserts a row into a record's rows in Windows' order: by marker (the
 /// low bits of 0x80000001, 0x80000002, 3), attribute type, then name.
-fn insert_attribute(rows: &mut Vec<Vec<u8>>, new: Vec<u8>) {
+fn insert_attribute(up: &[u16], rows: &mut Vec<Vec<u8>>, new: Vec<u8>) {
     let class = |k: &[u8]| {
         (
             k.get(8..12).map(|_| le32(k, 8) & 0x7fff_ffff),
             k.get(12..16).map(|_| le32(k, 12) & 0xffff),
-            upcased(k.get(0x10..).unwrap_or(&[])),
+            upcased(up, k.get(0x10..).unwrap_or(&[])),
         )
     };
     let at = class(row_key(&new));
@@ -5571,7 +5673,7 @@ mod tests {
         // A set row twice.
         let mut twice = rows.clone();
         let set_row = rows.iter().find(|r| is_set_row(r)).unwrap().clone();
-        insert_attribute(&mut twice, set_row);
+        insert_attribute(&vol.upcase().unwrap(), &mut twice, set_row);
         let record = record_with_rows(&file.record, &twice, le32(&file.record, 0x98)).unwrap();
         let mut v = small();
         v.create_file("/f.txt", b"hello", now).unwrap();
@@ -5609,7 +5711,7 @@ mod tests {
         key[8..12].copy_from_slice(&0x8000_0001u32.to_le_bytes());
         key[12..16].copy_from_slice(&0xe0u32.to_le_bytes());
         let unknown = row(&key, &value, 0);
-        insert_attribute(&mut rows, unknown.clone());
+        insert_attribute(&vol.upcase().unwrap(), &mut rows, unknown.clone());
         let record = record_with_rows(&file.record, &rows, le32(&file.record, 0x98)).unwrap();
         vol.store_record(&file, &record, &[]).unwrap();
         for data in [&b"short"[..], &[0x42; 9000][..], &b"again"[..]] {
@@ -5628,5 +5730,199 @@ mod tests {
             assert!(buf == data);
             assert_eq!(vol.check(&[]).unwrap().problems, Vec::<String>::new());
         }
+    }
+
+    /// Paths name directories in any case, as on Windows: a file made,
+    /// written, renamed and deleted through a parent path in another case
+    /// than the directory's name (1.2.2 failed with NotFound after the
+    /// work, the change not made).
+    #[test]
+    fn parent_paths_in_another_case_name_the_directory() {
+        let mut vol = small();
+        let now = 135_900_000_000_000_000;
+        vol.create_directory("/case", now).unwrap();
+        vol.create_file("/case/inner.txt", b"inner", now).unwrap();
+        vol.create_file("/CASE/x.txt", b"x", now).unwrap();
+        vol.create_directory("/Case/sub", now).unwrap();
+        vol.write_file("/CASE/inner.txt", b"written", now).unwrap();
+        vol.rename("/cAsE/x.txt", "y.txt", now).unwrap();
+        vol.create_file("/CASE/SUB/deep.txt", b"deep", now).unwrap();
+        let names: Vec<String> = vol
+            .read_dir(match vol.lookup("/case").unwrap().target {
+                crate::Target::Directory(oid) => oid,
+                _ => panic!("not a directory"),
+            })
+            .unwrap()
+            .into_iter()
+            .map(|e| e.name)
+            .collect();
+        assert_eq!(names, ["inner.txt", "sub", "y.txt"]);
+        let f = vol.open_file(&vol.lookup("/case/inner.txt").unwrap()).unwrap();
+        let mut buf = [0u8; 7];
+        vol.read_stream(f.data.as_ref().unwrap(), 0, &mut buf).unwrap();
+        assert_eq!(&buf, b"written");
+        vol.delete_file("/CASE/sub/DEEP.TXT", now).unwrap();
+        vol.delete_file("/CASE/y.txt", now).unwrap();
+        assert_eq!(vol.check(&[]).unwrap().problems, Vec::<String>::new());
+        // Every other change through such a path.
+        let times = vol.lookup("/case/inner.txt").unwrap().times;
+        vol.set_times("/CASE/inner.txt", &times).unwrap();
+        vol.set_attributes("/CASE/inner.txt", 0x20).unwrap();
+        vol.overwrite("/CASE/inner.txt", 0, b"W", now).unwrap();
+        vol.update_file("/CASE/inner.txt", &&b"Written"[..], &[(0, 7)], now)
+            .unwrap();
+        vol.write_stream("/CASE/inner.txt", "s", b"stream", now).unwrap();
+        vol.delete_stream("/CASE/inner.txt", "s", now).unwrap();
+        vol.create_file("/case/z.txt", b"z", now).unwrap();
+        vol.rename_replacing("/CASE/z.txt", "/CASE/SUB/z.txt", now).unwrap();
+        vol.link_file("/CASE/SUB/z.txt", "/CASE/zz.txt", now).unwrap();
+        vol.move_file("/CASE/inner.txt", "/CASE/SUB/inner.txt", now).unwrap();
+        vol.rename("/CASE/SUB", "sub2", now).unwrap();
+        vol.create_directory("/CASE/SUB2/deeper", now).unwrap();
+        assert!(vol.lookup("/case/sub2/inner.txt").is_ok());
+        assert!(vol.lookup("/case/sub2/z.txt").is_ok());
+        assert!(vol.lookup("/case/zz.txt").is_ok());
+        assert!(vol.lookup("/case/sub2/deeper").is_ok());
+        assert_eq!(vol.check(&[]).unwrap().problems, Vec::<String>::new());
+    }
+
+    /// A file mapping one cluster at two places, as a block clone within a
+    /// file leaves it (the table counts the reference beyond the first):
+    /// deleting it lets go of both references, and the cluster is free.
+    /// 1.2.2 let go of each cluster once (a clone counts one reference per
+    /// place): the count went to 0 and the cluster stayed allocated,
+    /// leaked (audit 2026-10-16, ReFS writer).
+    #[test]
+    fn a_cluster_mapped_twice_is_freed_with_both_references() {
+        let mut vol = small();
+        let now = 135_900_000_000_000_000;
+        let baseline = vol.check(&[]).unwrap().leaked_clusters;
+        vol.create_file("/twice.bin", &[0x5a; 8192], now).unwrap();
+        let file = vol.open_file(&vol.lookup("/twice.bin").unwrap()).unwrap();
+        let crate::file::Content::Extents(x) = &file.data.as_ref().unwrap().content else {
+            panic!("inline")
+        };
+        let v0 = x[0].vlcn;
+        let (c0, c1) = (vol.translate(v0).unwrap(), vol.translate(v0 + 1).unwrap());
+        {
+            let mut tx = Transaction::begin(&vol).unwrap();
+            tx.add_references(&[(v0, 1)]).unwrap();
+            tx.commit().unwrap();
+        }
+        vol.load().unwrap();
+        // Both places map the first cluster; the second is freed.
+        let fa = vol.file_at("/twice.bin").unwrap();
+        let mut rows = embedded_rows(&fa.record).unwrap();
+        let at = rows
+            .iter()
+            .position(|r| is_data_row(r) && row_key(r).len() >= 0x18 && le64(row_key(r), 0x10) == LIVE_STREAM)
+            .unwrap();
+        let key = row_key(&rows[at]).to_vec();
+        let extents = [(0, v0, 1, Vec::new()), (1, v0, 1, Vec::new())];
+        rows[at] = row(
+            &key,
+            &level_value(8192, 8192, &extents, vol.integrity_kind()),
+            ROW_EMBEDS_NODE,
+        );
+        let record = record_with_rows(&fa.record, &rows, le32(&fa.record, 0x98)).unwrap();
+        vol.store_record(&fa, &record, &[c1]).unwrap();
+        assert_eq!(vol.check(&[]).unwrap().problems, Vec::<String>::new());
+        vol.delete_file("/twice.bin", now).unwrap();
+        let medium = crate::check::Allocator::read(&vol, 1).unwrap();
+        assert!(!medium.used(c0) && !medium.used(c1));
+        let report = vol.check(&[]).unwrap();
+        assert_eq!(report.problems, Vec::<String>::new());
+        assert_eq!(report.leaked_clusters, baseline, "{:?}", report.leaks);
+    }
+
+    /// Names Windows programs could not open under them are refused, for
+    /// files and directories made, renamed, moved or linked (`r314fold`:
+    /// Win32 dropped the last dots and spaces, and opened the device for
+    /// CON.txt, COM1.log and PRN.x); names Windows opens stay allowed
+    /// (1.2.2 made every one of them).
+    #[test]
+    fn names_windows_could_not_open_are_refused() {
+        let mut vol = small();
+        let now = 135_900_000_000_000_000;
+        vol.create_file("/ok.txt", b"ok", now).unwrap();
+        let refused = [
+            "trail.",
+            "trail ",
+            "both. ",
+            "CON",
+            "con.txt",
+            "Nul",
+            "nul.tar.gz",
+            "COM1.log",
+            "lpt9",
+            "PRN.x",
+            "COM0",
+            "aux",
+        ];
+        for name in refused {
+            let path = format!("/{name}");
+            for r in [
+                vol.create_file(&path, b"x", now),
+                vol.create_directory(&path, now),
+                vol.rename("/ok.txt", name, now),
+                vol.rename_replacing("/ok.txt", &path, now),
+                vol.link_file("/ok.txt", &path, now),
+            ] {
+                assert!(matches!(r, Err(Error::Unsupported(_))), "{name:?}: {r:?}");
+            }
+            assert!(vol.lookup(&path).is_err(), "{name:?} made");
+        }
+        for name in ["AUX .txt", "conin$", "COM10", "LPT.txt", "a.b", "CONSOLE", "com1x"] {
+            vol.create_file(&format!("/{name}"), b"x", now).unwrap();
+        }
+        vol.write_stream("/ok.txt", "con", b"stream", now).unwrap();
+        assert_eq!(vol.check(&[]).unwrap().problems, Vec::<String>::new());
+    }
+
+    /// Windows sets a file's archive attribute when its data or a named
+    /// stream is written, it is renamed or moved, or it gets another name,
+    /// not when a time is set (Windows 11 build 26340 on a Dev Drive); so
+    /// does refs (1.2.2 left it as it was).
+    #[test]
+    fn changes_set_the_archive_attribute_as_windows_does() {
+        let mut vol = small();
+        let now = 135_900_000_000_000_000;
+        vol.create_file("/a.txt", &[0x41; 9000], now).unwrap();
+        vol.create_directory("/elsewhere", now).unwrap();
+        type Vol = Volume<Overlay<SparseImage>>;
+        let archived = |vol: &Vol, path: &str| vol.lookup(path).unwrap().attributes & ARCHIVE != 0;
+        assert!(archived(&vol, "/a.txt"));
+        assert!(!archived(&vol, "/elsewhere"));
+        type Step<'a> = (&'a str, &'a dyn Fn(&mut Vol) -> Result<()>);
+        let steps: [Step<'_>; 8] = [
+            ("overwrite", &|v| v.overwrite("/a.txt", 10, b"xyz", now)),
+            ("write", &|v| v.write_file("/a.txt", &[0x42; 9100], now)),
+            ("update", &|v| {
+                v.update_file("/a.txt", &&[0x43u8; 9100][..], &[(0, 4096)], now)
+            }),
+            ("small write", &|v| v.write_file("/a.txt", b"short", now)),
+            ("stream", &|v| v.write_stream("/a.txt", "s", b"side", now)),
+            ("rename", &|v| v.rename("/a.txt", "b.txt", now)),
+            ("move", &|v| v.move_file("/b.txt", "/elsewhere/b.txt", now)),
+            ("link", &|v| v.link_file("/elsewhere/b.txt", "/c.txt", now)),
+        ];
+        let mut path = "/a.txt";
+        for (what, step) in steps {
+            vol.set_attributes(path, 0).unwrap();
+            assert!(!archived(&vol, path), "{what}: cleared");
+            step(&mut vol).unwrap();
+            path = match what {
+                "rename" => "/b.txt",
+                "move" | "link" => "/elsewhere/b.txt",
+                _ => path,
+            };
+            assert!(archived(&vol, path), "{what}: archive not set");
+        }
+        vol.set_attributes(path, 0).unwrap();
+        let times = vol.lookup(path).unwrap().times;
+        vol.set_times(path, &times).unwrap();
+        assert!(!archived(&vol, path), "set_times set it");
+        assert!(!archived(&vol, "/elsewhere"));
+        assert_eq!(vol.check(&[]).unwrap().problems, Vec::<String>::new());
     }
 }

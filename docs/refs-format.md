@@ -85,8 +85,9 @@ A volume Windows grew (`Resize-Partition`) has the copies at its new end
 end, where the copies were, and the container after them (16,384
 clusters) stay marked used with nothing referencing them that `refs
 check` follows (`refsutil leak` counts 8 leaked clusters there, `refs
-check` 16,544 used and unreferenced against about 156 on a volume never
-grown). Windows left that volume with a record past its checkpoint
+check` 16,456 used and unreferenced against about 68 on a volume never
+grown; 16,544 and 156 before `refs check` read the upcase table's pages,
+see Directories). Windows left that volume with a record past its checkpoint
 although the disk was taken offline, and replayed its log (0x3:0x27 to
 0x3:0x29, "Last Shutdown Was Dirty: true") when it attached a copy: the
 guard's `fs.refs.log` calls it suspect, rightly. A volume left by fast
@@ -149,6 +150,17 @@ object's tree as a page reference at 0x20, and for directories the last
 file id given out at 0x50 (Windows raises it with every file it creates
 and never lowers it; new files take the next one, **verified**). Directories are objects; the
 root directory is 0x600; user objects start at 0x701. (**verified**)
+
+Objects 0x7 and 0x8 are Windows' upcase table and its copy ("Upcase
+Table"; rows keyed by a u32: 0 the table's name, 1 its units, 0x10000,
+from 2 on the 65,536 UTF-16 units cut into rows of about 341 bytes, 27
+rows of 64 KiB clusters), 0x9 and 0xa the "Logfile Information Table"
+and its copy. Their trees are addressed by virtual clusters like every
+object's (the physical addresses fail their checksums), not physically as
+the container tables of roots 7 and 8 are; `refs check` reads them since
+1.3 (it left them out, and counted their pages among the clusters nothing
+references). (**verified**: the same table on every 3.x volume of the
+corpus, Windows Server 2016 to Windows 11; ReFS 1.2 has neither object.)
 
 ## Directories
 
@@ -253,9 +265,19 @@ the last), and a root left with one child takes that child's rows when
 they fit (the table loses a level). Windows' own policy is not known.
 
 A directory's rows sort by type, then: file id rows (0x20) by id, name
-rows (0x30) by name compared without case (NTFS-like: upcased UTF-16
-units; the key flags at 2 do not count). (**verified** on the names of
-the corpus; new names are ASCII for now.)
+rows (0x30) by name, each UTF-16 unit through the volume's upcase table
+(the key flags at 2 do not count). The table is not Unicode's upper case:
+424 units map otherwise (µ, ı, ſ, ÿ and ǅ stay themselves, Ÿ becomes ÿ,
+capital Greek letters with marks become small ones), and no unit outside
+ASCII maps into it. Windows orders names by the table, and takes names it
+maps alike for one name (**verified**: `r314fold`, made by Windows 11
+build 26340: its fold\ holds I, J, S, µ, ÿ, Ā, ıa, ſ, Ǆ, ǅ, Β and Μ in the
+table's order, which Unicode's upper case does not keep; making Ÿ, μ, i
+and ā there failed, "already exists", while µ beside Μ, ı beside I and ſ
+beside S were made). `refs` orders what it writes by the table (1.2.2
+took Unicode's upper case, and a name could go where Windows does not look
+for it, test `new_names_go_where_the_upcase_table_puts_them`), and `refs
+check` finds a directory's names out of its order.
 
 ## File records
 
@@ -971,6 +993,29 @@ table's rows for a text diff):
   stream in between). Windows attached such a volume healthy, read every
   file and the replaced stream as written, and `refsutil leak` found only
   the 4 clusters of the untouched volume (2026-10-18).
+* **Names.** `refs` writes names of printable ASCII, none that Windows
+  programs could not open under it: none ending in a dot or a space
+  (Win32 drops those: `r314fold`'s `trail.` became `trail`), and no device
+  name, alone or before an extension (CON, PRN, AUX, NUL, COM0 to COM9,
+  LPT0 to LPT9, as Microsoft documents them reserved; Win32 made files
+  named `CON`, `CON.txt`, `COM1.log` and `PRN.x` on `r314fold` and then
+  opened the devices for those names). A parent path names a directory in
+  any case, as on Windows (1.2.2 found the directory and then failed to
+  update its entry, after the work).
+* **The archive attribute** (0x20). Windows sets it when a file's data or
+  a named stream is written, the file renamed or moved, or given another
+  name, not when a time is set, and never on directories (Windows 11 build
+  26340 on a Dev Drive, each step after `attrib -a`); `refs` does the same
+  (1.2.2 left the attribute alone). A Dev Drive has no USN journal active
+  (`fsutil usn queryjournal`: "The volume change journal is not active")
+  and its records' USN is 0; `refs` writes no journal records.
+* **References.** A file's clusters are let go of once per reference as
+  the block reference count table counts them: a cluster at one place of
+  a stream in several levels (a snapshot and the live data) once, at two
+  places (a clone within the file) twice, as a clone adds them. 1.2.2 let
+  go of each cluster once, and a cluster a file mapped twice kept a count
+  of 0 and stayed allocated (test
+  `a_cluster_mapped_twice_is_freed_with_both_references`).
 
 ## The log (MLog)
 

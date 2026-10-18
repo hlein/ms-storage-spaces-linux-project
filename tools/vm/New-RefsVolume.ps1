@@ -30,6 +30,12 @@ Scenarios:
   small   a few files (resident, in extents, in a subdirectory): the base
           of write experiments (tools/vm/Invoke-RefsSteps.ps1)
   empty   the freshly formatted volume only
+  casefold  names whose order and sameness under Windows' upcase table
+          (objects 0x7 and 0x8) differ from Unicode's upper case, in
+          fold\; names folded to ones there, made with CreateNew; and in
+          names\ the names Win32 makes otherwise or not at all (reserved
+          device names, trailing dots and spaces): what each attempt did is
+          in the manifest's "attempts"
 
 With -ExtendMB N the partition is made N MiB short of the disk, the
 volume grown by N MiB (Resize-Partition) once the tree is written, and the
@@ -43,7 +49,7 @@ the GPT and the Dev Drive; the manifest's "pool" names them.
 #>
 param(
     [Parameter(Mandatory)] [string] $Name,
-    [ValidateSet('basic', 'features', 'small', 'empty')] [string] $Scenario = 'basic',
+    [ValidateSet('basic', 'features', 'small', 'empty', 'casefold')] [string] $Scenario = 'basic',
     [ValidateSet('NONE', 'LZ4', 'ZSTD')] [string] $Compression = 'NONE',
     [int] $CompressionLevel = 0,
     [long] $ChunkSize = 0,
@@ -243,6 +249,33 @@ public static class RefsGen {
         New-File 'last.txt' 10
     }
 
+    $attempts = $null
+    if ($Scenario -eq 'casefold') {
+        function Join-Units([int[]] $units) { -join ($units | ForEach-Object { [char] $_ }) }
+        # In table order J < (dotless i)a, (y diaeresis) < (A macron), micro < Beta;
+        # in Unicode's upper case the other way round. Distinct in the
+        # table, the same in upper case: I and dotless i, S and long s,
+        # micro and Mu, the title case Dz and capital DZ.
+        $names = @('J', 'I', (Join-Units 0x131, 0x61), 'S', (Join-Units 0x17f), (Join-Units 0xff), (Join-Units 0x100),
+            (Join-Units 0xb5), (Join-Units 0x392), (Join-Units 0x39c), (Join-Units 0x1c5), (Join-Units 0x1c4))
+        foreach ($n in $names) { New-File "fold\$n.txt" 100 }
+        function Test-Create([string] $rel) {
+            try { [IO.File]::Open((Join-Path $drive $rel), [IO.FileMode]::CreateNew).Close(); 'created' }
+            catch { "$($_.Exception.InnerException.GetType().Name): $($_.Exception.InnerException.Message)".Trim() }
+        }
+        [IO.Directory]::CreateDirectory((Join-Path $drive 'names')) | Out-Null
+        $attempts = [ordered]@{}
+        # Folded to names there by the table: Y diaeresis, small mu, i, a macron.
+        foreach ($n in (Join-Units 0x178), (Join-Units 0x3bc), 'i', (Join-Units 0x101)) {
+            $attempts["fold\$n.txt"] = Test-Create "fold\$n.txt"
+        }
+        foreach ($n in 'CON', 'CON.txt', 'nul.tar.gz', 'COM0', 'COM1.log', 'LPT0.txt', 'AUX .txt', 'PRN.x', 'conin$',
+            'CONOUT$', 'trail.', 'trail ', 'both. ', 'mid.dot.') {
+            $attempts["names\$n"] = Test-Create "names\$n"
+        }
+        New-File 'last.txt' 10
+    }
+
     if ($Scenario -eq 'features') {
         foreach ($s in 1000, 65536, 100000, 1048576, 10485760) { New-Text "compress\text_$s.txt" $s }
         New-File 'compress\random.bin' 3145728
@@ -369,7 +402,7 @@ public static class RefsGen {
     $part = Get-Partition -DiskNumber $disk.Number | Where-Object Type -eq 'Basic'
     if (-not $part.DriveLetter) { $part | Add-PartitionAccessPath -AssignDriveLetter; $part = Get-Partition -DiskNumber $disk.Number -PartitionNumber $part.PartitionNumber }
     $drive = "$($part.DriveLetter):\"
-    $last = @{ basic = 'gone\new_name.txt'; features = 'last.txt'; small = 'last.txt' }[$Scenario]
+    $last = @{ basic = 'gone\new_name.txt'; features = 'last.txt'; small = 'last.txt'; casefold = 'last.txt' }[$Scenario]
     if ($last -and -not (Test-Path -LiteralPath (Join-Path $drive $last))) { throw 'the last writes are missing after reattaching' }
     # (Get-FileHash of Windows PowerShell 5.1 cannot open "file:stream".)
     function Get-StreamHash([string] $path, [string] $stream) {
@@ -416,6 +449,10 @@ public static class RefsGen {
                 $link = $item.LinkType -in 'SymbolicLink', 'Junction'
                 if ($link) { $e.link_type = "$($item.LinkType)"; $e.link_target = "$($item.Target)" }
             }
+            # Names Win32 lists but does not open by their path (casefold's
+            # names\: a device name with an extension, as created).
+            $e.win32_open = Test-Path -LiteralPath $item.FullName
+            if (-not $e.win32_open) { $e.size = $item.Length; $entries.Add($e); return }
             if (-not $item.PSIsContainer -and -not $link) {
                 $e.size = $item.Length
                 $e.sha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $item.FullName).Hash.ToLowerInvariant()
@@ -449,6 +486,7 @@ public static class RefsGen {
         extended_mb = $ExtendMB
         pool = if ($PoolDisks -gt 0) { [ordered]@{ name = $poolName; space = $Name; disks = $PoolDisks; resiliency = $Resiliency } } else { $null }
         refsinfo = ($info -join "`n")
+        attempts = $attempts
         entries = $entries
     }
     $manifest | ConvertTo-Json -Depth 6 | Set-Content -Encoding UTF8 (Join-Path $dir 'manifest.json')

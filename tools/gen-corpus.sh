@@ -5,7 +5,7 @@
 # @Script.ps1 and that script's arguments. SUFFIX=_26100 appends a suffix to
 # the pool names (the same configurations created by another Windows build).
 set -uo pipefail
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/.." || exit
 wanted=" $* "
 status=0
 while read -r name args; do
@@ -24,7 +24,7 @@ while read -r name args; do
   # guest network for a minute, which would kill an attached SSH session.
   # Starting twice is harmless (the generator refuses an existing pool).
   started=0
-  for attempt in 1 2 3; do
+  for _ in 1 2 3; do
     # shellcheck disable=SC2086
     if tools/vm.sh -bg "gen-$name" "$script" -Name "$name" $args </dev/null; then started=1; break; fi
     sleep 30

@@ -4,12 +4,12 @@
 # Usage: tools/push-corpus.sh [name...]
 set -uo pipefail
 tools=$(cd "$(dirname "$0")" && pwd)
-cd "$tools/../testdata/pools"
+cd "$tools/../testdata/pools" || exit
 vm=${LINUX_VM_HOST:-192.168.189.142}
 ssh_cmd=(ssh -o BatchMode=yes -o IdentitiesOnly=yes -o ServerAliveInterval=30 -o ServerAliveCountMax=20
-  -o HostKeyAlias=192.168.189.144 -i "$HOME/.ssh/rustadmin_vm_ed25519" codex@$vm)
+  -o HostKeyAlias=192.168.189.144 -i "$HOME/.ssh/rustadmin_vm_ed25519" "codex@$vm")
 names=("$@")
-[[ ${#names[@]} -eq 0 ]] && names=($(ls))
+[[ ${#names[@]} -eq 0 ]] && names=(*)
 status=0
 for name in "${names[@]}"; do
   [[ -f $name/manifest.json ]] || continue

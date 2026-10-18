@@ -11,7 +11,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 dir=$1
 spaces=$PWD/target/release/spaces
-q() { "$spaces" "$@" --yes | grep -vE "^step [0-9]+:" || true; }
+q() { "$spaces" "$@" --yes | sed -E "/^step [0-9]+:/d"; }
 make() {
   local kind=$1 n=$2 hdd=$3 columns=$4
   local d=$dir/$kind

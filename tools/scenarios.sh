@@ -4,13 +4,13 @@
 # runs on it, and the snapshots it takes, fetched into testdata/snapshots/.
 # Usage: tools/scenarios.sh NAME...
 set -uo pipefail
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/.." || exit
 
 # Starts a script detached on the VM and waits for its "EXIT" line.
 run_bg() {
   local log=$1; shift
   local started=0
-  for attempt in 1 2 3; do
+  for _ in 1 2 3; do
     if tools/vm.sh -bg "$log" "$@" </dev/null; then started=1; break; fi
     sleep 30
   done

@@ -81,7 +81,10 @@ scp -q "${ssh_opts[@]}" "$deb" "$host:sstest/check.deb"
 vm 'rm -f sstest/old.deb'
 if [[ -n ${OLD_DEB:-} ]]; then scp -q "${ssh_opts[@]}" "$OLD_DEB" "$host:sstest/old.deb"; fi
 vm "CASES='$cases' bash -s" <<'REMOTE'
-set -u
+# A command that fails where no case expects it ends the run, naming it
+# (1.2.2's remote parts went on past it).
+set -Eeuo pipefail
+trap 'echo "FAIL harness: line $LINENO: $BASH_COMMAND (exit $?)"' ERR
 pass=0 fail=0
 result() {
   if [[ $1 == ok ]]; then echo "PASS $2${3:+ ($3)}"; pass=$((pass + 1));
@@ -115,8 +118,9 @@ served_by() { # the program the server of attached space $1 (dm name) runs, "" w
 }
 unit_of() { # the server unit of attached space $1 (dm name)
   local f
-  f=$(sudo sh -c 'grep -lx "dm=$0" /run/storage-spaces/*.state' "$1" 2>/dev/null | head -1)
-  sudo sed -n 's/^unit=//p' "$f" 2>/dev/null
+  f=$(sudo sh -c 'grep -lx "dm=$0" /run/storage-spaces/*.state' "$1" 2>/dev/null | head -1 || true)
+  # Nothing when the space is not attached (the case says so).
+  if [[ -n $f ]]; then sudo sed -n 's/^unit=//p' "$f"; fi
 }
 main_pid() { systemctl show -p MainPID --value "$(unit_of "$1")" 2>/dev/null; }
 mount_ntfs() { # mount_ntfs DM DIR: the NTFS partition of attached space DM, read-only
@@ -127,10 +131,16 @@ mount_ntfs() { # mount_ntfs DM DIR: the NTFS partition of attached space DM, rea
   sudo mount -o ro "/dev/mapper/$part" "$2" 2>/dev/null || sudo mount -t ntfs3 -o ro "/dev/mapper/$part" "$2" 2>/dev/null ||
     sudo mount -t ntfs-3g -o ro "/dev/mapper/$part" "$2"
 }
-readable() { # every file of a directory reads
-  sudo find "$1" -type f -print0 | sudo xargs -0 -r cat >/dev/null 2>&1 && echo yes || echo no
+readable() { # every file of a directory reads, and there is one (an empty
+  # directory, as an unmounted mount point, passed in 1.2.2's harness)
+  local n
+  n=$(sudo find "$1" -type f | wc -l)
+  if ((n > 0)) && sudo find "$1" -type f -print0 | sudo xargs -0 cat >/dev/null 2>&1; then echo yes; else echo "no ($n files)"; fi
 }
 cleanup() { # the test pools' spaces and loop devices, by whichever spaces is there
+  # Best effort: what is not there need not go.
+  set +e
+  trap - ERR
   local d b l
   for d in /mnt/sstest-busy /mnt/sstest-upgrade /mnt/sstest-inuse; do mountpoint -q "$d" && sudo umount "$d"; done
   for d in $(ours); do
@@ -143,6 +153,9 @@ cleanup() { # the test pools' spaces and loop devices, by whichever spaces is th
   done
   sudo rm -rf /opt/sstest
   rm -rf ~/sstest/scratch/parts
+  # As before (it also runs before the cases, for what a cut-off run left).
+  set -e
+  trap 'echo "FAIL harness: line $LINENO: $BASH_COMMAND (exit $?)"' ERR
 }
 cleanup # what an interrupted run left behind
 trap 'cleanup; rm -f ~/sstest/check.deb ~/sstest/old.deb' EXIT
@@ -157,22 +170,27 @@ for c in $CASES; do
       attach_pools wc4k ntfstier
       continue
     fi
-    dpkg -s storage-spaces >/dev/null 2>&1 && sudo dpkg -r storage-spaces >/dev/null
-    lsmod | grep -q '^nbd ' && sudo modprobe -r nbd 2>/dev/null
+    if dpkg -s storage-spaces >/dev/null 2>&1; then sudo dpkg -r storage-spaces >/dev/null; fi
+    if lsmod | grep -q '^nbd '; then sudo modprobe -r nbd 2>/dev/null || true; fi
+    # Loaded still (in use): whether installing loads it cannot be told.
+    nbd_before=no
+    if lsmod | grep -q '^nbd '; then nbd_before=yes; fi
     attach_pools wc4k ntfstier
     sleep 3
     if [[ -n $(ours) ]]; then result fail install "attached before the package was installed"; continue; fi
     sudo dpkg -i ~/sstest/check.deb >/dev/null
     for _ in $(seq 60); do [[ $(ours | wc -l) -ge 2 ]] && break; sleep 1; done
     if [[ $(ours | wc -l) -ge 2 ]]; then result ok install "$(ours | tr '\n' ' ')"; else result fail install "attached after installing: $(ours | tr '\n' ' ')"; fi
-    if lsmod | grep -q '^nbd '; then result ok nbd; else result fail nbd "not loaded after installing"; fi ;;
+    if [[ $nbd_before == yes ]]; then result skip nbd "loaded before installing (in use), so it tells nothing"
+    elif lsmod | grep -q '^nbd '; then result ok nbd
+    else result fail nbd "not loaded after installing"; fi ;;
   gpt)
     for d in ss-ss_wc4k-wc4k ss-ss_ntfstier-ntfstier; do
       if [[ ! -b /dev/mapper/$d ]]; then result fail "gpt $d" "not attached"; continue; fi
       out=$(sudo env LC_ALL=C sfdisk --verify "/dev/mapper/$d" 2>&1)
       if [[ $out == *"No errors detected"* && $out != *corrupt* && $out != *invalid* ]]; then result ok "gpt $d" "sfdisk clean"; else result fail "gpt $d" "${out//$'\n'/ | }"; fi
     done
-    bad=$(sudo journalctl -k --since "$since" --no-pager -o cat | grep -c 'Alternate GPT is invalid')
+    bad=$(sudo journalctl -k --since "$since" --no-pager -o cat | grep -c 'Alternate GPT is invalid' || true)
     if [[ $bad == 0 ]]; then result ok "gpt kernel"; else result fail "gpt kernel" "$bad times 'Alternate GPT is invalid'"; fi ;;
   user)
     out=$(/usr/sbin/spaces status 2>&1)
@@ -184,13 +202,21 @@ for c in $CASES; do
     mkdir -p "$t/local-fs-pre.target.wants"
     cp /usr/lib/systemd/system/storage-spaces-attach.service "$t/"
     ln -s ../storage-spaces-attach.service "$t/local-fs-pre.target.wants/"
+    cycles() { SYSTEMD_UNIT_PATH="$t:" systemd-analyze verify default.target 2>&1 | grep -c 'ordering cycle' || true; }
+    # First a cycle planted into the copy (After=local-fs.target, which
+    # comes after local-fs-pre.target): seen, or the count says nothing.
+    sed -i 's/^\[Unit\]$/[Unit]\nAfter=local-fs.target/' "$t/storage-spaces-attach.service"
+    planted=$(cycles)
+    cp /usr/lib/systemd/system/storage-spaces-attach.service "$t/"
     counts=
     for _ in 1 2 3; do
-      counts+="$(SYSTEMD_UNIT_PATH="$t:" systemd-analyze verify default.target 2>&1 | grep -c 'ordering cycle') "
+      counts+="$(cycles) "
     done
-    example=$(SYSTEMD_UNIT_PATH="$t:" systemd-analyze verify default.target 2>&1 | grep -m1 'ordering cycle')
+    example=$(SYSTEMD_UNIT_PATH="$t:" systemd-analyze verify default.target 2>&1 | grep -m1 'ordering cycle' || true)
     rm -rf "$t"
-    if [[ $counts == "0 0 0 " ]]; then result ok cycle "0 cycles in 3 runs"; else result fail cycle "cycles: $counts: $example"; fi ;;
+    if ((planted == 0)); then result fail cycle "a planted cycle was not seen: the count proves nothing here"
+    elif [[ $counts == "0 0 0 " ]]; then result ok cycle "0 cycles in 3 runs (the planted one seen $planted times)"
+    else result fail cycle "cycles: $counts: $example"; fi ;;
   servers)
     n=0 bad=
     for d in $(ours); do
@@ -212,8 +238,8 @@ for c in $CASES; do
     d=ss-ss_ntfstier-ntfstier
     if ! mount_ntfs "$d" /mnt/sstest-busy; then result fail busy "cannot mount the NTFS volume of $d"; continue; fi
     unit=$(unit_of "$d")
-    out=$(sudo /usr/sbin/spaces detach ntfstier 2>&1)
-    rc=$?
+    rc=0
+    out=$(sudo /usr/sbin/spaces detach ntfstier 2>&1) || rc=$?
     alive=no
     systemctl is-active -q "$unit" && alive=yes
     ok=$(readable /mnt/sstest-busy)
@@ -273,7 +299,7 @@ for c in $CASES; do
     if [[ -z $bad ]]; then result ok upgrade "$(basename "$old") -> check.deb: $w attached anew, $n kept (mounted)"; else result fail upgrade "$bad"; fi ;;
   byhand)
     w=ss-ss_wc4k-wc4k
-    sudo /usr/sbin/spaces detach "$w" >/dev/null 2>&1
+    sudo /usr/sbin/spaces detach "$w" >/dev/null 2>&1 || true
     for l in $(losetup -a | grep -E "pools/wc4k/" | cut -d: -f1); do sudo losetup -d "$l" 2>/dev/null; done
     out=$(sudo /usr/sbin/spaces attach --backend nbd ~/sstest/pools/wc4k/disk0.img 2>&1)
     if [[ ! -b /dev/mapper/$w ]]; then result fail byhand "cannot attach wc4k by hand: ${out//$'\n'/ | }"; attach_pools wc4k; continue; fi
@@ -290,7 +316,7 @@ for c in $CASES; do
       [[ -b /dev/mapper/$w ]] && attached=yes
       result fail byhand "attached: $attached, backend ${backend:-none}, server $pw -> $(main_pid "$w") ($e): ${out//$'\n'/ | }"
     fi
-    sudo /usr/sbin/spaces detach "$w" >/dev/null 2>&1
+    sudo /usr/sbin/spaces detach "$w" >/dev/null 2>&1 || true
     attach_pools wc4k
     for _ in $(seq 60); do [[ -b /dev/mapper/$w ]] && break; sleep 1; done ;;
   enabled)
@@ -326,8 +352,8 @@ for c in $CASES; do
   inuse)
     n=ss-ss_ntfstier-ntfstier
     if ! mount_ntfs "$n" /mnt/sstest-inuse; then result fail inuse "cannot mount the NTFS volume of $n"; continue; fi
-    out=$(sudo dpkg -r storage-spaces 2>&1)
-    rc=$?
+    rc=0
+    out=$(sudo dpkg -r storage-spaces 2>&1) || rc=$?
     installed=$(dpkg-query -W -f='${db:Status-Status}' storage-spaces 2>/dev/null)
     ok=$(readable /mnt/sstest-inuse)
     attached=no
@@ -380,7 +406,7 @@ for c in $CASES; do
     # Only its own pool goes afterwards: the later cases need the others.
     drop_parts() {
       for x in $(ours | grep parts); do sudo /usr/sbin/spaces detach "$x" >/dev/null 2>&1; done
-      sudo losetup -d "$l" 2>/dev/null
+      sudo losetup -d "$l" 2>/dev/null || true
       rm -rf "${d:?}"
     }
     sudo /usr/sbin/spaces attach --rw --space parts "$l" >/dev/null 2>&1
@@ -389,7 +415,7 @@ for c in $CASES; do
     { echo "label: gpt"; echo "table-length: 256"
       for _ in $(seq 200); do echo "size=1MiB, type=EBD0A0A2-B9E5-4433-87C0-68B6B72699C7"; done
     } | sudo sfdisk -q "/dev/mapper/$dm" >/dev/null 2>&1
-    sudo /usr/sbin/spaces detach "$dm" >/dev/null 2>&1
+    sudo /usr/sbin/spaces detach "$dm" >/dev/null 2>&1 || true
     t0=$SECONDS
     out=$(sudo /usr/sbin/spaces attach --space parts "$l" 2>&1)
     took=$((SECONDS - t0))

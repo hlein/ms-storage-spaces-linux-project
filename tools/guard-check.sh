@@ -87,7 +87,10 @@ pattern=${SPACES_PATTERN:-target/x86_64-unknown-linux-musl/release/spaces-patter
 scp -q "${ssh_opts[@]}" "$deb" "$host:sstest/guard.deb"
 scp -q "${ssh_opts[@]}" "$pattern" "$host:sstest/spaces-pattern"
 vm "CASES='$cases' bash -s" <<'REMOTE'
-set -u
+# A command that fails where no case expects it ends the run, naming it
+# (1.2.2's remote parts went on past it).
+set -Eeuo pipefail
+trap 'echo "FAIL harness: line $LINENO: $BASH_COMMAND (exit $?)"' ERR
 pass=0 fail=0
 result() {
   if [[ $1 == ok ]]; then echo "PASS $2${3:+ ($3)}"; pass=$((pass + 1));
@@ -120,11 +123,17 @@ umount_all() {
   done
 }
 cleanup() {
+  # Best effort: what is not there need not go.
+  set +e
+  trap - ERR
   umount_all
   for d in $(ours); do sudo "$spaces" detach "$d" >/dev/null 2>&1 || true; done
   for l in $(losetup -a | grep -E "(sstest|/srv/spaces)/(pools|refs|scratch)/" | cut -d: -f1); do
     sudo losetup -d "$l" 2>/dev/null || true
   done
+  # As before (it also runs before the cases, for what a cut-off run left).
+  set -e
+  trap 'echo "FAIL harness: line $LINENO: $BASH_COMMAND (exit $?)"' ERR
 }
 cleanup # what an interrupted run left behind
 trap 'cleanup; sudo dpkg -r storage-spaces >/dev/null 2>&1; rm -f ~/sstest/guard.deb ~/sstest/spaces-pattern' EXIT
@@ -141,17 +150,19 @@ cp --sparse=always $pools/wc4k/disk0.img "$scratch/wc4kbad/disk0.img"
 # degraded.
 away=
 for i in 0 1 2 3; do
-  rest=$(for j in 0 1 2 3; do [[ $j != "$i" ]] && echo $pools/ntfstier/disk$j.img; done)
+  rest=$(for j in 0 1 2 3; do if [[ $j != "$i" ]]; then echo $pools/ntfstier/disk$j.img; fi; done)
   # shellcheck disable=SC2086
-  if "$spaces" check --json $rest 2>/dev/null | grep -q '"verdict": "degraded"'; then away=$i; break; fi
+  # check exits 1 for a degraded pool: its output, not its status, says.
+  verdicts=$("$spaces" check --json $rest 2>/dev/null || true)
+  if grep -q '"verdict": "degraded"' <<<"$verdicts"; then away=$i; break; fi
 done
 guid() { # the GUID of space $1 in the pool of the devices that follow
   local name=$1
   shift
-  "$spaces" check --json "$@" 2>/dev/null | tr -d '\n ' |
+  { "$spaces" check --json "$@" 2>/dev/null || true; } | tr -d '\n ' |
     sed -n "s/.*\"space\":{\"name\":\"$name\",\"guid\":\"\([0-9a-f-]*\)\".*/\1/p"
 }
-tier_disks=$(for j in 0 1 2 3; do [[ $j != "$away" ]] && echo $pools/ntfstier/disk$j.img; done)
+tier_disks=$(for j in 0 1 2 3; do if [[ $j != "$away" ]]; then echo $pools/ntfstier/disk$j.img; fi; done)
 # shellcheck disable=SC2086
 tier_guid=$(guid ntfstier $tier_disks)
 wc_guid=$(guid wc4k $pools/wc4k/disk0.img)
@@ -183,19 +194,20 @@ for c in $CASES; do
     fi
     j=$(sudo journalctl -u 'storage-spaces-attach*' --since "$since" --no-pager -o cat)
     if [[ $j == *"not attached"* && $j == *"DEGRADED pool.members"* ]]; then result ok "auto journal"; else result fail "auto journal" "$(one "$j")"; fi
-    s=$("$spaces" status 2>&1)
+    s=$("$spaces" status 2>&1) || true
     if [[ $s == *"not attached: space \"ntfstier\""* && $s == *"verdict healthy"* ]]; then result ok "auto status"; else result fail "auto status" "$(one "$s")"; fi
     cleanup ;;
   force)
     newloop "$scratch/wc4kbad/disk0.img"
     bad=$LOOP
-    out=$(sudo "$spaces" attach "$bad" 2>&1)
-    if [[ $? != 0 && $out == *"SUSPECT space.partitions"* && $out == *"not attached"* && -z $(ours | grep wc4k) ]]; then
+    rc=0
+    out=$(sudo "$spaces" attach "$bad" 2>&1) || rc=$?
+    if [[ $rc != 0 && $out == *"SUSPECT space.partitions"* && $out == *"not attached"* && -z $(ours | grep wc4k) ]]; then
       result ok "force refused" "$(head -1 <<<"$out" | cut -c1-120)"
     else
       result fail "force refused" "$(one "$out")"
     fi
-    out=$(sudo "$spaces" attach --force "$bad" 2>&1)
+    out=$(sudo "$spaces" attach --force "$bad" 2>&1) || true
     dm=$(ours | grep wc4k | head -1)
     state=$(sudo cat "/run/storage-spaces/$wc_guid.state" 2>/dev/null || true)
     if [[ -n $dm && $state == *forced=1* && $state == *verdict=suspect* && $out == *read-only* ]]; then
@@ -229,7 +241,7 @@ for c in $CASES; do
     # A pool with a disk away: read-only with --degraded.
     devs=()
     for img in $tier_disks; do newloop "$img"; devs+=("$LOOP"); done
-    out=$(sudo "$spaces" attach --degraded "${devs[@]}" 2>&1)
+    out=$(sudo "$spaces" attach --degraded "${devs[@]}" 2>&1) || true
     state=$(sudo cat "/run/storage-spaces/$tier_guid.state" 2>/dev/null || true)
     if [[ $state == *verdict=degraded* && $state == *forced=1* ]]; then result ok "degraded attached" "read-only"; else result fail "degraded attached" "$(one "$out")"; fi
     cleanup ;;
@@ -239,7 +251,7 @@ for c in $CASES; do
     newloop "$img" -o $((start * 512)) --sizelimit $((size * 512))
     vol=$LOOP
     sudo mkdir -p /mnt/gc-refs
-    out=$(sudo mount -t ReFS "$vol" /mnt/gc-refs 2>&1)
+    out=$(sudo mount -t ReFS "$vol" /mnt/gc-refs 2>&1) || true
     if ! mountpoint -q /mnt/gc-refs && [[ $out == *"SUSPECT: fs.refs.log:"* && $out == *"-o force"* && $out == *"report /run/storage-spaces/reports/refs-"* ]]; then
       result ok "refs refused" "$(grep -m1 SUSPECT <<<"$out" | cut -c1-120)"
     else
@@ -248,8 +260,8 @@ for c in $CASES; do
     # udisks2 (libblockdev) answers "Unknown error" for whatever a mount
     # helper refuses; the helper's reason goes to udisks2's journal.
     t0=$(date '+%F %T')
-    out=$(sudo udisksctl mount -b "$vol" --no-user-interaction 2>&1)
-    st=$?
+    st=0
+    out=$(sudo udisksctl mount -b "$vol" --no-user-interaction 2>&1) || st=$?
     j=$(sudo journalctl -u udisks2 --since "$t0" --no-pager -o cat)
     if [[ $st != 0 && $j == *"SUSPECT: fs.refs.log:"* && $j == *"report /run/storage-spaces/reports/refs-"* ]]; then
       result ok "refs udisks refused" "udisks2: $(cut -c1-60 <<<"${out##*: }"); its journal: the reason and the report"
@@ -257,7 +269,7 @@ for c in $CASES; do
       result fail "refs udisks refused" "$(one "$out") / journal: $(one "$j")"
       sudo udisksctl unmount -b "$vol" --no-user-interaction >/dev/null 2>&1 || true
     fi
-    out=$(sudo mount -t ReFS -o force "$vol" /mnt/gc-refs 2>&1)
+    out=$(sudo mount -t ReFS -o force "$vol" /mnt/gc-refs 2>&1) || true
     opts=$(findmnt -no OPTIONS --mountpoint /mnt/gc-refs 2>/dev/null | tail -1)
     if mountpoint -q /mnt/gc-refs && [[ ,$opts, == *,ro,* ]] && sudo ls /mnt/gc-refs >/dev/null; then
       result ok "refs forced" "$opts"
@@ -269,20 +281,20 @@ for c in $CASES; do
   inherit)
     devs=()
     for img in $refsdir/r314mirror/disk*.img; do newloop "$img"; devs+=("$LOOP"); done
-    out=$(sudo "$spaces" attach "${devs[@]}" 2>&1)
+    out=$(sudo "$spaces" attach "${devs[@]}" 2>&1) || true
     if [[ $out == *"not attached"* && $out == *"fs.refs.log"* ]]; then result ok "inherit refused" "suspect: fs.refs.log"; else result fail "inherit refused" "$(one "$out")"; fi
     sudo "$spaces" attach --force "${devs[@]}" >/dev/null 2>&1
     part=$(ours | grep r314mirror | head -1)-p2
     sudo mkdir -p /mnt/gc-inherit
-    out=$(sudo mount -t ReFS "/dev/mapper/$part" /mnt/gc-inherit 2>&1)
+    out=$(sudo mount -t ReFS "/dev/mapper/$part" /mnt/gc-inherit 2>&1) || true
     if ! mountpoint -q /mnt/gc-inherit && [[ $out == *"not mounted"* && $out == *"SUSPECT"* ]]; then
       result ok "inherit mount refused"
     else
       result fail "inherit mount refused" "$(one "$out")"
     fi
-    r=$(sudo refs check --quick "/dev/mapper/$part" 2>&1)
+    r=$(sudo refs check --quick "/dev/mapper/$part" 2>&1) || true
     if [[ $r == *space.verdict* && $r == *"attached as suspect"* ]]; then result ok "inherit verdict" "space.verdict suspect"; else result fail "inherit verdict" "$(one "$r")"; fi
-    out=$(sudo mount -t ReFS -o force "/dev/mapper/$part" /mnt/gc-inherit 2>&1)
+    out=$(sudo mount -t ReFS -o force "/dev/mapper/$part" /mnt/gc-inherit 2>&1) || true
     opts=$(findmnt -no OPTIONS --mountpoint /mnt/gc-inherit 2>/dev/null | tail -1)
     if mountpoint -q /mnt/gc-inherit && [[ ,$opts, == *,ro,* ]]; then result ok "inherit forced" "$opts"; else result fail "inherit forced" "$(one "$out")"; fi
     umount_all
@@ -337,7 +349,7 @@ with open(sys.argv[1], "r+b") as f:
         f.seek(at)
         f.write(data)
 PY
-    sudo "$spaces" detach "$dm" >/dev/null 2>&1
+    sudo "$spaces" detach "$dm" >/dev/null 2>&1 || true
     sudo losetup -d "$hl"
     hguid=$(guid hostile "$h/disk0.img")
     t0=$(date '+%F %T')
@@ -345,7 +357,7 @@ PY
       # An install.sh installation's unit takes udev's events here: each
       # pool attached explicitly.
       newloop "$h/disk0.img"
-      out=$(sudo "$spaces" attach "$LOOP" 2>&1)
+      out=$(sudo "$spaces" attach "$LOOP" 2>&1) || true
       newloop $pools/wc4k/disk0.img
       out+=$'\n'$(sudo "$spaces" attach "$LOOP" 2>&1)
       how="attached one pool at a time"
@@ -378,25 +390,25 @@ PY
     cleanup ;;
   nomatch)
     newloop $pools/wc4k/disk0.img
-    out=$(sudo "$spaces" attach --space nonexistent "$LOOP" 2>&1)
-    rc=$?
+    rc=0
+    out=$(sudo "$spaces" attach --space nonexistent "$LOOP" 2>&1) || rc=$?
     if [[ $rc != 0 && $out == *'no space named "nonexistent" in the pools found'* && -z $(ours | grep wc4k) ]]; then
       result ok "nomatch space" "exit $rc"
     else
       result fail "nomatch space" "exit $rc: $(one "$out")"
     fi
-    out=$(sudo "$spaces" attach --pool nonexistent "$LOOP" 2>&1)
-    rc=$?
+    rc=0
+    out=$(sudo "$spaces" attach --pool nonexistent "$LOOP" 2>&1) || rc=$?
     if [[ $rc != 0 && $out == *'of a pool named "nonexistent"'* && -z $(ours | grep wc4k) ]]; then
       result ok "nomatch pool" "exit $rc"
     else
       result fail "nomatch pool" "exit $rc: $(one "$out")"
     fi
-    out=$(sudo "$spaces" check --json --space nonexistent "$LOOP" 2>/dev/null)
-    rc=$?
+    rc=0
+    out=$(sudo "$spaces" check --json --space nonexistent "$LOOP" 2>/dev/null) || rc=$?
     if [[ $rc != 0 && $out == "[]" ]]; then result ok "nomatch check" "[] and exit $rc"; else result fail "nomatch check" "exit $rc: $(one "$out")"; fi
-    out=$(sudo "$spaces" detach nonexistent 2>&1)
-    rc=$?
+    rc=0
+    out=$(sudo "$spaces" detach nonexistent 2>&1) || rc=$?
     if [[ $rc != 0 && $out == *'no attached space named "nonexistent"'* ]]; then
       result ok "nomatch detach" "exit $rc"
     else
@@ -420,30 +432,30 @@ PY
     dup_space=$(guid wc4k "$d/disk0.img")
     newloop $pools/wc4k/disk0.img
     newloop "$d/disk0.img"
-    out=$(sudo "$spaces" attach --pool ss-wc4k 2>&1)
-    rc=$?
+    rc=0
+    out=$(sudo "$spaces" attach --pool ss-wc4k 2>&1) || rc=$?
     if [[ $rc != 0 && -n $wc_pool && -n $dup_pool && $out == *"names 2 pools"*"$wc_pool"* &&
       $out == *"$dup_pool"* && -z $(ours | grep wc4k) ]]; then
       result ok "dupname pool" "exit $rc"
     else
       result fail "dupname pool" "exit $rc: $(one "$out")"
     fi
-    out=$(sudo "$spaces" attach --pool "$wc_pool" 2>&1 && sudo "$spaces" attach --pool "$dup_pool" 2>&1)
-    rc=$?
+    rc=0
+    out=$(sudo "$spaces" attach --pool "$wc_pool" 2>&1 && sudo "$spaces" attach --pool "$dup_pool" 2>&1) || rc=$?
     if [[ $rc == 0 && $(ours | grep -c wc4k) == 2 ]]; then
       result ok "dupname attach" "$(ours | grep wc4k | tr '\n' ' ')"
     else
       result fail "dupname attach" "exit $rc: $(one "$out")"
     fi
-    out=$(sudo "$spaces" detach wc4k 2>&1)
-    rc=$?
+    rc=0
+    out=$(sudo "$spaces" detach wc4k 2>&1) || rc=$?
     if [[ $rc != 0 && $out == *"names 2 attached spaces"* && $(ours | grep -c wc4k) == 2 ]]; then
       result ok "dupname detach" "exit $rc"
     else
       result fail "dupname detach" "exit $rc: $(one "$out"), left: $(ours | grep wc4k | tr '\n' ' ')"
     fi
-    out=$(sudo "$spaces" detach "$dup_space" 2>&1)
-    rc=$?
+    rc=0
+    out=$(sudo "$spaces" detach "$dup_space" 2>&1) || rc=$?
     left=$(ours | grep wc4k | tr '\n' ' ')
     if [[ $rc == 0 && -n $dup_space && $left == "ss-ss_wc4k-wc4k " ]]; then
       result ok "dupname detach GUID" "left: $left"

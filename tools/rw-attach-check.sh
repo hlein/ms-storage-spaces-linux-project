@@ -24,7 +24,7 @@ mkdir -p "$work"
 cp --sparse=always "$src"/disk*.img "$src"/manifest.json "$work/"
 loops=() parts=() dev=
 cleanup() {
-  [[ -n $dev ]] && "$spaces" detach "$(basename "$dev")" >/dev/null 2>&1 || true
+  if [[ -n $dev ]]; then "$spaces" detach "$(basename "$dev")" >/dev/null 2>&1 || true; fi
   for p in "${parts[@]}"; do dmsetup remove "$(basename "$p")" 2>/dev/null || true; done
   for l in "${loops[@]}"; do losetup -d "$l" 2>/dev/null || true; done
 }

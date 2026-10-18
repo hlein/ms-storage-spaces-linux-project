@@ -75,7 +75,7 @@ disks are never written, unless a space is attached read-write
 | From a checkout: `cargo build --release && sudo contrib/install.sh` | `spaces`, `refs`, `mount.ReFS`, man pages, udev rule, systemd unit, module list | any distribution |
 | Debian/Ubuntu package: `contrib/deb/build-deb.sh && sudo apt install ./target/deb/storage-spaces_*.deb` | the same, as a package | Debian, Ubuntu |
 | Arch Linux: `(cd contrib/arch && makepkg -si)` | the same, as a package | Arch |
-| The releases page of the repository | static `spaces` and `refs` binaries (x86_64, musl) and a `.deb`, with `SHA256SUMS` (from 1.1.0; 1.0.0 had no `refs`) | trying it out; `sha256sum -c SHA256SUMS` first |
+| The releases page of the repository | static `spaces` and `refs` binaries (x86_64, musl) and a `.deb`, with `SHA256SUMS` (from 1.1.0; 1.0.0 had no `refs`) and, from 1.3, `THIRD-PARTY-NOTICES.txt` (the licences of what the binaries link) | trying it out; `sha256sum -c SHA256SUMS` first (it is not signed: it shows a damaged download, not a file swapped on the page) |
 | `cargo install --locked --path crates/spaces-cli --bin spaces` (and `crates/refs-cli`) | the binary only, no udev rule or unit (without `--bin spaces` also `spaces-pattern`, the write tests' pattern writer, which writes member devices without a plan, `--yes` or the guard) | development |
 
 `contrib/install.sh` (as root; it takes the path of `spaces` if it was
@@ -993,10 +993,15 @@ security`, scores 9.5 UNSAFE before, 5.1 MEDIUM after):
 * `storage-spaces-attach.service` (installed by `contrib/install.sh`):
   no new privileges, the file system read-only except `/run`, a private
   `/tmp`, no namespaces, no network but local sockets and netlink, and
-  without 24 capabilities it has no use for (a deny-list:
-  `CapabilityBoundingSet=~...`; those device-mapper and the module loader
-  need, CAP_SYS_ADMIN and CAP_SYS_MODULE, stay, and so do others such as
-  CAP_SYS_RAWIO and CAP_DAC_OVERRIDE; there is no system call filter). Home
+  without 24 capabilities it has no use for. That is a deny-list
+  (`CapabilityBoundingSet=~...`): the 17 others stay, CAP_SYS_ADMIN
+  (device-mapper, loop devices, mounts) and CAP_SYS_MODULE (the module
+  loader) among them, and with them CAP_SYS_RAWIO, CAP_DAC_OVERRIDE,
+  CAP_DAC_READ_SEARCH, CAP_CHOWN, CAP_FOWNER, CAP_FSETID, CAP_MKNOD,
+  CAP_SETFCAP, CAP_IPC_LOCK, CAP_IPC_OWNER, CAP_LEASE, CAP_SYS_NICE,
+  CAP_SYS_RESOURCE, CAP_NET_BIND_SERVICE and CAP_NET_BROADCAST, which it
+  has not been shown to need; and no system call filter. (`mount.ReFS`
+  starts its unit with an allow-list of 7 instead.) Home
   directories stay readable, as pool disks may be image files. The
   private `/tmp` is an empty file system of its own
   (`TemporaryFileSystem=`), not `PrivateTmp=`: that orders a unit after

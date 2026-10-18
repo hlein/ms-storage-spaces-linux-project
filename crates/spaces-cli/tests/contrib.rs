@@ -217,3 +217,22 @@ fn no_module_is_listed_to_load_at_boot() {
     );
     assert!(!contrib("arch/PKGBUILD").contains("modules-load.d"));
 }
+
+/// The packages say whose the software is and under which licences what
+/// they link may be shipped (audit 2026-10-16, M26): the deb a DEP-5
+/// copyright naming the holder (1.2.2 shipped the bare GPL text) and a
+/// maintainer that is no placeholder, the deb and the Arch package the
+/// third-party notices.
+#[test]
+fn the_packages_name_the_holder_and_ship_the_licence_notices() {
+    let copyright = contrib("deb/copyright");
+    assert!(copyright.starts_with("Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/"));
+    assert!(copyright.contains("\nCopyright: 2026 w0w\n"), "{copyright}");
+    assert!(copyright.contains("License: GPL-2.0-or-later"));
+    let deb = contrib("deb/build-deb.sh");
+    assert!(!deb.contains("example.invalid"), "a placeholder maintainer");
+    assert!(deb.contains("Installed-Size:") && deb.contains("-Zxz"));
+    assert!(deb.contains("third-party-notices.py") && deb.contains("THIRD-PARTY-NOTICES.txt"));
+    let arch = contrib("arch/PKGBUILD");
+    assert!(arch.contains("third-party-notices.py") && arch.contains("/usr/share/licenses/"));
+}

@@ -2,82 +2,149 @@ name: CI
 
 on:
   push:
+    branches: [main]
+    tags: ["v*"]
   pull_request:
   schedule:
     # Advisories appear after a release: look again every week.
     - cron: "17 4 * * 1"
 
+# The jobs read the repository and nothing else.
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
 
+# Actions are pinned by commit (the tag each was in use with is named).
 jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: Install build dependencies
         run: sudo apt-get update && sudo apt-get install -y libclang-dev
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # 2026-10-09
         with:
+          toolchain: stable
           components: rustfmt, clippy
       - name: Format
         run: cargo fmt --all --check
       - name: No unsafe code in the project
         run: |
-          missing=$(grep -L 'forbid(unsafe_code)' crates/*/src/lib.rs crates/*/src/main.rs 2>/dev/null || true)
+          # grep -L: 1 when it lists no file (none missing), 2 on an error.
+          missing=$(grep -L 'forbid(unsafe_code)' crates/*/src/lib.rs crates/*/src/main.rs crates/*/src/bin/*.rs || test $? = 1)
           test -z "$missing" || { echo "no #![forbid(unsafe_code)] in: $missing"; exit 1; }
       - name: Clippy
-        run: cargo clippy --all-targets -- -D warnings
+        run: |
+          cargo clippy --all-targets -- -D warnings
+          cargo clippy -p spaces-cli --features test-hooks --all-targets -- -D warnings
       - name: Tests (fixtures; the image corpus is not in the repository)
         run: cargo test --all-targets
+      - name: Tests of the test builds (feature test-hooks)
+        run: cargo test -p spaces-cli --features test-hooks --all-targets
       - name: Build without optional backends
         run: cargo build -p spaces-cli -p refs-cli --no-default-features
+
+  scripts:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - run: sudo apt-get update && sudo apt-get install -y shellcheck
+      - name: shellcheck (tools, contrib)
+        run: |
+          shellcheck --version
+          files=$(grep -lE '^#!/bin/(ba)?sh' tools/*.sh contrib/*.sh contrib/mount.refs contrib/deb/*.sh contrib/arch/storage-spaces.install)
+          shellcheck -x $files
 
   supply-chain:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: Licenses, advisories, sources (deny.toml)
-        uses: EmbarkStudios/cargo-deny-action@v2
-      - uses: dtolnay/rust-toolchain@stable
+        uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # 2026-10-09
+        with:
+          toolchain: stable
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ~/.cargo/bin/cargo-audit
+          key: cargo-audit-0.22.2
       - name: Advisories (RustSec)
-        run: cargo install cargo-audit --locked && cargo audit
+        run: |
+          command -v cargo-audit >/dev/null || cargo install cargo-audit --version 0.22.2 --locked
+          cargo audit
 
   msrv:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - run: sudo apt-get update && sudo apt-get install -y libclang-dev
-      - uses: dtolnay/rust-toolchain@1.89
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # 2026-10-09
+        with:
+          toolchain: "1.89"
       - run: cargo build --all-targets
 
   musl:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - run: sudo apt-get update && sudo apt-get install -y libclang-dev musl-tools
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # 2026-10-09
         with:
+          toolchain: stable
           targets: x86_64-unknown-linux-musl
-      - name: Static binary
-        run: cargo build --release --target x86_64-unknown-linux-musl -p spaces-cli -p refs-cli
-      - uses: actions/upload-artifact@v4
+          components: rust-docs
+      - name: Static binaries (paths remapped, symbols stripped)
+        run: tools/build-static.sh
+      - name: Smoke run of the static binaries
+        run: |
+          bin=target/x86_64-unknown-linux-musl/release
+          ldd "$bin/spaces" 2>&1 | grep -q 'not a dynamic executable\|statically linked'
+          "$bin/spaces" --version && "$bin/refs" --version
+          work=$(mktemp -d)
+          for i in 0 1 2; do truncate -s 4G "$work/disk$i.img"; done
+          "$bin/spaces" pool create --name smoke --yes "$work"/disk*.img
+          "$bin/spaces" space create --name data --resiliency mirror --size 1G --yes "$work"/disk*.img
+          "$bin/spaces-pattern" "$work"/disk*.img --space data --offset 0 --length 1048576 --tag smoke
+          "$bin/spaces" check-pattern "$work"/disk*.img --space data --length 1048576 --tag smoke
+          "$bin/spaces" check --json "$work"/disk*.img | grep -q '"verdict": "healthy"'
+          rm -rf "$work"
+      - name: Licence notices
+        run: tools/third-party-notices.py --target x86_64-unknown-linux-musl THIRD-PARTY-NOTICES.txt
+      - name: Debian package
+        run: |
+          BIN_DIR=target/x86_64-unknown-linux-musl/release contrib/deb/build-deb.sh target/deb
+          deb=$(ls target/deb/*.deb)
+          dpkg-deb -I "$deb"
+          dpkg-deb -c "$deb" | tee contents.txt
+          grep -q 'usr/share/doc/storage-spaces/THIRD-PARTY-NOTICES.txt.gz' contents.txt
+          grep -q 'usr/share/doc/storage-spaces/copyright' contents.txt
+          ! grep -q 'spaces-pattern\|modules-load' contents.txt
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: spaces-x86_64-linux-musl
           path: |
             target/x86_64-unknown-linux-musl/release/spaces
             target/x86_64-unknown-linux-musl/release/refs
+            THIRD-PARTY-NOTICES.txt
+            target/deb/*.deb
 
   fuzz:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # 2026-10-09
         with:
+          toolchain: nightly
           components: rustfmt
       - name: Format
         run: cd fuzz && cargo fmt --check
-      - run: cargo install cargo-fuzz --locked
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ~/.cargo/bin/cargo-fuzz
+          key: cargo-fuzz-0.13.2
+      - run: command -v cargo-fuzz >/dev/null || cargo install cargo-fuzz --version 0.13.2 --locked
       - name: Fuzz smoke run (30 s per target)
         run: |
           for t in $(cargo fuzz list); do

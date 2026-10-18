@@ -17,7 +17,7 @@ rm -rf -- "${dir:?}"
 mkdir -p "$dir"
 for i in 0 1 2 3; do truncate -s 8G "$dir/d$i.img"; done
 pool=("$dir"/d0.img "$dir"/d1.img "$dir"/d2.img)
-q() { "$spaces" "$@" --yes | grep -vE "^step [0-9]+:" || true; }
+q() { "$spaces" "$@" --yes | sed -E "/^step [0-9]+:/d"; }
 
 q pool create --name ss-lifecycle "${pool[@]}"
 q space create --name lsimple --resiliency simple --size 2G "${pool[@]}"

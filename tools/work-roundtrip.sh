@@ -24,7 +24,8 @@ m["files"] = json.load(open(f"{w}/files.json"))
 json.dump(m, open(f"{w}/manifest.json", "w"), indent=1)
 PY
 fi
-n=$(ls "$work"/disk*.img | wc -l)
+disks=("$work"/disk*.img)
+n=${#disks[@]}
 tools/vm.sh "New-Item -ItemType Directory -Force C:\\sstest\\roundtrip\\$name | Out-Null" >/dev/null
 for ((i = 0; i < n; i++)); do
   python3 tools/raw2vhdx.py "$work/disk$i.img" "$work/disk$i.vhdx" >/dev/null
@@ -32,13 +33,17 @@ for ((i = 0; i < n; i++)); do
   rm -f -- "$work/disk$i.vhdx"
 done
 tools/vm.sh -put "$work/manifest.json" "C:/sstest/roundtrip/$name/manifest.json"
-tools/vm.sh -f tools/vm/Test-RoundTrip.ps1 -Name "$name" "$@" || true
+# Its exit status is kept: the summary below shows what it found first.
+rc=0
+tools/vm.sh -f tools/vm/Test-RoundTrip.ps1 -Name "$name" "$@" || rc=$?
 tools/vm.sh -get "C:/sstest/roundtrip/$name/roundtrip.json" "$work/roundtrip.json"
 python3 - "$work/roundtrip.json" <<'PY'
 import json, re, sys
 r = json.load(open(sys.argv[1], encoding="utf-8-sig"))
+bad = 0
 if r.get("error"):
     print("error:", r["error"])
+    bad += 1
 for k in ("attached", "repaired"):
     s = r.get(k)
     if s:
@@ -50,4 +55,10 @@ for c in r.get("checks", []):
             c["chkdsk_exit"], c["files"], len(c["mismatching"]),
             re.findall(r"file record segment \w+", c["chkdsk"]))
     print("check", c["space"], c["kind"], "ok" if c["ok"] else "FAILED", extra)
+bad += sum(1 for c in r.get("checks", []) if not c["ok"])
+if bad:
+    print(f"{bad} problem(s): the round trip failed")
+sys.exit(1 if bad else 0)
 PY
+# A failure of the run on Windows that its summary does not show.
+((rc == 0)) || { echo "Test-RoundTrip.ps1 failed (exit $rc)" >&2; exit "$rc"; }

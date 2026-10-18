@@ -76,7 +76,8 @@ the pool, its disks and the verdict of each space.
 Packages: `contrib/deb/build-deb.sh` builds a Debian/Ubuntu package,
 `contrib/arch/PKGBUILD` an Arch Linux one, and the
 [releases page](https://github.com/woffko/ms-storage-spaces-linux-project/releases)
-has a static x86_64 `spaces` and a `.deb` (with `SHA256SUMS`); what the
+has static x86_64 `spaces` and `refs` binaries and a `.deb` (with
+`SHA256SUMS`, unsigned, and the third-party licence notices); what the
 installation needs and puts where is in the
 [user guide](docs/user-guide.md#installing). Without installing anything,
 pools can be inspected and copied out:

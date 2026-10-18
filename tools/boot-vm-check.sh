@@ -93,8 +93,12 @@ restart() {
 }
 restart
 
-vm 'bash -s' <<'REMOTE' || true
-set -u
+# Its status is kept (the restart and the cleanup below come all the same).
+first=0
+vm 'bash -s' <<'REMOTE' || first=$?
+# A command that fails where no case expects it ends this part, naming it.
+set -Eeuo pipefail
+trap 'echo "FAIL harness: line $LINENO: $BASH_COMMAND (exit $?)"' ERR
 pass=0 fail=0
 result() {
   if [[ $1 == ok ]]; then echo "PASS $2${3:+ ($3)}"; pass=$((pass + 1));
@@ -104,12 +108,19 @@ part=$(cat /var/tmp/boot-check.part)
 j() { sudo journalctl -b --no-pager "$@"; }
 mono() { systemctl show -p "$2" --value "$1"; } # monotonic microseconds
 
-n=$(j -o cat | grep -c 'ordering cycle')
-if [[ $n == 0 ]]; then result ok cycles; else result fail cycles "$n lines: $(j -o cat | grep -m1 'ordering cycle')"; fi
+# The boot's journal, which must be there to look in (without it 1.2.2's
+# harness found no cycle and passed).
+lines=$(j -o cat | wc -l)
+n=$(j -o cat | grep -c 'ordering cycle' || true)
+if ((lines < 100)); then result fail cycles "the boot's journal has $lines lines: nothing to look in"
+elif [[ $n == 0 ]]; then result ok cycles "in $lines lines"
+else result fail cycles "$n lines: $(j -o cat | grep -m1 'ordering cycle')"; fi
 
 target=$(mono local-fs-pre.target ActiveEnterTimestampMonotonic)
-f=$(sudo sh -c 'grep -l "^dm=ss-ss_ntfstier-ntfstier$" /run/storage-spaces/*.state' 2>/dev/null | head -1)
-unit=$(sudo sed -n 's/^unit=//p' "$f" 2>/dev/null)
+# Empty when the space is not attached: "early" says so.
+f=$(sudo sh -c 'grep -l "^dm=ss-ss_ntfstier-ntfstier$" /run/storage-spaces/*.state' 2>/dev/null | head -1 || true)
+unit=
+[[ -n $f ]] && unit=$(sudo sed -n 's/^unit=//p' "$f")
 started=0
 [[ -n $unit ]] && started=$(mono "$unit" ExecMainStartTimestampMonotonic)
 if [[ -b /dev/mapper/ss-ss_ntfstier-ntfstier && $started -gt 0 && $started -lt $target ]]; then
@@ -150,8 +161,11 @@ REMOTE
 restart
 
 vm 'bash -s' <<'REMOTE'
-set -u
-read -r pass _ fail _ < /var/tmp/boot-check.first
+set -Eeuo pipefail
+trap 'echo "FAIL harness: line $LINENO: $BASH_COMMAND (exit $?)"' ERR
+pass=0 fail=1
+# The first part's counts (none when it ended early: one failure then).
+[[ -s /var/tmp/boot-check.first ]] && read -r pass _ fail _ < /var/tmp/boot-check.first
 result() {
   if [[ $1 == ok ]]; then echo "PASS $2${3:+ ($3)}"; pass=$((pass + 1));
   else echo "FAIL $2: $3"; fail=$((fail + 1)); fi
@@ -175,17 +189,21 @@ else
   result fail shutdown "unmounted at ${unmounted} s, the server ($unit) stopping at ${stopping} s"
 fi
 
-# Cleanup: what this check set up, and the package.
-sudo umount /mnt/sstest-boot 2>/dev/null
+# Cleanup: what this check set up, and the package (each step best
+# effort: what is not there need not go).
+trap - ERR
+set +e
+mountpoint -q /mnt/sstest-boot && sudo umount /mnt/sstest-boot
 sudo sed -i '\|# sstest boot-vm-check|d' /etc/fstab
 sudo rmdir /mnt/sstest-boot 2>/dev/null
 sudo systemctl disable sstest-boot-loops.service 2>/dev/null
 sudo rm -f /etc/systemd/system/sstest-boot-loops.service
 sudo /usr/sbin/spaces detach ntfstier >/dev/null 2>&1
 for l in $(losetup -a | grep /sstest-boot/ | cut -d: -f1); do sudo losetup -d "$l"; done
-sudo dpkg -r storage-spaces >/dev/null
+sudo dpkg -r storage-spaces >/dev/null || { echo "FAIL cleanup: dpkg -r storage-spaces"; fail=$((fail + 1)); }
 sudo systemctl daemon-reload
 rm -f /tmp/boot-check.deb /var/tmp/boot-check.part /var/tmp/boot-check.unit /var/tmp/boot-check.first
 echo "$pass passed, $fail failed (systemd $(systemctl --version | awk 'NR==1 {print $2}'))"
 [[ $fail == 0 ]]
 REMOTE
+((first == 0)) || { echo "the checks after the first restart ended early (exit $first)" >&2; exit 1; }

@@ -10,7 +10,7 @@ arch=('x86_64')
 url='https://github.com/woffko/ms-storage-spaces-linux-project'
 license=('GPL-2.0-or-later')
 depends=('device-mapper' 'systemd' 'gcc-libs')
-makedepends=('cargo' 'clang')
+makedepends=('cargo' 'clang' 'python')
 optdepends=('nbd: NBD backend (nbd-client)'
             'fuse3: FUSE backend and refs mount'
             'ntfs-3g: mounting NTFS volumes with FUSE (the kernel has ntfs3)')
@@ -28,7 +28,11 @@ prepare() {
 
 build() {
   _root
-  CARGO_TARGET_DIR="$srcdir/target" cargo build --frozen --release -p spaces-cli -p refs-cli
+  # The binaries name no path of this machine (as tools/build-static.sh).
+  local remap="--remap-path-prefix=$srcdir/target=/target --remap-path-prefix=$PWD=/build"
+  remap+=" --remap-path-prefix=${CARGO_HOME:-$HOME/.cargo}=/cargo"
+  RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }$remap" CARGO_TARGET_DIR="$srcdir/target" \
+    cargo build --frozen --release -p spaces-cli -p refs-cli
 }
 
 check() {
@@ -49,6 +53,9 @@ package() {
   done
   install -Dm644 contrib/man/spaces.8 "$pkgdir/usr/share/man/man8/spaces.8"
   install -Dm644 contrib/man/refs.1 "$pkgdir/usr/share/man/man1/refs.1"
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+  python tools/third-party-notices.py --target "$(rustc -vV | sed -n 's/host: //p')" \
+    "$pkgdir/usr/share/licenses/$pkgname/THIRD-PARTY-NOTICES.txt"
   install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
   install -Dm644 docs/user-guide.md "$pkgdir/usr/share/doc/$pkgname/user-guide.md"
 }

@@ -3,8 +3,11 @@
 # Usage: [BIN_DIR=dir] contrib/deb/build-deb.sh [output dir]
 #   (after cargo build --release -p spaces-cli -p refs-cli)
 # BIN_DIR is where spaces and refs are (default target/release). A package for
-# every distribution wants the static musl build: BIN_DIR=target/x86_64-unknown-linux-musl/release
-# (a build on a new distribution links its glibc, which older ones lack).
+# every distribution wants the static musl build (tools/build-static.sh):
+# BIN_DIR=target/x86_64-unknown-linux-musl/release (a build on a new
+# distribution links its glibc, which older ones lack). The licence notices
+# of what the binaries link come from tools/third-party-notices.py, for the
+# target BIN_DIR names (python3, cargo and the crates fetched).
 set -euo pipefail
 root=$(cd "$(dirname "$0")/../.." && pwd)
 bin=${BIN_DIR:-$root/target/release}
@@ -29,14 +32,21 @@ install -D -m 644 "$root/contrib/man/spaces.8" "$stage/usr/share/man/man8/spaces
 gzip -9n "$stage/usr/share/man/man8/spaces.8"
 install -D -m 644 "$root/contrib/man/refs.1" "$stage/usr/share/man/man1/refs.1"
 gzip -9n "$stage/usr/share/man/man1/refs.1"
-install -D -m 644 "$root/LICENSE" "$stage/usr/share/doc/storage-spaces/copyright"
+install -D -m 644 "$root/contrib/deb/copyright" "$stage/usr/share/doc/storage-spaces/copyright"
+case $bin in
+  *musl*) target=x86_64-unknown-linux-musl ;;
+  *) target=$(rustc -vV | sed -n 's/^host: //p') ;;
+esac
+(cd "$root" && python3 tools/third-party-notices.py --target "$target" "$stage/usr/share/doc/storage-spaces/THIRD-PARTY-NOTICES.txt")
+gzip -9n "$stage/usr/share/doc/storage-spaces/THIRD-PARTY-NOTICES.txt"
 
 mkdir -p "$stage/DEBIAN"
 cat > "$stage/DEBIAN/control" <<CONTROL
 Package: storage-spaces
 Version: $version
 Architecture: $arch
-Maintainer: storage-spaces developers <noreply@example.invalid>
+Maintainer: w0w <2505149+woffko@users.noreply.github.com>
+Installed-Size: @SIZE@
 Depends: dmsetup, systemd, udev
 Recommends: nbd-client, fuse3
 Suggests: ntfs-3g
@@ -47,9 +57,11 @@ Description: read, write and manage Microsoft Storage Spaces pools on Linux
  Assembles Windows 11 Storage Spaces pools from their member disks and
  exposes every virtual disk as a block device under
  /dev/mapper/ss-<pool>-<space>, attached automatically (read-only) when the
- disks appear; spaces can be attached read-write, and pools, spaces and
- disks created and changed the way Windows does. Includes refs, which reads
- ReFS volumes (also inside a space) and mounts them read-only with FUSE.
+ disks appear and their checks find them healthy; spaces can be attached
+ read-write, and pools, spaces and disks created and changed the way
+ Windows does. Includes refs, which reads ReFS volumes (also inside a
+ space), checks them, and mounts them with FUSE (read-only unless asked:
+ mount -t ReFS -o rw,refs.rw).
 CONTROL
 cat > "$stage/DEBIAN/preinst" <<'PREINST'
 #!/bin/sh
@@ -156,5 +168,8 @@ fi
 POSTRM
 chmod 755 "$stage/DEBIAN/preinst" "$stage/DEBIAN/postinst" "$stage/DEBIAN/prerm" "$stage/DEBIAN/postrm"
 mkdir -p "$out"
-dpkg-deb --root-owner-group --build "$stage" "$out/storage-spaces_${version}_${arch}.deb" >/dev/null
+size=$(du -sk --exclude=DEBIAN "$stage" | cut -f1)
+sed -i "s/@SIZE@/$size/" "$stage/DEBIAN/control"
+# xz, which every dpkg reads (the zstd of newer ones is unknown to older).
+dpkg-deb -Zxz --root-owner-group --build "$stage" "$out/storage-spaces_${version}_${arch}.deb" >/dev/null
 echo "$out/storage-spaces_${version}_${arch}.deb"

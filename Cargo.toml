@@ -20,3 +20,5 @@ clap = { version = "4.5", features = ["derive"] }
 # not wrap into a plausible value. (The cost is a few percent.)
 [profile.release]
 overflow-checks = true
+# Released binaries carry no symbol table (panics still name file and line).
+strip = "symbols"

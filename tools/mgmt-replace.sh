@@ -17,7 +17,7 @@ pattern=${SPACES_PATTERN:-${spaces%/*}/spaces-pattern}
 rm -rf -- "${dir:?}"
 mkdir -p "$dir"
 for i in 0 1 2 3; do truncate -s 8G "$dir/d$i.img"; done
-q() { "$spaces" "$@" --yes | grep -vE "^step [0-9]+:" || true; }
+q() { "$spaces" "$@" --yes | sed -E "/^step [0-9]+:/d"; }
 q pool create --name ss-replace "$dir"/d{0,1,2}.img
 q space create --name rmirror --resiliency mirror --size 1G "$dir"/d{0,1,2}.img
 q space create --name rparity --resiliency parity --size 2G "$dir"/d{0,1,2}.img

@@ -20,7 +20,7 @@ for f in "$src"/disk*.img; do cp --sparse=always "$f" "$dir/d$n.img"; n=$((n + 1
 truncate -s 8G "$dir/d$n.img"
 pool=()
 for ((i = 0; i < n; i++)); do pool+=("$dir/d$i.img"); done
-q() { "$spaces" "$@" --yes | grep -vE "^step [0-9]+:" || true; }
+q() { "$spaces" "$@" --yes | sed -E "/^step [0-9]+:/d"; }
 space=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1],encoding="utf-8-sig"))["space"]["name"])' "$src/manifest.json")
 size=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1],encoding="utf-8-sig"))["space"]["size"])' "$src/manifest.json")
 

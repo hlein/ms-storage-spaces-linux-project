@@ -28,12 +28,12 @@ mkdir -p "$work" "$mnt"
 cp --sparse=always "$src"/disk*.img "$src"/manifest.json "$work/"
 disks=("$work"/disk*.img)
 
-pid= dev=
+pid='' dev=''
 cleanup() {
-  mountpoint -q "$mnt" && umount "$mnt" || true
-  [[ $backend == nbd && -n $dev ]] && nbd-client -d "$dev" >/dev/null 2>&1 || true
-  [[ -n $pid ]] && kill "$pid" 2>/dev/null && wait "$pid" 2>/dev/null || true
-  pid= dev=
+  if mountpoint -q "$mnt"; then umount "$mnt" || true; fi
+  if [[ $backend == nbd && -n $dev ]]; then nbd-client -d "$dev" >/dev/null 2>&1 || true; fi
+  if [[ -n $pid ]] && kill "$pid" 2>/dev/null; then wait "$pid" 2>/dev/null || true; fi
+  pid='' dev=''
 }
 trap cleanup EXIT
 

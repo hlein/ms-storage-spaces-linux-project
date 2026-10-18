@@ -1,0 +1,5 @@
+# shellcheck over tools/ and contrib/ (CI, job "scripts"):
+# SC2029: the VM scripts expand values on this side for the remote shell
+#         (vm "mkdir -p $store/pools") on purpose;
+# SC2016: and keep '$' in single quotes for the remote shell to expand.
+disable=SC2029,SC2016

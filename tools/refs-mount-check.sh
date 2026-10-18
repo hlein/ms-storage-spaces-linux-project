@@ -27,7 +27,7 @@
 # Usage: [REFS=binary] tools/refs-mount-check.sh --rw IMAGE [CASE...]
 # REFS names the refs binary to check (built here otherwise).
 set -uo pipefail
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/.." || exit
 refs=${REFS:-target/release/refs}
 [[ -n ${REFS:-} ]] || cargo build --release -q -p refs-cli || exit 1
 if [[ ${1:-} == --rw ]]; then
@@ -141,14 +141,19 @@ EOF
   exit
 fi
 names=("$@")
-((${#names[@]})) || mapfile -t names < <(ls testdata/refs)
+given=${#names[@]}
+((given)) || names=(testdata/refs/*) names=("${names[@]#testdata/refs/}")
 mnt=$(mktemp -d)
 trap 'fusermount -u "$mnt" 2>/dev/null; rmdir "$mnt"' EXIT
 trap 'exit 130' INT TERM
-failed=0
+failed=0 checked=0
 for name in "${names[@]}"; do
   dir=testdata/refs/$name
-  [[ -f $dir/manifest.json ]] || continue
+  if [[ ! -f $dir/manifest.json ]]; then
+    # A volume asked for and not there is a failure (1.2.2 skipped it).
+    if ((given)); then echo "FAIL $name: no testdata/refs/$name/manifest.json"; failed=1; fi
+    continue
+  fi
   # A volume inside a space: the pool's disks and the space's name.
   space=$(python3 -c 'import json, sys; p = json.load(open(sys.argv[1], encoding="utf-8-sig")).get("pool"); print(p["space"] if p else "")' "$dir/manifest.json")
   if [[ -n $space ]]; then
@@ -156,7 +161,11 @@ for name in "${names[@]}"; do
   else
     source=("$dir/disk.img")
   fi
-  [[ -f ${source[-1]} ]] || continue
+  if [[ ! -f ${source[-1]} ]]; then
+    if ((given)); then echo "FAIL $name: no ${source[-1]}"; failed=1; fi
+    continue
+  fi
+  checked=$((checked + 1))
   # Read as it is (the guard's verdict has tests of its own): since 1.2.1
   # two volumes of the corpus, taken with log records past their checkpoint,
   # are suspect and were not mounted, so not compared.
@@ -227,4 +236,6 @@ EOF
   fusermount -u "$mnt"
   wait "$pid"
 done
+# Nothing compared proves nothing.
+if ((checked == 0)); then echo "FAIL: no volume was compared"; exit 1; fi
 exit $failed

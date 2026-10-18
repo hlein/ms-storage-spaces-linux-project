@@ -20,7 +20,7 @@ rm -rf -- "${dir:?}"
 mkdir -p "$dir/base"
 for i in 0 1 2 3; do truncate -s 8G "$dir/base/disk$i.img"; done
 base=("$dir"/base/disk{0,1,2,3}.img)
-q() { "$spaces" "$@" --yes | grep -vE "^step [0-9]+:" || true; }
+q() { "$spaces" "$@" --yes | sed -E "/^step [0-9]+:/d"; }
 q pool create --name ss-health "${base[@]}"
 q space create --name hsimple --resiliency simple --size 1G --columns 1 "${base[@]}"
 q space create --name hwide --resiliency simple --size 1G "${base[@]}"

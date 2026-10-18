@@ -301,8 +301,40 @@
   guide says what has been tried, and what to expect of SELinux, WSL2 and
   kernels before 6.0 (audit 2026-10-16, "Install story").
 
+### Packaging
+
+* The binaries, the deb and the Arch package ship the licence notices of
+  everything the binaries link (`THIRD-PARTY-NOTICES.txt`: the Rust crates,
+  the Rust standard library, musl; `tools/third-party-notices.py`). The deb's
+  `copyright` is a DEP-5 file naming the copyright holder (it was the bare
+  GPL text), its maintainer a project address (it was a placeholder), with
+  `Installed-Size`, xz members that every dpkg reads (the zstd of 1.2.2
+  needed dpkg 1.21.18) and a description that says what refs does now (it
+  said read-only).
+* `tools/build-static.sh` builds the static binaries the releases ship:
+  without the build machine's paths, symbols stripped (the release
+  profile); two builds of one tree in different directories give
+  identical binaries (`tools/repro-check.sh`). `SHA256SUMS` stays unsigned,
+  and the user guide says so.
+* CI: read-only permissions, actions pinned by commit, `cargo install`
+  pinned and cached, pushes of `main` and tags only, shellcheck over
+  `tools/` and `contrib/`, the tests of the feature `test-hooks`, a smoke
+  run of the static binaries, and a deb build whose contents are checked.
+
 ### Testing
 
+* The harnesses fail where something fails: the remote parts of the VM
+  scripts run with `set -e` and an ERR trap that names the command (they
+  went on past it), so every `dpkg -i` is checked; cases that could pass
+  vacuously no longer do (`cycle` first sees a cycle planted into a copy of
+  the unit, `readable` needs files to read, `nbd` all 40 idle connections,
+  the boot check's `cycles` a journal to look in, `nbd` of the install case
+  is skipped where the module cannot be unloaded first); `q()` of the
+  management scripts and the round-trip runners fail with the command or
+  the Windows run that failed (their summary said FAILED and they exited
+  0); `tools/fuzz-long.sh` exits non-zero when a target does not run its
+  time out. `tools/attach-crash-check.sh` keeps fwupd from running while it
+  attaches (it held a ublk partition open and made a detach refuse).
 * `tools/attach-crash-check.sh` case `children` (one attach of two pools,
   the second's checks made to allocate without bound, then to hang:
   test builds), `tools/rw-attach-check.sh` with `IMAGES=1` (a pool on image

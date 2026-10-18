@@ -51,7 +51,10 @@ vm "mkdir -p ~/sstest/attach-check && test -s ~/sstest/pools/wc4k/disk0.img" ||
   { echo "no ~/sstest/pools/wc4k on the VM (tools/guard-check.sh copies it)" >&2; exit 2; }
 scp -q "${ssh_opts[@]}" "$binary" "$host:sstest/attach-check/spaces"
 vm "CASES='$cases' bash -s" <<'REMOTE'
-set -u
+# A command that fails where no case expects it ends the run, naming it
+# (1.2.2's remote parts went on past it).
+set -Eeuo pipefail
+trap 'echo "FAIL harness: line $LINENO: $BASH_COMMAND (exit $?)"' ERR
 pass=0 fail=0
 result() {
   if [[ $1 == ok ]]; then echo "PASS $2${3:+ ($3)}"; pass=$((pass + 1));
@@ -71,7 +74,7 @@ newloop() { # newloop IMAGE [losetup options]: LOOP = a loop device of IMAGE
 guid() { # the GUID of space $1 in the pool of the devices that follow
   local name=$1
   shift
-  sudo "$spaces" check --json "$@" 2>/dev/null | tr -d '\n ' |
+  { sudo "$spaces" check --json "$@" 2>/dev/null || true; } | tr -d '\n ' |
     sed -n "s/.*\"space\":{\"name\":\"$name\",\"guid\":\"\([0-9a-f-]*\)\".*/\1/p"
 }
 left() { # what is left of space $1 (GUID): devices with its UUID, its unit, its state
@@ -82,6 +85,9 @@ left() { # what is left of space $1 (GUID): devices with its UUID, its unit, its
   printf '%s' "$out"
 }
 cleanup() {
+  # Best effort: what is not there need not go.
+  set +e
+  trap - ERR
   local g
   # What the busy case may have left holding a device.
   [[ -s $scratch/holder.pid ]] && sudo kill -9 "$(cat "$scratch/holder.pid")" 2>/dev/null
@@ -101,12 +107,23 @@ cleanup() {
     sudo dmsetup remove --retry "$d" >/dev/null 2>&1 || true
   done
   sudo dmsetup remove "$leftover" >/dev/null 2>&1 || true
+  if [[ ${fwupd:-no} == yes ]]; then sudo systemctl unmask --runtime fwupd.service >/dev/null 2>&1; fwupd=no; fi
   for l in "${loops[@]}"; do sudo losetup -d "$l" 2>/dev/null || true; done
   loops=()
+  # As before (it also runs before the cases, for what a cut-off run left).
+  set -e
+  trap 'echo "FAIL harness: line $LINENO: $BASH_COMMAND (exit $?)"' ERR
 }
 trap cleanup EXIT
 rm -rf "${scratch:?}"
 mkdir -p "$scratch"
+# fwupd probes block devices as they appear and holds one open for a
+# moment, which makes a detach refuse ("in use ... (fwupd)", seen on the
+# 26.10 VM): it is kept from running for this run, and let run again after.
+fwupd=no
+if systemctl list-unit-files fwupd.service >/dev/null 2>&1; then
+  sudo systemctl mask --runtime --now fwupd.service >/dev/null 2>&1 && fwupd=yes
+fi
 
 # The pools: wc4k (a write-back cache: ublk), and a simple space with one
 # partition (device-mapper).
@@ -143,14 +160,14 @@ space_of() {
 # nothing of it is left: "" when all went well, else what did not.
 recover() {
   local out rc missing= p
-  out=$(sudo "$spaces" attach --space "$g" "$loop" 2>&1)
-  rc=$?
+  rc=0
+  out=$(sudo "$spaces" attach --space "$g" "$loop" 2>&1) || rc=$?
   [[ $rc == 0 ]] || { printf 'attach again: exit %s: %s' "$rc" "$(one "$out")"; return; }
   [[ -e /dev/mapper/$name ]] || missing+=" $name"
   for p in $parts; do [[ -e /dev/mapper/$name-$p ]] || missing+=" $name-$p"; done
   [[ -z $missing ]] || { printf 'attached without%s: %s' "$missing" "$(one "$out")"; return; }
-  out=$(sudo "$spaces" detach "$g" 2>&1)
-  rc=$?
+  rc=0
+  out=$(sudo "$spaces" detach "$g" 2>&1) || rc=$?
   [[ $rc == 0 ]] || { printf 'detach: exit %s: %s' "$rc" "$(one "$out")"; return; }
   local l
   l=$(left "$g")
@@ -172,8 +189,8 @@ release() { sudo kill -9 "$(cat "$1")" 2>/dev/null; wait 2>/dev/null; }
 # and the state of the space are still there.
 refused() {
   local out rc missing= p
-  out=$(sudo "$spaces" detach "$g" 2>&1)
-  rc=$?
+  rc=0
+  out=$(sudo "$spaces" detach "$g" 2>&1) || rc=$?
   [[ -e /dev/mapper/$name ]] || missing+=" $name"
   for p in $parts; do [[ -e /dev/mapper/$name-$p ]] || missing+=" $name-$p"; done
   [[ -e /run/storage-spaces/$g.state ]] || missing+=" state"
@@ -186,8 +203,8 @@ refused() {
 # detached CASE: detach of space $g now succeeds and leaves nothing.
 detached() {
   local out rc l
-  out=$(sudo "$spaces" detach "$g" 2>&1)
-  rc=$?
+  rc=0
+  out=$(sudo "$spaces" detach "$g" 2>&1) || rc=$?
   l=$(left "$g")
   if [[ $rc == 0 && -z $l ]]; then result ok "$1"; else result fail "$1" "exit $rc, left:$l: $(one "$out")"; fi
 }
@@ -221,10 +238,10 @@ for c in $CASES; do
     busy_loop=
     detached "busy loop released" ;;
   steps)
-    out=$(sudo env SPACES_ATTACH_STOP_AFTER=state "$spaces" attach --space "$crash" "$crash_loop" 2>&1)
-    rc=$?
+    rc=0
+    out=$(sudo env SPACES_ATTACH_STOP_AFTER=state "$spaces" attach --space "$crash" "$crash_loop" 2>&1) || rc=$?
     if [[ $rc != 99 ]]; then
-      sudo "$spaces" detach "$crash" >/dev/null 2>&1
+      sudo "$spaces" detach "$crash" >/dev/null 2>&1 || true
       result skip steps "this build has no test hooks (exit $rc)"
       continue
     fi
@@ -232,14 +249,14 @@ for c in $CASES; do
       space_of $kind
       for step in state props server dm partition partitions; do
         [[ $kind == crash && $step == server ]] && continue
-        out=$(sudo env SPACES_ATTACH_STOP_AFTER=$step "$spaces" attach --space "$g" "$loop" 2>&1)
-        rc=$?
+        rc=0
+        out=$(sudo env SPACES_ATTACH_STOP_AFTER=$step "$spaces" attach --space "$g" "$loop" 2>&1) || rc=$?
         if [[ $rc != 99 ]]; then
           result fail "steps $kind $step" "the attach did not stop there (exit $rc): $(one "$out")"
           sudo "$spaces" detach "$g" >/dev/null 2>&1 || true
           continue
         fi
-        st=$("$spaces" status 2>&1)
+        st=$("$spaces" status 2>&1) || true
         why=$(recover)
         if [[ -z $why && $st == *"cut off"* ]]; then
           result ok "steps $kind $step"
@@ -262,15 +279,15 @@ for c in $CASES; do
         fi
         sleep 0.01
       done
-      wait 2>/dev/null
+      wait 2>/dev/null || true
       if [[ -z $killed ]]; then
         result fail "kill $kind" "no device appeared to kill the attach at"
-        sudo "$spaces" detach "$g" >/dev/null 2>&1
+        sudo "$spaces" detach "$g" >/dev/null 2>&1 || true
         continue
       fi
       why=$(recover)
       if [[ -z $why ]]; then result ok "kill $kind"; else result fail "kill $kind" "$why"; fi
-      sudo "$spaces" detach "$g" >/dev/null 2>&1
+      sudo "$spaces" detach "$g" >/dev/null 2>&1 || true
     done ;;
   names)
     truncate -s 4G "$scratch/names.img"
@@ -286,16 +303,16 @@ for c in $CASES; do
     photo=$(guid Фото "$names_loop") games=$(guid Игры "$names_loop")
     guids+=("$photo" "$games")
     sudo "$spaces" attach --space "$photo" "$names_loop" >/dev/null 2>&1
-    out=$(sudo "$spaces" attach --space "$games" "$names_loop" 2>&1)
-    rc=$?
-    a=$(sudo sed -n 's/^dm=//p' "/run/storage-spaces/$photo.state" 2>/dev/null | head -1)
-    b=$(sudo sed -n 's/^dm=//p' "/run/storage-spaces/$games.state" 2>/dev/null | head -1)
+    rc=0
+    out=$(sudo "$spaces" attach --space "$games" "$names_loop" 2>&1) || rc=$?
+    a=$(sudo sed -n 's/^dm=//p' "/run/storage-spaces/$photo.state" 2>/dev/null | head -1) || true
+    b=$(sudo sed -n 's/^dm=//p' "/run/storage-spaces/$games.state" 2>/dev/null | head -1) || true
     if [[ $rc == 0 && -n $a && -n $b && $a != "$b" && -e /dev/mapper/$a && -e /dev/mapper/$b ]]; then
       result ok "names attach" "$a $b"
     else
       result fail "names attach" "exit $rc: $(one "$out"); devices: ${a:-none} ${b:-none}, $(ls /dev/mapper | grep ss-ss_names | tr '\n' ' ')"
     fi
-    sudo "$spaces" detach "$games" >/dev/null 2>&1
+    sudo "$spaces" detach "$games" >/dev/null 2>&1 || true
     if [[ -n $a && -e /dev/mapper/$a && -z $(left "$games") ]]; then
       result ok "names detach" "$a stays"
     else
@@ -305,9 +322,9 @@ for c in $CASES; do
   leftovers)
     zeros=00000000-0000-0000-0000-000000000000
     echo "0 8 zero" | sudo dmsetup create "$leftover" --uuid "STORAGESPACES-$zeros-$zeros" >/dev/null
-    st=$(sudo "$spaces" status 2>&1)
-    out=$(sudo "$spaces" detach --leftovers 2>&1)
-    rc=$?
+    st=$(sudo "$spaces" status 2>&1) || true
+    rc=0
+    out=$(sudo "$spaces" detach --leftovers 2>&1) || rc=$?
     if [[ $st == *"/dev/mapper/$leftover"* && $rc == 0 && ! -e /dev/mapper/$leftover ]]; then
       result ok leftovers "named and removed"
     else
@@ -327,10 +344,11 @@ for c in $CASES; do
     for hook in "SPACES_TEST_HOG_POOL SPACES_POOL_MEMORY=512 512 MiB" "SPACES_TEST_HANG_POOL SPACES_POOL_TIMEOUT=5 5 s"; do
       read -r var limit want <<<"$hook"
       start=$(date +%s)
-      out=$(sudo env "$var=ss_hog" "$limit" "$spaces" attach "$crash_loop" "$hog_loop" 2>&1)
-      rc=$? took=$(($(date +%s) - start))
-      sudo "$spaces" detach "$crash" >/dev/null 2>&1
-      sudo "$spaces" detach "$hog" >/dev/null 2>&1
+      rc=0
+      out=$(sudo env "$var=ss_hog" "$limit" "$spaces" attach "$crash_loop" "$hog_loop" 2>&1) || rc=$?
+      took=$(($(date +%s) - start))
+      sudo "$spaces" detach "$crash" >/dev/null 2>&1 || true
+      sudo "$spaces" detach "$hog" >/dev/null 2>&1 || true
       if [[ $out != *"$want"* && $out == *'attached "hog"'* ]]; then
         result skip "children ${var#SPACES_TEST_}" "this build has no test hooks"
       elif [[ $rc != 0 && $out == *'attached "crash"'* && $out != *'attached "hog"'* && $out == *"$want"* && $took -lt 60 ]]; then

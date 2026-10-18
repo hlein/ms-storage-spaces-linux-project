@@ -10,7 +10,7 @@
 # N may list several disks (0,1).
 # Usage: tools/health-drop.sh DIR_LINUX DIR_WINDOWS [N...]
 set -uo pipefail
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/.." || exit
 spaces=$PWD/target/release/spaces
 linux=$1 windows=$2
 shift 2

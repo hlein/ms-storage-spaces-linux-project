@@ -50,7 +50,10 @@ copy() { # copy NAME: testdata/pools/NAME to the VM, unless there already
 [[ " $cases " == *" all "* ]] && copy multi
 scp -q "${ssh_opts[@]}" "$deb" "$host:sstest/multi.deb"
 vm "CASES='$cases' STORE='$store' bash -s" <<'REMOTE'
-set -u
+# A command that fails where no case expects it ends the run, naming it
+# (1.2.2's remote parts went on past it).
+set -Eeuo pipefail
+trap 'echo "FAIL harness: line $LINENO: $BASH_COMMAND (exit $?)"' ERR
 pass=0 fail=0
 result() {
   if [[ $1 == ok ]]; then echo "PASS $2${3:+ ($3)}"; pass=$((pass + 1)); else echo "FAIL $2: $3"; fail=$((fail + 1)); fi
@@ -90,10 +93,13 @@ dev_of() { # dev_of SPACE-GUID: the device of an attached space
 detach_guid() { # detach_guid SPACE-GUID
   local dm
   dm=$(state_of "$1" | sed -n 's/^dm=//p' | head -1)
-  [[ -n $dm ]] && sudo "$spaces" detach "$dm" >/dev/null 2>&1
+  if [[ -n $dm ]]; then sudo "$spaces" detach "$dm" >/dev/null 2>&1 || true; fi
   return 0
 }
 cleanup() {
+  # Best effort: what is not there need not go.
+  set +e
+  trap - ERR
   for f in /run/storage-spaces/*.state; do
     [[ -e $f ]] || continue
     if sudo grep -qE '^pool=(dd2ff933-d79d-4ec4-9344-20361115a818|'"${WPOOL:-none}"')$' "$f"; then
@@ -103,6 +109,9 @@ cleanup() {
   for w in "${wraps[@]}"; do sudo dmsetup remove "$w" 2>/dev/null || true; done
   for l in "${loops[@]}"; do sudo losetup -d "$l" 2>/dev/null || true; done
   wraps=() loops=()
+  # As before (it also runs before the cases, for what a cut-off run left).
+  set -e
+  trap 'echo "FAIL harness: line $LINENO: $BASH_COMMAND (exit $?)"' ERR
 }
 trap 'cleanup; sudo dpkg -r storage-spaces >/dev/null 2>&1; rm -f ~/sstest/multi.deb; rm -rf "${scratch:?}"' EXIT
 sudo dpkg -i ~/sstest/multi.deb >/dev/null
@@ -114,7 +123,7 @@ for c in $CASES; do
       [multi-p]=0c294630-7cb9-4ba0-bde4-1060dc82948c)
     declare -A length=([multi]=1073741824 [multi-s]=3221225472 [multi-p]=2147483648)
     members mvc ro $pools/multi/disk0.img $pools/multi/disk1.img $pools/multi/disk2.img
-    out=$(sudo "$spaces" attach --pool ss-multi "${PARTS[@]}" 2>&1)
+    out=$(sudo "$spaces" attach --pool ss-multi "${PARTS[@]}" 2>&1) || true
     attached=() backends=()
     for s in multi multi-s multi-p; do
       st=$(state_of "${guid[$s]}")
@@ -157,10 +166,10 @@ for c in $CASES; do
       "$spaces" space create --name two --resiliency mirror --size 1G --yes "${imgs[@]}" >/dev/null || {
       result fail writers "the pool could not be made"; continue
     }
-    WPOOL=$("$spaces" check --json "${imgs[@]}" 2>/dev/null | tr -d '\n ' | sed -n 's/.*"pool":{"name":"[^"]*","guid":"\([0-9a-f-]*\)".*/\1/p')
+    WPOOL=$({ "$spaces" check --json "${imgs[@]}" 2>/dev/null || true; } | tr -d '\n ' | sed -n 's/.*"pool":{"name":"[^"]*","guid":"\([0-9a-f-]*\)".*/\1/p')
     members mvw rw "${imgs[@]}"
-    out=$(sudo "$spaces" attach --pool ss_writers "${PARTS[@]}" 2>&1)
-    pairs=$("$spaces" check --json "${imgs[@]}" 2>/dev/null | tr -d '\n ' | grep -o '"space":{"name":"[a-z]*","guid":"[0-9a-f-]*"' | sed 's/.*"name":"\([a-z]*\)","guid":"\([0-9a-f-]*\)"/\1=\2/')
+    out=$(sudo "$spaces" attach --pool ss_writers "${PARTS[@]}" 2>&1) || true
+    pairs=$("$spaces" check --json "${imgs[@]}" 2>/dev/null | tr -d '\n ' | grep -o '"space":{"name":"[a-z]*","guid":"[0-9a-f-]*"' | sed 's/.*"name":"\([a-z]*\)","guid":"\([0-9a-f-]*\)"/\1=\2/') || true
     declare -A wguid=()
     for kv in $pairs; do wguid[${kv%%=*}]=${kv#*=}; done
     if [[ -z $(state_of "${wguid[one]:-x}") || -z $(state_of "${wguid[two]:-x}") ]]; then

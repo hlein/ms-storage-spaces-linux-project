@@ -34,12 +34,12 @@ dev=
 loops=()
 cleanup() {
   case $backend in
-    nbd) [[ -n $dev ]] && nbd-client -d "$dev" >/dev/null 2>&1 || true ;;
+    nbd) if [[ -n $dev ]]; then nbd-client -d "$dev" >/dev/null 2>&1 || true; fi ;;
     dm) dmsetup remove "ss-rwcheck" 2>/dev/null || true ;;
   esac
-  [[ -n $pid ]] && kill "$pid" 2>/dev/null && wait "$pid" 2>/dev/null || true
+  if [[ -n $pid ]] && kill "$pid" 2>/dev/null; then wait "$pid" 2>/dev/null || true; fi
   for l in "${loops[@]}"; do losetup -d "$l" 2>/dev/null || true; done
-  loops=() pid= dev=
+  loops=() pid='' dev=''
 }
 trap cleanup EXIT
 
@@ -64,7 +64,7 @@ expose() {
       dev=
       for d in /dev/nbd*; do
         [[ $d =~ ^/dev/nbd[0-9]+$ ]] || continue
-        [[ $(cat /sys/block/${d#/dev/}/size) == 0 ]] || continue
+        [[ $(cat "/sys/block/${d#/dev/}/size") == 0 ]] || continue
         local ro=()
         [[ $mode == ro ]] && ro=(-R)
         nbd-client -N "$space" -u "$work/sock" "$d" -b 512 "${ro[@]}" >/dev/null && dev=$d && break

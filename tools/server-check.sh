@@ -34,7 +34,10 @@ vm "mkdir -p ~/sstest/server-check && test -s ~/sstest/pools/wc4k/disk0.img" ||
   { echo "no ~/sstest/pools/wc4k on the VM (tools/guard-check.sh copies it)" >&2; exit 2; }
 scp -q "${ssh_opts[@]}" "$binary" "$host:sstest/server-check/spaces"
 vm "CASES='$cases' bash -s" <<'REMOTE'
-set -u
+# A command that fails where no case expects it ends the run, naming it
+# (1.2.2's remote parts went on past it).
+set -Eeuo pipefail
+trap 'echo "FAIL harness: line $LINENO: $BASH_COMMAND (exit $?)"' ERR
 pass=0 fail=0
 result() {
   if [[ $1 == ok ]]; then echo "PASS $2${3:+ ($3)}"; pass=$((pass + 1));
@@ -50,9 +53,12 @@ sudo modprobe ublk_drv
 sudo modprobe nbd
 sudo mkdir -p "$dir" && sudo chown "$(id -u)" "$dir"
 pids=() loops=() nbds=()
-wc4k=$(sudo "$spaces" check --json "$img" 2>/dev/null | tr -d '\n ' |
+wc4k=$({ sudo "$spaces" check --json "$img" 2>/dev/null || true; } | tr -d '\n ' |
   sed -n 's/.*"space":{"name":"wc4k","guid":"\([0-9a-f-]*\)".*/\1/p')
 cleanup() {
+  # Best effort: what is not there need not go.
+  set +e
+  trap - ERR
   local p
   for p in "${pids[@]}"; do sudo kill -9 "$p" 2>/dev/null; done
   for n in "${nbds[@]}"; do sudo nbd-client -d "$n" >/dev/null 2>&1; done
@@ -60,6 +66,9 @@ cleanup() {
   [[ -n $wc4k ]] && sudo "$spaces" detach "$wc4k" >/dev/null 2>&1
   for l in "${loops[@]}"; do sudo losetup -d "$l" 2>/dev/null; done
   sudo rm -rf "$dir"
+  # As before (it also runs before the cases, for what a cut-off run left).
+  set -e
+  trap 'echo "FAIL harness: line $LINENO: $BASH_COMMAND (exit $?)"' ERR
 }
 trap cleanup EXIT
 # background PIDFILE COMMAND...: COMMAND as root, its pid in PIDFILE.
@@ -103,19 +112,21 @@ PY
     )
     n=$(for i in $(seq 0 15); do [[ $(cat /sys/block/nbd$i/size 2>/dev/null) == 0 && ! -e /sys/block/nbd$i/pid ]] && echo /dev/nbd$i && break; done)
     nbds+=("$n")
-    out=$(sudo timeout 20 nbd-client -N wc4k -u "$sock" "$n" -b 4096 -R 2>&1)
-    rc=$?
+    rc=0
+    out=$(sudo timeout 20 nbd-client -N wc4k -u "$sock" "$n" -b 4096 -R 2>&1) || rc=$?
     read=no
     [[ $rc == 0 ]] && sudo dd if="$n" of=/dev/null bs=4096 count=16 status=none 2>/dev/null && read=yes
-    sudo nbd-client -d "$n" >/dev/null 2>&1
+    sudo nbd-client -d "$n" >/dev/null 2>&1 || true
     alive=no
     sudo kill -0 "${pids[-1]}" 2>/dev/null && alive=yes
-    if [[ $rc == 0 && $read == yes && $alive == yes ]]; then
+    # All 40 idle connections made, or the case proves nothing (1.2.2's
+    # harness passed it with none).
+    if [[ $held == 40 && $rc == 0 && $read == yes && $alive == yes ]]; then
       result ok nbd "after $held idle connections: a client served"
     else
       result fail nbd "after $held idle connections: nbd-client exit $rc, read: $read, server alive: $alive: $(one "$out")"
     fi
-    sudo kill "${pids[-1]}" 2>/dev/null ;;
+    sudo kill "${pids[-1]}" 2>/dev/null || true ;;
   fuse)
     sudo mkdir -p "$dir/fuse"
     background "$dir/fuse.pid" "$spaces" serve-fuse "$img" --space "$wc4k" --mountpoint "$dir/fuse" \
@@ -147,8 +158,8 @@ PY
     for _ in $(seq 50); do systemctl is-active --quiet "$unit" || break; sleep 0.1; done
     left=no
     [[ -e /sys/class/ublk-char/ublkc$n ]] && left=yes
-    out=$(sudo "$spaces" detach "$wc4k" 2>&1)
-    rc=$?
+    rc=0
+    out=$(sudo "$spaces" detach "$wc4k" 2>&1) || rc=$?
     after=no
     [[ -e /sys/class/ublk-char/ublkc$n ]] && after=yes
     if [[ $left == yes && $rc == 0 && $after == no ]]; then
@@ -164,18 +175,18 @@ PY
     p=${pids[-1]}
     dev=$(sudo cat "$dir/panic.ready")
     n=${dev#/dev/ublkb}
-    sudo timeout 20 dd if="$dev" of=/dev/null bs=4096 skip=256 count=1 iflag=direct status=none 2>/dev/null
-    rc_read=$?
+    rc_read=0
+    sudo timeout 20 dd if="$dev" of=/dev/null bs=4096 skip=256 count=1 iflag=direct status=none 2>/dev/null || rc_read=$?
     ended=no
     gone "$p" && ended=yes
     hooked=yes
     sudo grep -q "SPACES_UBLK_PANIC_AT" "$dir/server.log" || hooked=no
-    status=$(sudo grep -c "a ublk queue stopped on an internal error" "$dir/server.log")
+    status=$(sudo grep -c "a ublk queue stopped on an internal error" "$dir/server.log" || true)
     after=no
     [[ -e /sys/class/ublk-char/ublkc$n ]] && after=yes
     if [[ $hooked == no ]]; then
       result skip ublkpanic "this build has no test hooks"
-      sudo kill "$p" 2>/dev/null
+      sudo kill "$p" 2>/dev/null || true
     elif [[ $rc_read != 0 && $ended == yes && $status -ge 1 && $after == no ]]; then
       result ok ublkpanic "the read failed, the server ended with an error, ublkc$n deleted"
     else
@@ -189,7 +200,7 @@ PY
     # A build without the hook has started its device by now.
     if sudo test -s "$dir/term.ready"; then
       result skip ublkterm "this build has no test hooks"
-      sudo kill "$p" 2>/dev/null
+      sudo kill "$p" 2>/dev/null || true
       continue
     fi
     sudo kill -TERM "$p"
@@ -203,7 +214,7 @@ PY
     else
       result fail ublkterm "SIGTERM before the device started: served: $served, ended: $ended"
     fi
-    sudo kill "$p" 2>/dev/null ;;
+    sudo kill "$p" 2>/dev/null || true ;;
   *) result fail "$c" "unknown case" ;;
   esac
 done

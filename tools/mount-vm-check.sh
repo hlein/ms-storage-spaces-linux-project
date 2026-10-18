@@ -29,7 +29,10 @@ if [[ -n $deb ]]; then
   vm 'sudo dpkg -i ~/sstest/check.deb >/dev/null && rm ~/sstest/check.deb && dpkg-query -W storage-spaces'
 fi
 vm "CASES='$cases' bash -s" <<'REMOTE'
-set -u
+# A command that fails where no case expects it ends the run, naming it
+# (1.2.2's remote parts went on past it).
+set -Eeuo pipefail
+trap 'echo "FAIL harness: line $LINENO: $BASH_COMMAND (exit $?)"' ERR
 sample=$HOME/sstest/r314small/disk.img
 read -r start size < <(sfdisk -d "$sample" | sed -n '/Basic data/s/.*start= *\([0-9]*\), size= *\([0-9]*\).*/\1 \2/p')
 off=$((start * 512)) len=$((size * 512))
@@ -60,11 +63,17 @@ unit_pid() { # the refs process serving mount point $1 (its mount.ReFS unit or i
   done
 }
 cleanup() {
+  # Best effort: what is not there need not go.
+  set +e
+  trap - ERR
   umount_all
   sudo dmsetup remove --retry mc-slow 2>/dev/null || true
   sudo dmsetup remove --retry mc-bad 2>/dev/null || true
   for l in "${loops[@]}"; do sudo losetup -d "$l" 2>/dev/null || true; done
   sudo rm -f /tmp/mc-fake-refs /tmp/mc-zero.img /tmp/mc-bad.img /tmp/mc-fake-sr/systemd-run
+  # As before (it also runs before the cases, for what a cut-off run left).
+  set -e
+  trap 'echo "FAIL harness: line $LINENO: $BASH_COMMAND (exit $?)"' ERR
 }
 trap cleanup EXIT
 
@@ -150,7 +159,7 @@ FAKE
     fi
     pid=$(unit_pid "$d")
     umount_all
-    [[ -n $pid && $pid != 0 ]] && sudo kill "$pid" 2>/dev/null
+    if [[ -n $pid && $pid != 0 ]]; then sudo kill "$pid" 2>/dev/null || true; fi
     true ;;
   slow) # a device that answers every read after 1 s: opening the sample
     # (about 30 reads) takes longer than any short timeout would allow
@@ -207,7 +216,7 @@ FAKE
     d=$(dir unitlog)
     if sudo mount -t ReFS "$l" "$d" >/dev/null 2>&1 && mountpoint -q "$d"; then
       pid=$(unit_pid "$d")
-      target=$(sudo readlink "/proc/$pid/fd/1" 2>&1)
+      target=$(sudo readlink "/proc/$pid/fd/1" 2>&1) || true
       if [[ -z $pid || $pid == 0 ]]; then
         result fail unitlog "no refs process found for $d"
       elif [[ $target == *"(deleted)"* ]] || ! sudo test -f "$target"; then
@@ -239,8 +248,8 @@ FAKE
     if out=$(sudo mount -t ReFS "$l" "$d" 2>&1); then
       result fail reportmode "mounted a suspect volume"
     else
-      modes=$(sudo stat -c %a /run/storage-spaces "$reports" 2>&1 | tr '\n' ' ')
-      files=$(sudo sh -c "stat -c %a $reports/*.txt $reports/*.json" 2>&1 | sort -u | tr '\n' ' ')
+      modes=$(sudo stat -c %a /run/storage-spaces "$reports" 2>&1 | tr '\n' ' ') || true
+      files=$(sudo sh -c "stat -c %a $reports/*.txt $reports/*.json" 2>&1 | sort -u | tr '\n' ' ') || true
       if [[ $modes == "755 755 " && $files == "644 " ]]; then
         result ok reportmode "directories $modes, reports $files"
       else

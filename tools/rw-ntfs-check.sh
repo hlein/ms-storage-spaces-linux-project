@@ -32,8 +32,8 @@ cp --sparse=always "$src"/disk*.img "$src"/manifest.json "$work/"
 disks=("$work"/disk*.img)
 pid=
 cleanup() {
-  mountpoint -q "$mnt" && umount "$mnt" || true
-  [[ -n $pid ]] && kill "$pid" 2>/dev/null && wait "$pid" 2>/dev/null || true
+  if mountpoint -q "$mnt"; then umount "$mnt" || true; fi
+  if [[ -n $pid ]] && kill "$pid" 2>/dev/null; then wait "$pid" 2>/dev/null || true; fi
   pid=
 }
 trap cleanup EXIT
@@ -50,7 +50,7 @@ expose() {
 expose --rw
 end=0
 [[ -n ${PART_MB:-} ]] && end=+${PART_MB}M
-sgdisk -o -n 1:2048:$end -t 1:0700 -c 1:linux "$dev" >/dev/null
+sgdisk -o -n "1:2048:$end" -t 1:0700 -c 1:linux "$dev" >/dev/null
 partprobe "$dev"
 udevadm settle
 mkntfs -f -Q -L linux "${dev}p1" >/dev/null

@@ -1366,6 +1366,7 @@ fn cmd_attach(
     devices: &[PathBuf],
 ) -> Result<()> {
     use std::io::IsTerminal;
+    check::start_attach_time();
     let _lock = attach::lock()?;
     attach::reconcile();
     let groups: Vec<Vec<PathBuf>> = if devices.is_empty() {
@@ -1445,6 +1446,14 @@ fn cmd_attach(
                     continue;
                 }
                 None => {}
+            }
+            if check::time_left() == Some(std::time::Duration::ZERO) {
+                eprintln!(
+                    "{:?}: not attached: the time of this run is up (SPACES_ATTACH_TIMEOUT); spaces attach attaches it",
+                    space.name()
+                );
+                failures += 1;
+                continue;
             }
             let mut report = check::space_report(&pool, &health, &paths, space);
             let verdict = report.verdict();

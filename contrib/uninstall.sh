@@ -27,6 +27,7 @@ for f in \
   /sbin/mount.ReFS /sbin/mount.refs \
   /etc/udev/rules.d/69-storage-spaces.rules \
   /etc/systemd/system/storage-spaces-attach.service \
+  /etc/systemd/system/storage-spaces-attach@.service \
   /etc/modules-load.d/storage-spaces.conf \
   /usr/local/share/man/man8/spaces.8 \
   /usr/local/share/man/man1/refs.1; do

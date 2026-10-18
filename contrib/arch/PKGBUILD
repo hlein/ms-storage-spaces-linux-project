@@ -41,8 +41,10 @@ package() {
   install -Dm755 contrib/mount.refs "$pkgdir/usr/bin/mount.ReFS"
   ln -sf mount.ReFS "$pkgdir/usr/bin/mount.refs"
   install -Dm644 contrib/udev/69-storage-spaces.rules "$pkgdir/usr/lib/udev/rules.d/69-storage-spaces.rules"
-  sed 's#/usr/local/sbin/spaces#/usr/bin/spaces#' contrib/systemd/storage-spaces-attach.service |
-    install -Dm644 /dev/stdin "$pkgdir/usr/lib/systemd/system/storage-spaces-attach.service"
+  for u in storage-spaces-attach.service storage-spaces-attach@.service; do
+    sed 's#/usr/local/sbin/spaces#/usr/bin/spaces#' "contrib/systemd/$u" |
+      install -Dm644 /dev/stdin "$pkgdir/usr/lib/systemd/system/$u"
+  done
   install -Dm644 contrib/man/spaces.8 "$pkgdir/usr/share/man/man8/spaces.8"
   install -Dm644 contrib/man/refs.1 "$pkgdir/usr/share/man/man1/refs.1"
   printf 'ublk_drv\nnbd\n' | install -Dm644 /dev/stdin "$pkgdir/usr/lib/modules-load.d/storage-spaces.conf"

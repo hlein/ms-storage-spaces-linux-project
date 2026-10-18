@@ -5,8 +5,8 @@
 
 use std::fs::File;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, OnceLock};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use storage_spaces::gpt::{MSR_PARTITION_TYPE, Partition};
@@ -27,11 +27,40 @@ const _: fn() = || {
 };
 
 /// How long the quick checks of a space, and the opening of a pool, may
-/// take: SPACES_CHECK_TIMEOUT seconds (0: no limit), 40 by default. Real
-/// ones take a second or two; a hostile disk can make them loop, and
+/// take: SPACES_CHECK_TIMEOUT seconds (0: no limit), 40 by default, and no
+/// longer than what is left of the time of `spaces attach` ([`time_left`]).
+/// Real ones take a second or two; a hostile disk can make them loop, and
 /// `spaces attach` checks every pool in one process.
 pub fn deadline() -> Option<Duration> {
-    deadline_of(std::env::var("SPACES_CHECK_TIMEOUT").ok().as_deref())
+    let check = deadline_of(std::env::var("SPACES_CHECK_TIMEOUT").ok().as_deref());
+    match (check, time_left()) {
+        (Some(check), Some(left)) => Some(check.min(left)),
+        (check, left) => check.or(left),
+    }
+}
+
+/// When the run of `spaces attach` has to be done.
+static ATTACH_UNTIL: OnceLock<Instant> = OnceLock::new();
+
+/// Starts the time of `spaces attach`: SPACES_ATTACH_TIMEOUT seconds, which
+/// the attach units set below their start timeout, so that every wait
+/// (for udev, a server, the checks) ends in time and the run says what it
+/// did not get to, rather than systemd killing it. None without it.
+pub fn start_attach_time() {
+    let seconds = std::env::var("SPACES_ATTACH_TIMEOUT")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|&s| s > 0);
+    if let Some(s) = seconds {
+        let _ = ATTACH_UNTIL.set(Instant::now() + Duration::from_secs(s));
+    }
+}
+
+/// What is left of the time of `spaces attach` (`None`: no limit).
+pub fn time_left() -> Option<Duration> {
+    ATTACH_UNTIL
+        .get()
+        .map(|until| until.saturating_duration_since(Instant::now()))
 }
 
 /// The [`deadline`] a value of SPACES_CHECK_TIMEOUT sets.

@@ -1,5 +1,5 @@
 #!/bin/sh
-# Install the spaces binary, the udev rule and the systemd unit (and refs
+# Install the spaces binary, the udev rule and the systemd units (and refs
 # when it was built next to spaces).
 # Usage: contrib/install.sh [path/to/spaces]   (run as root)
 set -eu
@@ -8,6 +8,7 @@ bin=${1:-$here/../target/release/spaces}
 install -m 755 "$bin" /usr/local/sbin/spaces
 install -m 644 "$here/udev/69-storage-spaces.rules" /etc/udev/rules.d/69-storage-spaces.rules
 install -m 644 "$here/systemd/storage-spaces-attach.service" /etc/systemd/system/storage-spaces-attach.service
+install -m 644 "$here/systemd/storage-spaces-attach@.service" /etc/systemd/system/storage-spaces-attach@.service
 install -D -m 644 "$here/man/spaces.8" /usr/local/share/man/man8/spaces.8
 if [ -x "$(dirname "$bin")/refs" ]; then
   install -m 755 "$(dirname "$bin")/refs" /usr/local/bin/refs

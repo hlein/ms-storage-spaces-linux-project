@@ -7,6 +7,9 @@
 #   servers  that run waited for no server (none timed out; it took < 25 s)
 #   fstab    a volume of the space listed in /etc/fstab is mounted at boot
 #   runs     the attach unit ran without hitting its start limit
+#   shutdown at the next restart the volume is unmounted before the server
+#            of its space begins to stop (1.2.2 stopped both at once, and the
+#            ublk device could go under a mounted volume)
 # Usage: LINUX_VM_HOST=user@address tools/boot-vm-check.sh DEB
 # The VM is restarted: use one nothing else needs (the 26.10 VM, not the
 # 22.04 one that linuxreflect shares). Test pool: testdata/pools/ntfstier
@@ -75,18 +78,22 @@ sudo systemctl daemon-reload
 sudo systemctl enable sstest-boot-loops.service 2>/dev/null
 echo "$part" > /var/tmp/boot-check.part
 REMOTE
-old_boot=$(vm 'cat /proc/sys/kernel/random/boot_id')
-vm 'sudo systemctl reboot' || true
-echo "restarting $host" >&2
-for _ in $(seq 60); do
-  sleep 5
-  b=$(vm 'cat /proc/sys/kernel/random/boot_id' 2>/dev/null || true)
-  [[ -n $b && $b != "$old_boot" ]] && break
-done
-[[ -n ${b:-} && $b != "$old_boot" ]] || { echo "the VM did not come back" >&2; exit 1; }
-vm 'systemctl is-system-running --wait >/dev/null 2>&1 || true'
+restart() {
+  local old_boot b=
+  old_boot=$(vm 'cat /proc/sys/kernel/random/boot_id')
+  vm 'sudo systemctl reboot' || true
+  echo "restarting $host" >&2
+  for _ in $(seq 60); do
+    sleep 5
+    b=$(vm 'cat /proc/sys/kernel/random/boot_id' 2>/dev/null || true)
+    [[ -n $b && $b != "$old_boot" ]] && break
+  done
+  [[ -n $b && $b != "$old_boot" ]] || { echo "the VM did not come back" >&2; exit 1; }
+  vm 'systemctl is-system-running --wait >/dev/null 2>&1 || true'
+}
+restart
 
-vm 'bash -s' <<'REMOTE'
+vm 'bash -s' <<'REMOTE' || true
 set -u
 pass=0 fail=0
 result() {
@@ -133,8 +140,40 @@ else
 fi
 
 runs=$(j -u storage-spaces-attach.service -o cat | grep -c '^Starting' || true)
-limit=$(j -o cat | grep -c -E 'storage-spaces-attach.service.*(start-limit|repeated too quickly)' || true)
+limit=$(j -o cat | grep -c -E 'storage-spaces-attach(@[^ ]*)?\.service.*(start-limit|repeated too quickly)' || true)
 if [[ $limit == 0 ]]; then result ok runs "$runs runs"; else result fail runs "$runs runs, start limit hit"; fi
+
+# The server, for the shutdown check after the next restart.
+echo "$unit" > /var/tmp/boot-check.unit
+echo "$pass passed, $fail failed" > /var/tmp/boot-check.first
+REMOTE
+restart
+
+vm 'bash -s' <<'REMOTE'
+set -u
+read -r pass _ fail _ < /var/tmp/boot-check.first
+result() {
+  if [[ $1 == ok ]]; then echo "PASS $2${3:+ ($3)}"; pass=$((pass + 1));
+  else echo "FAIL $2: $3"; fail=$((fail + 1)); fi
+}
+unit=$(cat /var/tmp/boot-check.unit)
+# The previous boot's shutdown: when the volume was unmounted, and when its
+# server began to stop (monotonic seconds).
+pj() { sudo journalctl -b -1 --no-pager -o short-monotonic "$@"; }
+at() { sed -n 's/^\[ *\([0-9.]*\)\].*/\1/p' | head -1; }
+unmounted=$(pj | grep -E 'Unmounted (mnt-sstest\\x2dboot\.mount|/mnt/sstest-boot)' | at)
+stopping=$(pj | grep -E "(Stopping|Stopped) $unit" | at)
+# A server that stops after local-fs-pre.target stops after journald too:
+# its stop is then not in the journal.
+if [[ -z $unit ]]; then
+  result fail shutdown "no server of ntfstier was recorded"
+elif [[ -z $unmounted ]]; then
+  result fail shutdown "the unmount of /mnt/sstest-boot is not in the journal"
+elif [[ -z $stopping ]] || python3 -c "import sys; sys.exit(0 if $unmounted < $stopping else 1)"; then
+  result ok shutdown "unmounted at ${unmounted} s, the server stopping ${stopping:+at $stopping s}${stopping:-after the journal ends}"
+else
+  result fail shutdown "unmounted at ${unmounted} s, the server ($unit) stopping at ${stopping} s"
+fi
 
 # Cleanup: what this check set up, and the package.
 sudo umount /mnt/sstest-boot 2>/dev/null
@@ -146,7 +185,7 @@ sudo /usr/sbin/spaces detach ntfstier >/dev/null 2>&1
 for l in $(losetup -a | grep /sstest-boot/ | cut -d: -f1); do sudo losetup -d "$l"; done
 sudo dpkg -r storage-spaces >/dev/null
 sudo systemctl daemon-reload
-rm -f /tmp/boot-check.deb /var/tmp/boot-check.part
+rm -f /tmp/boot-check.deb /var/tmp/boot-check.part /var/tmp/boot-check.unit /var/tmp/boot-check.first
 echo "$pass passed, $fail failed (systemd $(systemctl --version | awk 'NR==1 {print $2}'))"
 [[ $fail == 0 ]]
 REMOTE

@@ -9,7 +9,14 @@
 #            installation's unit shadows it)
 #   servers  the servers attach started are not ordered after
 #            systemd-tmpfiles-setup.service (at boot they would wait for the
-#            attach that waits for them) and have a /tmp of their own
+#            attach that waits for them), have a /tmp of their own and need
+#            nothing of /var, and are ordered before local-fs-pre.target, so
+#            that at shutdown they stop after the volumes on them unmount
+#            (1.2.2: in parallel)
+#   late     a pool whose disks appear while a run of the attach unit goes on
+#            is attached (1.2.2: udev's start joined that run, which had
+#            scanned the disks, and the pool stayed detached); the runs are
+#            slowed by drop-ins for it
 #   busy     spaces detach refuses a space whose volume is mounted, naming the
 #            mount, and leaves its server and the volume working
 #   upgrade  installing over attached pools (OLD_DEB, else DEB again) attaches
@@ -41,7 +48,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 deb=${1:?usage: tools/package-vm-check.sh DEB [CASE...]}
 shift
-cases=${*:-install gpt user cycle servers busy partitions upgrade byhand enabled inuse remove}
+cases=${*:-install gpt user cycle servers busy partitions late upgrade byhand enabled inuse remove}
 host=${LINUX_VM_HOST:-192.168.189.142}
 [[ $host == *@* ]] || host=codex@$host
 ssh_opts=(-o BatchMode=yes -o ConnectTimeout=10 -o IdentitiesOnly=yes -i "$HOME/.ssh/rustadmin_vm_ed25519")
@@ -97,7 +104,8 @@ attach_pools() { # attach_pools POOL...: loop devices of the pools' disks (attac
   done
 }
 ours() { # dm names of the attached spaces of the test pools
-  sudo sh -c 'cat /run/storage-spaces/*.state' 2>/dev/null | sed -n 's/^dm=\(ss-ss_\(wc4k\|ntfstier\|sect4k\|parts\)-[^-]*\)$/\1/p' | sort -u
+  # Not those still being attached (their state comes first since 1.3).
+  sudo sh -c 'for f in /run/storage-spaces/*.state; do grep -qx status=attaching "$f" || cat "$f"; done' 2>/dev/null | sed -n 's/^dm=\(ss-ss_\(wc4k\|ntfstier\|sect4k\|parts\)-[^-]*\)$/\1/p' | sort -u
 }
 served_by() { # the program the server of attached space $1 (dm name) runs, "" without a server
   local f u
@@ -191,9 +199,11 @@ for c in $CASES; do
       [[ -n $u ]] || continue
       n=$((n + 1))
       after=$(systemctl show -p After --value "$u")
+      before=$(systemctl show -p Before --value "$u")
       tmp=$(systemctl show -p TemporaryFileSystem --value "$u")
       [[ $after == *systemd-tmpfiles-setup* ]] && bad+=" $u: After=$after"
-      [[ $tmp == */tmp* ]] || bad+=" $u: TemporaryFileSystem=$tmp"
+      [[ $tmp == */tmp* && $tmp != */var* ]] || bad+=" $u: TemporaryFileSystem=$tmp"
+      [[ $before == *local-fs-pre.target* ]] || bad+=" $u: Before=$before"
     done
     if ((n == 0)); then result fail servers "no server of the test pools"
     elif [[ -z $bad ]]; then result ok servers "$n servers"
@@ -213,6 +223,32 @@ for c in $CASES; do
     else
       result fail busy "exit $rc, server active: $alive, readable: $ok: ${out//$'\n'/ | }"
     fi ;;
+  late)
+    if ((explicit)); then result skip late "an install.sh installation's rule and unit shadow the package's here"; continue; fi
+    w=ss-ss_wc4k-wc4k n=ss-ss_ntfstier-ntfstier
+    for d in $w $n; do sudo /usr/sbin/spaces detach "$d" >/dev/null 2>&1; done
+    for l in $(losetup -a | grep -E "pools/(wc4k|ntfstier)/" | cut -d: -f1); do sudo losetup -d "$l" 2>/dev/null; done
+    # Every run of the units keeps going 15 s after it has attached.
+    for u in storage-spaces-attach.service storage-spaces-attach@.service; do
+      sudo mkdir -p "/run/systemd/system/$u.d"
+      printf '[Service]\nExecStartPost=/bin/sleep 15\n' | sudo tee "/run/systemd/system/$u.d/late.conf" >/dev/null
+    done
+    sudo systemctl daemon-reload
+    attach_pools wc4k
+    for _ in $(seq 30); do [[ -b /dev/mapper/$w ]] && break; sleep 1; done
+    sleep 2
+    # ntfstier's disks, while that run goes on.
+    attach_pools ntfstier
+    for _ in $(seq 60); do [[ -b /dev/mapper/$n ]] && break; sleep 1; done
+    if [[ -b /dev/mapper/$w && -b /dev/mapper/$n ]]; then
+      result ok late "ntfstier attached while the run for wc4k went on"
+    else
+      result fail late "wc4k: $([[ -b /dev/mapper/$w ]] && echo attached || echo not attached), ntfstier: not attached a minute after its disks appeared"
+    fi
+    for u in storage-spaces-attach.service storage-spaces-attach@.service; do sudo rm -rf "/run/systemd/system/$u.d"; done
+    sudo systemctl daemon-reload
+    sudo systemctl start storage-spaces-attach.service >/dev/null 2>&1
+    for _ in $(seq 60); do [[ $(ours | wc -l) -ge 2 ]] && break; sleep 1; done ;;
   upgrade)
     if ((explicit)); then result skip upgrade "an install.sh installation's unit shadows the package's here"; continue; fi
     old=~/sstest/check.deb

@@ -20,10 +20,11 @@ install -D -m 755 "$bin/refs" "$stage/usr/bin/refs"
 install -D -m 755 "$root/contrib/mount.refs" "$stage/usr/sbin/mount.ReFS"
 ln -sf mount.ReFS "$stage/usr/sbin/mount.refs"
 install -D -m 644 "$root/contrib/udev/69-storage-spaces.rules" "$stage/usr/lib/udev/rules.d/69-storage-spaces.rules"
-sed 's#/usr/local/sbin/spaces#/usr/sbin/spaces#' "$root/contrib/systemd/storage-spaces-attach.service" \
-  > "$stage/storage-spaces-attach.service"
-install -D -m 644 "$stage/storage-spaces-attach.service" "$stage/usr/lib/systemd/system/storage-spaces-attach.service"
-rm "$stage/storage-spaces-attach.service"
+for u in storage-spaces-attach.service storage-spaces-attach@.service; do
+  sed 's#/usr/local/sbin/spaces#/usr/sbin/spaces#' "$root/contrib/systemd/$u" > "$stage/$u"
+  install -D -m 644 "$stage/$u" "$stage/usr/lib/systemd/system/$u"
+  rm "$stage/$u"
+done
 install -D -m 644 "$root/contrib/man/spaces.8" "$stage/usr/share/man/man8/spaces.8"
 gzip -9n "$stage/usr/share/man/man8/spaces.8"
 install -D -m 644 "$root/contrib/man/refs.1" "$stage/usr/share/man/man1/refs.1"
@@ -51,10 +52,25 @@ Description: read, write and manage Microsoft Storage Spaces pools on Linux
  disks created and changed the way Windows does. Includes refs, which reads
  ReFS volumes (also inside a space) and mounts them read-only with FUSE.
 CONTROL
+cat > "$stage/DEBIAN/preinst" <<'PREINST'
+#!/bin/sh
+set -e
+# Installed again after a removal (its configuration files kept): up to 1.2
+# the removal disabled the attach unit, which is then no choice of the
+# admin's; the postinst enables it as on a first installation.
+if [ "$1" = install ] && [ -n "$2" ] && dpkg --compare-versions "$2" lt 1.3~; then
+  touch /run/storage-spaces-enable-again
+fi
+PREINST
 cat > "$stage/DEBIAN/postinst" <<'POSTINST'
 #!/bin/sh
 set -e
 unit=storage-spaces-attach.service
+again=
+if [ -e /run/storage-spaces-enable-again ]; then
+  rm -f /run/storage-spaces-enable-again
+  again=yes
+fi
 # A unit of that name in /etc is the admin's or another installation's
 # (contrib/install.sh), or a mask: whether it is enabled is theirs to say.
 own=yes
@@ -68,16 +84,21 @@ if [ "$1" = configure ]; then
   # not, and then what systemd says now is the choice).
   if [ -n "$own" ] && [ -x /usr/bin/deb-systemd-helper ]; then
     deb-systemd-helper unmask "$unit" >/dev/null || true
-    if [ -n "$2" ] && ! deb-systemd-helper --quiet debian-installed "$unit" &&
+    if [ -n "$2" ] && [ -z "$again" ] && ! deb-systemd-helper --quiet debian-installed "$unit" &&
       ! systemctl --quiet is-enabled "$unit" 2>/dev/null; then
       deb-systemd-helper update-state "$unit" >/dev/null || true
     fi
-    if deb-systemd-helper --quiet was-enabled "$unit"; then
+    if [ -n "$again" ]; then
+      # Without links, deb-systemd-helper would keep it disabled: what it
+      # recorded goes, and the unit is enabled as on a first installation.
+      deb-systemd-helper purge "$unit" >/dev/null || true
+      deb-systemd-helper enable "$unit" >/dev/null || true
+    elif deb-systemd-helper --quiet was-enabled "$unit"; then
       deb-systemd-helper enable "$unit" >/dev/null || true
     else
       deb-systemd-helper update-state "$unit" >/dev/null || true
     fi
-  elif [ -n "$own" ] && [ -z "$2" ]; then
+  elif [ -n "$own" ] && { [ -z "$2" ] || [ -n "$again" ]; }; then
     systemctl enable "$unit" || true
   fi
   udevadm control --reload || true
@@ -134,7 +155,7 @@ if [ -d /run/systemd/system ]; then
   systemctl daemon-reload || true
 fi
 POSTRM
-chmod 755 "$stage/DEBIAN/postinst" "$stage/DEBIAN/prerm" "$stage/DEBIAN/postrm"
+chmod 755 "$stage/DEBIAN/preinst" "$stage/DEBIAN/postinst" "$stage/DEBIAN/prerm" "$stage/DEBIAN/postrm"
 mkdir -p "$out"
 dpkg-deb --root-owner-group --build "$stage" "$out/storage-spaces_${version}_${arch}.deb" >/dev/null
 echo "$out/storage-spaces_${version}_${arch}.deb"

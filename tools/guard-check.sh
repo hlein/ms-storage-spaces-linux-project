@@ -102,7 +102,8 @@ newloop() { # newloop IMAGE [losetup options]: LOOP = a read-only loop device
   loops+=("$LOOP")
 }
 ours() { # dm names of the spaces of the test pools
-  sudo sh -c 'cat /run/storage-spaces/*.state' 2>/dev/null |
+  # Not those still being attached (their state comes first since 1.3).
+  sudo sh -c 'for f in /run/storage-spaces/*.state; do grep -qx status=attaching "$f" || cat "$f"; done' 2>/dev/null |
     sed -n 's/^dm=\(ss-ss_\(wc4k\|ntfstier\|r314mirror\|hostile\)-[^-]*\(-[0-9a-f]\{8\}\)\?\)$/\1/p' | sort -u
 }
 umount_all() {
@@ -174,7 +175,7 @@ for c in $CASES; do
     else
       result fail "auto report" "$(one "$r")"
     fi
-    j=$(sudo journalctl -u storage-spaces-attach.service --since "$since" --no-pager -o cat)
+    j=$(sudo journalctl -u 'storage-spaces-attach*' --since "$since" --no-pager -o cat)
     if [[ $j == *"not attached"* && $j == *"DEGRADED pool.members"* ]]; then result ok "auto journal"; else result fail "auto journal" "$(one "$j")"; fi
     s=$("$spaces" status 2>&1)
     if [[ $s == *"not attached: space \"ntfstier\""* && $s == *"verdict healthy"* ]]; then result ok "auto status"; else result fail "auto status" "$(one "$s")"; fi
@@ -351,8 +352,10 @@ PY
       done
       sudo udevadm settle
       sleep 2
-      out=$(sudo journalctl -u storage-spaces-attach.service --since "$t0" --no-pager -o cat)
-      how="unit: $(systemctl show -p Result --value storage-spaces-attach.service)"
+      out=$(sudo journalctl -u 'storage-spaces-attach*' --since "$t0" --no-pager -o cat)
+      # The run at boot's unit and the instances udev starts.
+      how="unit: $(systemctl list-units --all --plain --no-legend 'storage-spaces-attach*' | awk '{print $1}' |
+        while read -r u; do systemctl show -p Result --value "$u"; done | sort -u | tr '\n' ' ')"
     fi
     r=$(cat "$reports/$hguid.txt" 2>/dev/null || true)
     if [[ -n $(ours | grep wc4k) ]]; then result ok "hostile beside" "wc4k attached ($how)"; else result fail "hostile beside" "wc4k not attached: $(one "$out")"; fi

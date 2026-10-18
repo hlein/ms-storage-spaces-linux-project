@@ -69,10 +69,18 @@ would do) removes it again; it refuses while spaces its `spaces` serves are
 attached (they would run on with no program left to detach them): detach
 them first (`spaces detach`).
 
-The udev rule starts `storage-spaces-attach.service` whenever a pool member
-appears, so pools are attached at boot and when their disks are plugged in
-(read-only; see Hardening below); installing starts it once too, for the
-pools whose disks are there already. To attach by hand only: after
+`storage-spaces-attach.service` attaches the pools at boot, before
+`local-fs-pre.target`, and the udev rule starts a run of its own,
+`storage-spaces-attach@MAJOR:MINOR.service`, for every pool member that
+appears later, so that pools are attached when their disks are plugged in
+(read-only; see Hardening below); installing starts the unit once too, for
+the pools whose disks are there already. A disk that comes while a run goes
+on gets its run all the same (1.2.2 started the one unit again, which only
+joined the run going on, and the pool of the late disk stayed detached). A
+run has 80 s (`SPACES_ATTACH_TIMEOUT`) after its 30 s of waiting for udev,
+within the units' start timeout of 120 s: what it does not get to, it
+names, and the next run attaches it. At shutdown the servers of spaces stop
+after the volumes on them are unmounted (1.2.2 stopped both at once). To attach by hand only: after
 `contrib/install.sh`, remove `/etc/udev/rules.d/69-storage-spaces.rules`;
 with the packages, whose rule is
 `/usr/lib/udev/rules.d/69-storage-spaces.rules` (an upgrade would bring a
@@ -571,7 +579,7 @@ report goes to:
 
 * standard error of the command that refused: whole on a terminal;
   under the attach unit a line for the space and one per failing check,
-  so `journalctl -u storage-spaces-attach` shows them;
+  so `journalctl -u 'storage-spaces-attach*'` shows them;
 * `/run/storage-spaces/reports/<space GUID>.txt` and `.json` (readable by
   every user), and `refs-<serial>.txt` for a refused ReFS mount (as root);
 * `spaces status` (the spaces not attached, and the verdict of those
@@ -895,13 +903,16 @@ security`, scores 9.5 UNSAFE before, 5.1 MEDIUM after):
   need, CAP_SYS_ADMIN and CAP_SYS_MODULE, stay, and so do others such as
   CAP_SYS_RAWIO and CAP_DAC_OVERRIDE; there is no system call filter). Home
   directories stay readable, as pool disks may be image files. The
-  private `/tmp` and `/var/tmp` are empty file systems of its own
+  private `/tmp` is an empty file system of its own
   (`TemporaryFileSystem=`), not `PrivateTmp=`: that orders a unit after
   `systemd-tmpfiles-setup.service`, which comes after `local-fs.target`,
   and the unit runs before `local-fs-pre.target` so that fstab can mount
   volumes on spaces. 1.1.0 and 1.2.0 had that ordering cycle, and systemd
   broke it at every boot by dropping jobs: other units' mounts, the setup
-  of `/tmp` (then logging in to GNOME failed), or the unit itself.
+  of `/tmp` (then logging in to GNOME failed), or the unit itself. No
+  `/var/tmp` (1.2.2 had one): with `/var` a file system of its own, not
+  mounted yet, systemd would make the directory on the root file system,
+  read-only that early at boot, and the unit would fail.
 * The servers `spaces attach` starts (`serve-ublk`, `serve-nbd`,
   `serve-fuse`, as transient `storage-spaces-<guid>.service` units) get
   the same limits from the program itself, but for the FUSE server a
@@ -928,7 +939,7 @@ overflow checks, and its parsers are fuzzed (`docs/security.md`).
 
 * A pool is not attached at boot, or `spaces attach` says `not attached`:
   the space is not healthy. `spaces status` lists it with its verdict,
-  `journalctl -u storage-spaces-attach` has a line for each failing check,
+  `journalctl -u 'storage-spaces-attach*'` has a line for each failing check,
   and `spaces check` (or `/run/storage-spaces/reports/<space GUID>.txt`)
   the whole report with what to do. `--degraded` or `--force` read it
   anyway, read-only; see "Health checks and forced attach".

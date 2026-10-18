@@ -93,6 +93,18 @@
   left the server running with no program to detach it; the removal now
   stops, saying what to do. `contrib/uninstall.sh` refuses likewise; the
   Arch package, which pacman cannot stop, warns.
+* At shutdown the servers of spaces stopped at the same time as the
+  volumes on them were unmounted (a ublk device could go under a mounted
+  volume); they are now ordered before `local-fs-pre.target`, which stops
+  after every local mount. A pool member that appeared while the attach
+  unit ran was missed (udev's start only joined that run): the rule now
+  starts `storage-spaces-attach@MAJOR:MINOR.service`, a run of its own per
+  member, which masking `storage-spaces-attach.service` turns off too. A
+  run of the units now ends within their start timeout
+  (`SPACES_ATTACH_TIMEOUT=80` bounds every wait of `spaces attach`, which
+  names what it did not get to). The units and the servers no longer mount
+  a private `/var/tmp`, which with a `/var` of its own made systemd create
+  a directory on a root file system still read-only at boot.
 
 ### Testing
 

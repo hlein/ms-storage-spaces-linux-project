@@ -403,6 +403,7 @@ fn mark_backend(dev: &str, state: &State) -> Result<()> {
 fn settle() {
     static SPENT_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let left = 60_000u64.saturating_sub(SPENT_MS.load(std::sync::atomic::Ordering::Relaxed));
+    let left = crate::check::time_left().map_or(left, |t| left.min(t.as_millis() as u64));
     if left == 0 {
         return;
     }
@@ -760,7 +761,10 @@ const SERVER_PRIVATE_VIEW: &[&str] = &[
     // Not PrivateTmp=yes: it orders the server after
     // systemd-tmpfiles-setup.service, that is after local-fs.target, which
     // at boot waits for the attach service that waits for this server.
-    "TemporaryFileSystem=/tmp /var/tmp",
+    // Not /var/tmp: with /var a file system of its own, not mounted yet at
+    // boot, systemd would make the directory on the root, still read-only
+    // then, and the unit would fail.
+    "TemporaryFileSystem=/tmp",
     "ProtectKernelTunables=yes",
     "ProtectProc=invisible",
 ];
@@ -780,6 +784,9 @@ fn start_server(unit: &str, kind: &str, paths: &[PathBuf], space: &str, extra: &
         "--property=DefaultDependencies=no".into(),
         "--property=Conflicts=shutdown.target".into(),
         "--property=Before=shutdown.target".into(),
+        // Stopped at shutdown after local-fs-pre.target, which comes after
+        // every local mount is unmounted: the volumes on the space first.
+        "--property=Before=local-fs-pre.target".into(),
     ];
     let private = if kind == "fuse" { &[][..] } else { SERVER_PRIVATE_VIEW };
     let restrictions: Vec<String> = SERVER_RESTRICTIONS
@@ -811,8 +818,9 @@ fn start_server(unit: &str, kind: &str, paths: &[PathBuf], space: &str, extra: &
         launch(&[])?;
     }
     // Opening a space read-write destages its write-back cache first, which
-    // can take minutes.
+    // can take minutes; never past the time of the run.
     let timeout = Duration::from_secs(if extra.contains(&"--rw") { 3600 } else { 30 });
+    let timeout = crate::check::time_left().map_or(timeout, |left| timeout.min(left));
     if let Err(e) = wait_for(&ready, unit, timeout) {
         let _ = run("systemctl", &["stop", unit], None);
         let log = run("journalctl", &["-u", unit, "-n", "20", "--no-pager"], None).unwrap_or_default();
@@ -1471,7 +1479,18 @@ mod hardening_tests {
         for p in SERVER_RESTRICTIONS.iter().chain(SERVER_PRIVATE_VIEW) {
             assert!(!p.starts_with("PrivateTmp"), "{p}");
         }
-        assert!(SERVER_PRIVATE_VIEW.contains(&"TemporaryFileSystem=/tmp /var/tmp"));
+        assert!(SERVER_PRIVATE_VIEW.contains(&"TemporaryFileSystem=/tmp"));
+    }
+
+    /// No server needs /var at boot: a /var of its own is not mounted when
+    /// the attach unit starts them, before local-fs-pre.target (1.2.2 had
+    /// /var/tmp in TemporaryFileSystem=, a directory systemd then makes on
+    /// a root file system still read-only).
+    #[test]
+    fn servers_need_nothing_of_var_at_boot() {
+        for p in SERVER_RESTRICTIONS.iter().chain(SERVER_PRIVATE_VIEW) {
+            assert!(!p.contains("/var"), "{p}");
+        }
     }
 }
 

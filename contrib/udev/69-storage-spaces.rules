@@ -15,10 +15,12 @@ ENV{SS_BACKEND}=="1", ENV{UDISKS_IGNORE}="1"
 ENV{SS_VERDICT}=="?*", ENV{SS_VERDICT}!="healthy", ENV{UDISKS_IGNORE}="1"
 
 # Attach Microsoft Storage Spaces pools read-only when their member disks
-# appear. The service attaches every complete pool and skips pools that are
-# still missing disks; it runs again for every further member that shows up.
-# Not for the devices of attached spaces (whose properties came above): what
-# a space holds never starts another attach.
+# appear. Each run attaches every complete pool and skips pools that are
+# still missing disks; every further member that shows up starts a run of
+# its own (an instance named after its device numbers, so that it is not
+# lost in a run that goes on). Not for the devices of attached spaces
+# (whose properties came above): what a space holds never starts another
+# attach.
 ACTION=="add|change", ENV{SS_SPACE}!="?*", ENV{ID_PART_ENTRY_TYPE}=="e75caf8f-f680-4cee-afa3-b001e56efc2d", \
-  TAG+="systemd", ENV{SYSTEMD_WANTS}+="storage-spaces-attach.service"
+  TAG+="systemd", ENV{SYSTEMD_WANTS}+="storage-spaces-attach@$env{MAJOR}:$env{MINOR}.service"
 LABEL="storage_spaces_end"

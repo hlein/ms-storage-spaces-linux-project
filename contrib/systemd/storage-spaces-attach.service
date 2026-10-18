@@ -7,10 +7,8 @@ DefaultDependencies=no
 After=systemd-udevd.service systemd-udev-trigger.service systemd-modules-load.service
 Before=local-fs-pre.target
 Wants=local-fs-pre.target
-# udev starts it for every member disk that appears or changes, several
-# times within seconds at boot: with the default start limit a disk that
-# came a little later would not be attached at all. Runs are cheap for
-# spaces already attached.
+# The run at boot; udev starts storage-spaces-attach@.service for every
+# member disk that appears or changes afterwards (and during this run).
 StartLimitIntervalSec=0
 
 [Service]
@@ -18,7 +16,10 @@ Type=oneshot
 # Let the other members of a pool finish appearing first.
 ExecStartPre=-/usr/bin/udevadm settle --timeout=30
 ExecStart=/usr/local/sbin/spaces attach
+# The run ends in time with what it did not get to said, rather than
+# being killed: 30 s of settle, then at most 80 s of spaces attach.
 TimeoutStartSec=120
+Environment=SPACES_ATTACH_TIMEOUT=80
 
 # This runs as root and parses the metadata of every disk that carries a
 # Storage Spaces partition, whoever made it: it keeps what it needs (block
@@ -35,7 +36,9 @@ ProtectHome=read-only
 # after systemd-tmpfiles-setup.service, which comes after local-fs.target,
 # and this runs before local-fs-pre.target: an ordering cycle at every
 # boot, which systemd breaks by dropping jobs (mounts, this unit) at random.
-TemporaryFileSystem=/tmp /var/tmp
+# Not /var/tmp: a /var of its own is not mounted yet, and systemd would
+# make the directory on the root file system, read-only that early.
+TemporaryFileSystem=/tmp
 ProtectKernelTunables=yes
 ProtectKernelLogs=yes
 ProtectControlGroups=yes

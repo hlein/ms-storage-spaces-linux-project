@@ -411,6 +411,13 @@ and
 has none). Checks that take longer make the space suspect (space.checks);
 checks that stop on an internal error fail it. Either way the other pools
 and spaces are checked and attached as usual.
+.TP
+.B SPACES_ATTACH_TIMEOUT
+Seconds a run of
+.B attach
+may take (no limit by default; the attach units set 80, within their start
+timeout): every wait, for udev, a server or the checks, ends by then, and
+the spaces it does not get to are named and not attached.
 .SH BACKENDS
 .TP
 .B dm
@@ -458,14 +465,17 @@ The udev properties of the devices attach made.
 .TQ
 .I /etc/udev/rules.d/69-storage-spaces.rules
 Starts
+.BI storage-spaces-attach@ major : minor .service
+when a pool member appears, a run of its own for each;
 .B storage-spaces-attach.service
-when a pool member appears: the packages install the first,
+attaches at boot. The packages install the first rule,
 .B contrib/install.sh
 the second. To attach by hand only, remove the second, or override the
 first with
 .B ln \-s /dev/null /etc/udev/rules.d/69-storage-spaces.rules
 (or
-.BR "systemctl mask storage-spaces-attach.service" ).
+.BR "systemctl mask storage-spaces-attach.service" ,
+which the runs of the rule heed too).
 .SH EXAMPLES
 .nf
 spaces scan

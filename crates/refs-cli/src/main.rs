@@ -17,7 +17,7 @@ use refs::{Content, Entry, Target, Volume};
 use storage_spaces::io::ReadAt;
 
 #[derive(Parser)]
-#[command(version, about = "Read Microsoft ReFS volumes")]
+#[command(version, about = "Read, check and write Microsoft ReFS volumes")]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -165,8 +165,9 @@ enum Command {
         yes: bool,
     },
     /// Create a file holding the content of a local file (experimental:
-    /// writes the volume, only with --yes; up to 64 GiB; a printable ASCII
-    /// name).
+    /// writes the volume, only with --yes; up to 64 GiB; a name of printable
+    /// ASCII that Windows can open: no last dot or space, no device name such
+    /// as CON or COM1).
     Create {
         /// The image, disk or partition.
         device: PathBuf,
@@ -196,7 +197,7 @@ enum Command {
         yes: bool,
     },
     /// Rename a file or directory within its directory (experimental:
-    /// writes the volume, only with --yes; a printable ASCII name).
+    /// writes the volume, only with --yes; a name as for create).
     Rename {
         /// The image, disk or partition.
         device: PathBuf,
@@ -211,7 +212,7 @@ enum Command {
         yes: bool,
     },
     /// Create a directory (experimental: writes the volume, only with
-    /// --yes; a printable ASCII name).
+    /// --yes; a name as for create).
     Mkdir {
         /// The image, disk or partition.
         device: PathBuf,
@@ -245,7 +246,7 @@ enum Command {
         yes: bool,
     },
     /// Move a file or directory into another directory (experimental:
-    /// writes the volume, only with --yes).
+    /// writes the volume, only with --yes; a name as for create).
     Move {
         /// The image, disk or partition.
         device: PathBuf,
@@ -260,7 +261,7 @@ enum Command {
         yes: bool,
     },
     /// Give a file another name, a hard link (experimental: writes the
-    /// volume, only with --yes).
+    /// volume, only with --yes; a name as for create).
     Link {
         /// The image, disk or partition.
         device: PathBuf,
@@ -278,7 +279,8 @@ enum Command {
     /// Copy a file as a block clone, as Copy-Item does on a Dev Drive: the
     /// copy shares the file's clusters, counted in the block reference
     /// count table (experimental: writes the volume, only with --yes; the
-    /// data only, not named streams; small files are copied)
+    /// data only, not named streams; small files are copied; a new name as
+    /// for create).
     Clone {
         /// The image, disk or partition.
         device: PathBuf,
@@ -294,9 +296,11 @@ enum Command {
         yes: bool,
     },
     /// Check the volume's consistency (read-only): every page's checksum
-    /// and structure, every page and file cluster used in its allocator,
-    /// clusters several files map counted as shared. Exits with 1 on a
-    /// problem.
+    /// and structure, no key twice, the counts of each table's descriptor,
+    /// every page and file cluster used in its allocator, the reference
+    /// counts of clusters several files map, a directory's names in the
+    /// order of the volume's upcase table; clusters used that nothing
+    /// references are counted. Exits with 1 on a problem.
     Check {
         #[command(flatten)]
         source: Source,

@@ -177,10 +177,27 @@ Thin spaces allocate rows as writes first reach them; discards give rows of
 thin simple and mirror spaces back to the pool once they cover them whole.
 Writes are durable once flushed or after
 .BR detach .
-Not with
+Pools on image files work too: the server may write the member images
+(its view of the system is otherwise read-only). Not with
 .B \-\-degraded
 or
 .BR \-\-force .
+.IP
+The checks of each pool run in a child process of its own, all at once,
+with a memory limit and a deadline
+.RB ( SPACES_POOL_MEMORY ,
+.BR SPACES_POOL_TIMEOUT );
+a pool whose child reaches one fails alone (space.checks), and nothing of it
+is attached. The devices of several pools may be given at once.
+.B attach
+and
+.B detach
+wait for another run of either (udev starts them as disks come) until the
+time of the run is up
+.RB ( SPACES_ATTACH_TIMEOUT ),
+or 10 minutes when started by hand, naming the process that runs; then they
+fail. The programs they run (dmsetup, losetup, nbd\-client, systemctl,
+udevadm, journalctl) are stopped after 120 s, or when the run's time is up.
 .TP
 .B detach
 Removes the devices of the given space (name, GUID or device-mapper name) or
@@ -219,8 +236,8 @@ gone since); for root also the
 device-mapper devices with the UUID of a space and no state.
 .TP
 .B check
-Checks the spaces of every pool found (or of the pool whose devices are
-given) as
+Checks the spaces of every pool found (or of the pools whose devices are
+given: the devices of several pools are checked each pool on its own) as
 .B attach
 does before it reads them, and prints a report per space: every check
 (pool.quorum, pool.members, pool.database, pool.clean, space.state,
@@ -261,6 +278,36 @@ could be read), or no space that
 names
 .RB ( \-\-json
 then prints an empty list).
+.TP
+.B serve\-ublk\fR, \fBserve\-nbd\fR, \fBserve\-fuse
+Serve one space in the foreground, as
+.B attach
+starts them (as transient units); the same checks gate them
+.RB ( \-\-degraded ,
+.B \-\-force
+as for attach), and
+.B \-\-rw
+serves it read-write (ublk and nbd).
+.B serve\-ublk
+makes
+.BR /dev/ublkb N
+(root, the
+.B ublk_drv
+module);
+.B serve\-nbd \-\-socket
+.I path
+listens on a Unix socket only its owner may connect to, from the moment it
+exists, for
+.B nbd\-client \-unix
+.IR path ;
+.B serve\-fuse \-\-mountpoint
+.I dir
+exposes the space read-only as the file
+.IR dir /space.img.
+.B \-\-ready\-file
+.I path
+writes, once it serves, the device, the socket or the image file there,
+whole. SIGINT and SIGTERM make what was written durable and end it.
 .TP
 .B info\fR, \fBextents\fR, \fBexport\fR, \fBdm\-table
 Inspect a pool given by its member devices or images: pool, disks (usage,
@@ -362,7 +409,13 @@ or grow it
 the file system inside is not grown).
 .TP
 .B disk add \-\-new \fIdevice\fR [\-\-wipe]
-Add a blank disk to the pool of the other devices (at most four).
+Add a blank disk to the pool of the other devices (at most four). A disk
+with a partition table, a file system or pool data in its first or last MiB
+is refused, unless
+.BR \-\-wipe ,
+which clears its first 17 MiB and last MiB first, as
+.B pool create \-\-wipe
+does.
 .TP
 .B disk set \-\-disk \fIid\fR [\-\-media unspecified|hdd|ssd] [\-\-usage auto\-select|manual\-select|hot\-spare]
 Change a disk's media type or usage.
@@ -422,15 +475,18 @@ whose checks need more fails (space.checks), and nothing of it is attached.
 .B SPACES_POOL_TIMEOUT
 Seconds the child that checks one pool may take (120 by default, 0 for no
 limit; never past
-.BR SPACES_ATTACH_TIMEOUT ).
+.BR SPACES_ATTACH_TIMEOUT ;
+.B check \-\-deep
+none unless this sets one).
 A child that takes longer is killed, and its pool fails (space.checks).
 .TP
 .B SPACES_ATTACH_TIMEOUT
 Seconds a run of
 .B attach
 may take (no limit by default; the attach units set 80, within their start
-timeout): every wait, for udev, a server or the checks, ends by then, and
-the spaces it does not get to are named and not attached.
+timeout): every wait, for udev, a server, another run's lock or the checks,
+ends by then, and the spaces it does not get to are named and not attached.
+Without it a run waits 10 minutes at most for another one's lock.
 .SH BACKENDS
 .TP
 .B dm

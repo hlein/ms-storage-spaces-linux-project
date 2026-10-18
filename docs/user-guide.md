@@ -72,7 +72,7 @@ disks are never written, unless a space is attached read-write
 
 | Way | Gives | For |
 |---|---|---|
-| From a checkout: `cargo build --release && sudo contrib/install.sh` | `spaces`, `refs`, `mount.ReFS`, man pages, udev rule, systemd unit, module list | any distribution |
+| From a checkout: `cargo build --release && sudo contrib/install.sh` | `spaces`, `refs`, `mount.ReFS`, man pages, udev rule, systemd unit | any distribution |
 | Debian/Ubuntu package: `contrib/deb/build-deb.sh && sudo apt install ./target/deb/storage-spaces_*.deb` | the same, as a package | Debian, Ubuntu |
 | Arch Linux: `(cd contrib/arch && makepkg -si)` | the same, as a package | Arch |
 | The releases page of the repository | static `spaces` and `refs` binaries (x86_64, musl) and a `.deb`, with `SHA256SUMS` (from 1.1.0; 1.0.0 had no `refs`) and, from 1.3, `THIRD-PARTY-NOTICES.txt` (the licences of what the binaries link) | trying it out; `sha256sum -c SHA256SUMS` first (it is not signed: it shows a damaged download, not a file swapped on the page) |
@@ -537,8 +537,9 @@ volume in a space attached with `--degraded` or `--force` mounts only with
   partitions inside the space and apart; a primary header lost with the backup
   valid is suspect, and the partitions are read from the backup (their
   file systems are checked); a protective MBR without a GPT is suspect.
-* `fs.ntfs`: the NTFS boot sector and its copy in the partition's last
-  sector agree.
+* `fs.ntfs`: the NTFS boot sector and its copy, in the sector after the
+  volume (where Windows writes it; 1.2.2 looked in the partition's last
+  sector), agree.
 * `fs.refs.boot`, `fs.refs.superblock`, `fs.refs.checkpoint`,
   `fs.refs.log`: the ReFS boot sector (the volume fits its partition), the
   superblock and its two copies, both checkpoints, and that the log holds
@@ -560,7 +561,9 @@ volume in a space attached with `--degraded` or `--force` mounts only with
   with a memory limit of 2048 MiB (`SPACES_POOL_MEMORY=MIB`, 0 none; the
   84 pools of the corpus check within 512) and a deadline of 120 s
   (`SPACES_POOL_TIMEOUT=SECONDS`, 0 none; never past the time of
-  `spaces attach`): a pool whose checks reach either gets one failed
+  `spaces attach`; with `--deep`, which may take hours, none unless the
+  variable sets one; `--bundle` checks in its own process, without the
+  child's limits): a pool whose checks reach either gets one failed
   `space.checks` report naming the limit, and nothing of it is attached
   (1.2.2 checked every pool in one process, where such a pool took the
   whole run with it). `spaces check` and `spaces attach` take the devices
@@ -749,7 +752,9 @@ export leaves no partial image (1.2.2 left one, with the umask's mode).
 ## Reading ReFS volumes
 
 `refs` reads ReFS 3.x volumes (Dev Drives, ReFS data volumes, ReFS inside a
-space) without Windows and never writes to them. The source is an image, a
+space) without Windows, and writes to them only when asked (the writing
+commands with `--yes`, `refs mount --rw`; see Writing ReFS volumes). The
+source is an image, a
 disk or a partition (on a disk the first ReFS partition of its GPT), or,
 with `--space NAME`, the member disks of a pool:
 
@@ -814,7 +819,8 @@ in one change and renamed in the next); so are a block clone to a new
 name and a named stream in clusters replaced. A file is created when it
 is opened and its data written when it is closed, two changes as on other
 file systems: a crash between them leaves it empty. A change `refs`
-refuses (a name that is not printable ASCII, for now) changes nothing; one
+refuses (a name that is not printable ASCII, for now, or one Windows
+programs could not open, see below) changes nothing; one
 the volume has no room for fails with ENOSPC (1.2.2: "Operation not
 supported"). The mount holds the volume for itself: the writing commands
 and another mount are refused while it is mounted ("... is in use by pid N
@@ -960,7 +966,9 @@ older checkpoint).
 descriptor those it has), every file (its clusters used; a cluster
 referenced several times, by block clones or deduplication, counted so in
 the block reference count table, and no count for one referenced once or
-not at all) and the compressed containers, and exits 1 on a problem. It
+not at all), every directory (its names in the order of the volume's
+upcase table, where Windows looks them up) and the compressed containers,
+and exits 1 on a problem. It
 also counts the pages only the older checkpoint references (Windows frees
 them with its next checkpoint) and, on ReFS 3.14 volumes, the clusters
 used that nothing references; Windows leaves some on every volume (about
@@ -1017,6 +1025,8 @@ security`, scores 9.5 UNSAFE before, 5.1 MEDIUM after):
   `serve-fuse`, as transient `storage-spaces-<guid>.service` units) get
   the same limits from the program itself, but for the FUSE server a
   private view of the file system, whose mount the host could not see.
+  A server attached with `--rw` may write the member image files besides
+  (`ReadWritePaths=`; 1.2.2's could not, EROFS).
   A server that cannot go on ends with an error, for systemd to show
   (`systemctl status storage-spaces-<guid>`), rather than live on
   uselessly: `serve-ublk`
@@ -1083,12 +1093,13 @@ overflow checks, and its parsers are fuzzed (`docs/security.md`).
   LVM; detach or stop that first.
 * `... is in use by pid N (spaces serve-ublk --space NAME, unit ...)`:
   another `spaces` process serves or writes the pool (a server of one of its
-  spaces, `serve-ublk --rw`, a management command); a writer waits for every
-  server of the pool, and a server for a writer.
+  spaces, `serve-ublk --rw`, a management command); a writer is refused
+  while a server of the pool runs, and a server while a writer does (at
+  once: nothing waits).
 * `... is in use by pid N (refs mount ...)`: the ReFS volume is mounted
   with `refs mount`; the writing `refs` commands, and a mount for writing,
-  wait until it is unmounted (a read-only mount allows other read-only
-  mounts).
+  are refused at once until it is unmounted (a read-only mount allows other
+  read-only mounts).
 * `the pool is not in a clean state`: a management command was given a pool
   with a missing disk or out-of-date copies; see
   [Replacing a failed disk](#replacing-a-failed-disk) or attach it to

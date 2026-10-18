@@ -1,6 +1,6 @@
 .TH REFS 1 "2026-10-17" "storage-spaces 1.2.2" "User Commands"
 .SH NAME
-refs \- read Microsoft ReFS volumes on Linux
+refs \- read, check and write Microsoft ReFS volumes on Linux
 .SH SYNOPSIS
 .B refs info
 .I source
@@ -139,9 +139,11 @@ links and junctions, attributes and times. Only
 .BR rename ,
 .BR move ,
 .BR link ,
-.B delete
-and
+.BR clone ,
+.BR delete ,
 .B mkdir
+and
+.B mount \-\-rw
 write to the volume.
 .PP
 Every metadata page is checked against the checksum its reference
@@ -229,7 +231,13 @@ opening a large volume on hard disks the first time can take minutes,
 which it waits for (on a terminal it shows every 10 s how much has been
 read; the environment variable
 .B MOUNT_REFS_TIMEOUT
-sets a limit in seconds).
+sets a limit in seconds). As root under systemd it runs
+.B refs mount
+as a transient unit
+.RI refs\-mount\- pid \- time .service
+without network, new privileges or most capabilities; if that unit cannot
+be started it mounts nothing and exits with 32, as for any mount that
+fails.
 Named streams appear as extended attributes
 .BR user. \fIname\fR
 (up to 64 KiB, the Linux limit; larger ones are read with
@@ -266,9 +274,14 @@ refuses, and keeps that line in its journal
 .TP
 .B check
 Check the volume's consistency without writing: every page's checksum
-and structure (as Windows checks pages), every page and file cluster
-used in its allocator, and clusters several files map counted in the
-block reference count table. Exits with 1 when it finds a problem.
+and structure (as Windows checks pages), no key twice in a table and the
+counts its descriptor gives, every page and file cluster used in its
+allocator, clusters several files map counted in the block reference
+count table (and no count for one referenced once), and a directory's
+names in the order of the volume's upcase table, where Windows looks
+them up; the pages only the older checkpoint references and the clusters
+used that nothing references are counted (Windows leaves some on every
+volume). Exits with 1 when it finds a problem.
 With
 .B \-\-quick
 only what mounting checks: the boot sector, the superblock and its copies
@@ -292,7 +305,8 @@ writing commands refuse it.
 .B set
 Change a file's times (UTC, "YYYY-MM-DD hh:mm:ss" or a FILETIME number)
 or attributes (the bits users can set: read-only 1, hidden 2, system 4,
-archive 0x20, ...), or with
+archive 0x20, ...; the other writing commands set the archive attribute
+of the files they change, see below), or with
 .B \-\-integrity on
 turn integrity streams on for an empty file. Experimental: only with
 .BR \-\-yes ,
@@ -324,7 +338,9 @@ permissions of the files beside it. Experimental; only with
 .BR \-\-yes .
 .TP
 .BR rename ", " delete
-Rename a file or directory within its directory, or delete a file (one
+Rename a file or directory within its directory (the new name as for
+.BR create ),
+or delete a file (one
 name of a hard link; clusters other files share stay theirs), a named
 stream
 .RB ( \-\-stream ),
@@ -332,18 +348,24 @@ or an empty directory. Experimental; only with
 .BR \-\-yes .
 .TP
 .B mkdir
-Create a directory. Experimental; only with
+Create a directory (named as for
+.BR create ).
+Experimental; only with
 .BR \-\-yes .
 .TP
 .BR move ", " link
 Move a file or directory into another directory, or give a file another
-name (a hard link). Experimental; only with
+name (a hard link); the new name as for
+.BR create .
+Experimental; only with
 .BR \-\-yes .
 .TP
 .B clone
 Copy a file as a block clone, as
 .B Copy\-Item
-does on a Dev Drive: the copy (a new name, or an empty file) shares the
+does on a Dev Drive: the copy (a new name as for
+.BR create ,
+or an empty file) shares the
 file's clusters, each counted once more in the block reference count
 table; changing either copy later leaves the other as it was. The data
 only (not named streams); small files are copied; both files must be
@@ -370,6 +392,12 @@ record), and
 deletes one. Experimental; only with
 .BR \-\-yes .
 .PP
+Names are ordered and compared as the volume's upcase table says, as
+Windows does; a path may name its directories in any case. Writing a
+file's data or a named stream, renaming, moving or linking it sets its
+archive attribute, as Windows does (setting times does not; directories
+never have it).
+.PP
 The writing commands refuse a volume whose log holds changes its last
 checkpoint lacks (a volume detached without being dismounted;
 .B refs info
@@ -390,6 +418,31 @@ ReFS 1.x by
 stream snapshots are read by
 .B cat
 but not shown in the mount.
+.SH ENVIRONMENT
+.TP
+.B REFS_TMPDIR
+Where
+.B mount \-\-rw
+keeps the files open for writing until they are written back: unnamed
+temporary files only the user may read
+(default: the system's temporary directory,
+.B TMPDIR
+or
+.IR /tmp ).
+.TP
+.B MOUNT_REFS_TIMEOUT
+How long
+.B mount.ReFS
+waits for the mount, in seconds (default: no limit).
+.SH FILES
+.TP
+.IR /run/refs\-mount/ unit .log
+The log of a mount
+.B mount.ReFS
+made as root under systemd, while it is mounted.
+.TP
+.IR /run/storage\-spaces/reports/refs\- serial .txt
+The report of a mount refused by its checks, made as root.
 .SH EXAMPLES
 .nf
 refs ls /dev/sdb2 \-lR

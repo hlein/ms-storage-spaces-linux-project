@@ -29,7 +29,7 @@ use storage_spaces::io::ReadAt;
 use storage_spaces::segments::SegmentKind;
 use storage_spaces::{Condition, Pool, Space, UncleanParity, testpattern};
 
-/// Inspect and read Microsoft Storage Spaces pools.
+/// Inspect, read, write and manage Microsoft Storage Spaces pools.
 #[derive(Parser)]
 #[command(version)]
 struct Cli {

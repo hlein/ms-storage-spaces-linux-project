@@ -614,19 +614,24 @@ fn pool_memory() -> Option<u64> {
 
 /// How long the checks of one pool may take: SPACES_POOL_TIMEOUT seconds
 /// (0: no limit), 120 by default, and no longer than what is left of the
-/// time of `spaces attach`.
-fn pool_deadline() -> Option<Duration> {
-    let own = match std::env::var("SPACES_POOL_TIMEOUT")
-        .ok()
-        .and_then(|v| v.trim().parse::<u64>().ok())
-    {
-        Some(0) => None,
-        Some(s) => Some(Duration::from_secs(s)),
-        None => Some(Duration::from_secs(120)),
-    };
+/// time of `spaces attach`. The deep checks, which read every copy, have
+/// no limit unless SPACES_POOL_TIMEOUT sets one (a scrub of a large pool
+/// takes hours).
+fn pool_deadline(deep: bool) -> Option<Duration> {
+    let own = pool_deadline_of(std::env::var("SPACES_POOL_TIMEOUT").ok().as_deref(), deep);
     match (own, time_left()) {
         (Some(own), Some(left)) => Some(own.min(left)),
         (own, left) => own.or(left),
+    }
+}
+
+/// The [`pool_deadline`] a value of SPACES_POOL_TIMEOUT sets.
+fn pool_deadline_of(value: Option<&str>, deep: bool) -> Option<Duration> {
+    match value.and_then(|v| v.trim().parse::<u64>().ok()) {
+        Some(0) => None,
+        Some(s) => Some(Duration::from_secs(s)),
+        None if deep => None,
+        None => Some(Duration::from_secs(120)),
     }
 }
 
@@ -641,7 +646,7 @@ fn pool_deadline() -> Option<Duration> {
 /// where a thread that hung stayed to the end and memory had no bound
 /// (audit 2026-10-16, E9).
 pub fn reports_in_children(groups: &[Vec<PathBuf>], only: Option<&str>, deep: bool) -> Vec<Result<Vec<Report>>> {
-    let (memory, deadline) = (pool_memory(), pool_deadline());
+    let (memory, deadline) = (pool_memory(), pool_deadline(deep));
     let children: Vec<_> = groups
         .iter()
         .map(|paths| spawn_child(paths, only, deep, memory))
@@ -884,6 +889,18 @@ mod tests {
         assert_eq!(deadline_of(Some(" 120\n")), Some(Duration::from_secs(120)));
         assert_eq!(deadline_of(Some("0")), None);
         assert_eq!(deadline_of(Some("soon")), Some(Duration::from_secs(40)));
+    }
+
+    /// A pool's child has 120 s unless SPACES_POOL_TIMEOUT says otherwise;
+    /// with the deep checks, which may take hours, none unless it sets one
+    /// (the first version of 1.3's children killed a deep scrub at 120 s).
+    #[test]
+    fn a_pools_checks_take_120_s_and_the_deep_ones_their_time() {
+        assert_eq!(pool_deadline_of(None, false), Some(Duration::from_secs(120)));
+        assert_eq!(pool_deadline_of(None, true), None);
+        assert_eq!(pool_deadline_of(Some("30"), true), Some(Duration::from_secs(30)));
+        assert_eq!(pool_deadline_of(Some("0"), false), None);
+        assert_eq!(pool_deadline_of(Some("soon"), false), Some(Duration::from_secs(120)));
     }
 
     /// A device that panics on every read once `armed`.

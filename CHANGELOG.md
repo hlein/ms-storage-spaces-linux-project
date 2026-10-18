@@ -286,7 +286,8 @@
   and every other pool, with it. Each pool is checked in a child process
   of its own now, all at once, with a memory limit (2048 MiB,
   `SPACES_POOL_MEMORY`) and a deadline (120 s, `SPACES_POOL_TIMEOUT`, within
-  the attach units' time): such a pool fails alone, with a `space.checks`
+  the attach units' time; none for `spaces check --deep` unless the
+  variable sets one): such a pool fails alone, with a `space.checks`
   report naming the limit (audit 2026-10-16, E9). The devices of several
   pools can be given together; each pool is checked on its own.
 * One reader of mountinfo fields for `spaces` and `refs` (the one of
@@ -394,6 +395,25 @@
   other, 0.1 s alone; none was slow twice. A third run of the whole
   campaign at 12 processes: the same results, and no mutant over 3 s at
   all (docs/security.md says what ran).
+
+### Documentation
+
+* refs(1) and `refs --help`: the names the writing commands refuse (a last
+  dot or space, device names such as CON or COM1), the archive attribute
+  they set, what `refs check` checks since 1.3 (keys twice, descriptor
+  counts, reference counts, the upcase table's order of names), `clone`
+  among the writing commands, `mount.ReFS`'s sandbox and its exit status 32
+  when the sandbox cannot start, ENVIRONMENT (`REFS_TMPDIR`,
+  `MOUNT_REFS_TIMEOUT`) and FILES (the unit's log in `/run/refs-mount`).
+* spaces(8): `check` of several pools, each in its child with its memory
+  limit and deadline, the lock and program time limits, `attach --rw` on
+  image files, `disk add --wipe`, the servers (`serve-ublk`, `serve-nbd`,
+  `serve-fuse`).
+* The user guide and docs/security.md: the deadlines of `--deep` and
+  `--bundle`, writers refused at once by a holder (not waiting), `--rw`
+  servers writing member images, and the install table without the
+  module list 1.3 no longer installs.
+* The 1.1.1 section says it shipped with 1.2.0 and has no tag of its own.
 
 ## 1.2.2 (2026-10-17)
 
@@ -719,6 +739,9 @@ verdict), with damaged copies of each kind, and on Ubuntu 26.10 and 22.04
   the number of reads counts.
 
 ## 1.1.1 (2026-10-07)
+
+Not released on its own: these fixes shipped with 1.2.0, and there is no
+tag v1.1.1 (the release notes of 1.2.0 carry this section).
 
 Fixes from a user's report of 1.1.0 on Ubuntu 26.10 (systemd 261, AppArmor
 confining fusermount3, three pools of SSDs and hard disks whose spaces have

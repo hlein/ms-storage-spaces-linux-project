@@ -264,7 +264,10 @@ impl State {
             }
             return ino;
         }
-        if self.inodes.len() > INODES_KEPT {
+        // Those the kernel holds stay: trimming waits for as many idle ones
+        // as are kept (1.2.2 trimmed at every new inode once the held ones
+        // alone were more: 1.6 ms each with 100 000 held; audit M17).
+        if self.paths.len() > INODES_KEPT + self.lookups.len() {
             self.trim();
         }
         let ino = match record.and_then(|r| self.records.get(&r).copied()) {
@@ -325,12 +328,12 @@ impl State {
         }
     }
 
-    /// Keeps a listing, within the budget of entries.
+    /// Keeps a listing, within the budget of entries; one larger than the
+    /// budget alone (every lookup there would read it all again: 1.2.2 kept
+    /// none, and each name in a directory of 200 000 cost a reading of it;
+    /// audit M17), until another is kept.
     fn cache_dir(&mut self, oid: u64, d: Arc<Dir>) {
         let n = d.entries.len();
-        if n > DIR_ENTRIES_KEPT {
-            return;
-        }
         if self.dirs.len() >= DIRECTORIES_KEPT || self.dir_entries + n > DIR_ENTRIES_KEPT {
             self.dirs.clear();
             self.dir_entries = 0;
@@ -2120,7 +2123,11 @@ mod tests {
             by_name: HashMap::new(),
         });
         s.cache_dir(9, huge);
-        assert!(!s.dirs.contains_key(&9), "a listing over the budget is not kept");
+        // One over the budget is kept alone (a lookup there reads it whole).
+        assert!(
+            s.dirs.contains_key(&9) && s.dirs.len() == 1,
+            "a listing over the budget is kept alone"
+        );
         let file = Arc::new(RefsFile::default());
         for i in 0..FILES_KEPT + 10 {
             s.cache_file(format!("/f{i}"), file.clone());
@@ -2165,6 +2172,50 @@ mod tests {
             state: Mutex::new(State::new()),
             broken: AtomicBool::new(false),
         }
+    }
+
+    /// New inodes while the kernel holds 100 000 (as `ls -l` of a large
+    /// directory leaves them): in time, the idle ones trimmed (1.2.2 trimmed
+    /// at every new inode once the held ones alone were more than it keeps:
+    /// 1.6 ms each; audit M17).
+    #[test]
+    fn many_held_inodes_do_not_slow_new_ones() {
+        let mut s = State::new();
+        for i in 0..100_000 {
+            let ino = s.inode(&format!("/held/{i}"), None);
+            s.looked_up(ino);
+        }
+        let t = std::time::Instant::now();
+        for i in 0..20_000 {
+            s.inode(&format!("/new/{i}"), None);
+        }
+        assert!(t.elapsed() < Duration::from_secs(5), "{:?}", t.elapsed());
+        assert!(s.paths.len() <= 100_000 + INODES_KEPT + 1);
+    }
+
+    /// A listing of more names than the cache keeps is kept, alone, so that
+    /// a lookup there reads it no more (1.2.2 kept none: every name looked up
+    /// in a directory of 200 000 cost a reading of all of it; audit M17).
+    #[test]
+    fn a_listing_of_many_names_is_kept() {
+        let mut s = State::new();
+        let small: Vec<Entry> = (0..10).map(|i| entry(&format!("f{i}"))).collect();
+        let big: Vec<Entry> = (0..DIR_ENTRIES_KEPT + 50_000)
+            .map(|i| entry(&format!("f{i}")))
+            .collect();
+        let dir = |entries: Vec<Entry>| {
+            let by_name = entries.iter().enumerate().map(|(i, e)| (e.name.clone(), i)).collect();
+            Arc::new(Dir { entries, by_name })
+        };
+        s.cache_dir(1, dir(small.clone()));
+        s.cache_dir(2, dir(big));
+        assert!(s.dirs.contains_key(&2), "the large listing kept");
+        assert!(!s.dirs.contains_key(&1), "alone");
+        s.cache_dir(3, dir(small));
+        assert!(
+            s.dirs.contains_key(&3) && !s.dirs.contains_key(&2),
+            "until another is kept"
+        );
     }
 
     /// The buffer of a file open for writing has no name, and only its user

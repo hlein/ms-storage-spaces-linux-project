@@ -166,6 +166,17 @@
   unreachable, listed twice); they are shown as WTF-8, each its own, and
   read, not changed. `st_blocks` counted the size; it counts what the file
   has (a sparse file less).
+* ReFS at scale: on a volume of many containers (10 TiB: 160 000) deleting
+  or rewriting a large file searched every container for every cluster,
+  about an hour for 100 GiB; containers are found by their physical start,
+  and clusters are freed run by run (allocator rows, reference counts),
+  their list kept as ranges. A commit no longer reads the container tables,
+  or the object table, again when it left them as they were. `refs mount`
+  trimmed its inodes at every new one once the kernel held more than it
+  keeps (`ls -l` of a large directory), and never kept the listing of a
+  directory of more than 200 000 names, so every name looked up there read
+  all of it again; it trims when the idle ones are more than it keeps, and
+  keeps such a listing alone.
 
 ### Testing
 

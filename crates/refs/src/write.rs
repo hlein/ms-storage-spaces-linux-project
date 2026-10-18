@@ -28,7 +28,7 @@ use crate::file::{Entry, LIVE_STREAM, Target, Times};
 use crate::node::Node;
 use crate::page::{PAGE_HEADER_SIZE, PageRef, store_reference};
 use crate::refcount;
-use crate::util::{le16, le32, le64, utf16};
+use crate::util::{Ranges, le16, le32, le64, runs_of, utf16};
 use crate::volume::{Held, ROOT_DIRECTORY, ROOT_OBJECTS, Volume};
 
 const ROOT_MEDIUM_ALLOCATOR: usize = 1;
@@ -99,7 +99,7 @@ pub struct Transaction<'v, D> {
     /// Clusters freed by this transaction: the old checkpoint still uses
     /// them, so they are not taken again before the commit; nor are those
     /// of the pages the commit before replaced (the older checkpoint's).
-    freed: std::collections::HashSet<u64>,
+    freed: Ranges,
     /// The clusters of the pages it replaces or drops.
     retiring: std::collections::HashSet<u64>,
     /// Containers this transaction handed out for data (first clusters).
@@ -156,7 +156,7 @@ impl<'v, D: WriteAt> Transaction<'v, D> {
             } else {
                 // Free already (a commit by `refs` freed them): still the
                 // older checkpoint's until this commit replaces it.
-                self.freed.extend(&lcns);
+                self.freed.extend_clusters(lcns.iter().copied());
             }
         }
         Ok(())
@@ -188,14 +188,14 @@ impl<'v, D: WriteAt> Transaction<'v, D> {
         // Within one commit of several changes, what the earlier ones freed
         // the checkpoint on disk may still use; the pages the commit before
         // replaced, the older checkpoint.
-        let mut freed: std::collections::HashSet<u64> = vol
+        let mut freed: Ranges = vol
             .held
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .as_ref()
             .map(|h| h.freed.clone())
             .unwrap_or_default();
-        freed.extend(vol.retired.lock().unwrap_or_else(|e| e.into_inner()).iter());
+        freed.extend_clusters(vol.retired.lock().unwrap_or_else(|e| e.into_inner()).iter().copied());
         Transaction {
             vol,
             pages: Vec::new(),
@@ -415,7 +415,7 @@ impl<'v, D: WriteAt> Transaction<'v, D> {
             if !(v.len() == 0x18 && le16(v, 0x12) == 2 && le16(v, 0x10) == 0xffff) || !phys.is_multiple_of(cpc) {
                 continue;
             }
-            let Some((&id, _)) = vol.containers.iter().find(|&(_, &p)| p == phys) else {
+            let Some(id) = vol.container_starting(phys) else {
                 continue;
             };
             for table in [crate::volume::ROOT_CONTAINERS, crate::volume::ROOT_CONTAINERS_COPY] {
@@ -450,7 +450,7 @@ impl<'v, D: WriteAt> Transaction<'v, D> {
             .ok_or_else(|| format_err!("no allocator bitmap at {start:#x}"))?;
         let v = &self.pages[at.page].data[at.value..at.value + at.len];
         let used =
-            |j: u64| v[ALLOCATOR_HEADER + (j / 8) as usize] >> (j % 8) & 1 != 0 || self.freed.contains(&(start + j));
+            |j: u64| v[ALLOCATOR_HEADER + (j / 8) as usize] >> (j % 8) & 1 != 0 || self.freed.contains(start + j);
         let after = (0..len).rev().find(|&j| used(j)).map_or(0, |j| j + 1);
         let free = u64::from(le16(v, 0x10));
         let mut budget = free.saturating_sub(keep);
@@ -499,8 +499,7 @@ impl<'v, D: WriteAt> Transaction<'v, D> {
                 continue;
             }
             let freed = &self.freed;
-            let bit =
-                |j: u64| v[ALLOCATOR_HEADER + (j / 8) as usize] >> (j % 8) & 1 != 0 || freed.contains(&(start + j));
+            let bit = |j: u64| v[ALLOCATOR_HEADER + (j / 8) as usize] >> (j % 8) & 1 != 0 || freed.contains(start + j);
             let Some(j) = (0..count.saturating_sub(n as u64 - 1))
                 .step_by(n)
                 .find(|&j| (j..j + n as u64).all(|k| !bit(k)))
@@ -524,49 +523,114 @@ impl<'v, D: WriteAt> Transaction<'v, D> {
 
     /// Marks clusters free again.
     fn release(&mut self, allocator: usize, clusters: &[u64]) -> Result<()> {
+        self.release_runs(allocator, &runs_of(clusters))
+    }
+
+    /// Marks runs of clusters (first, clusters) free again, a bitmap row
+    /// at a time (1.2.2 looked for the row of each cluster from the first);
+    /// a cluster in a uniform row has the row's block made a bitmap first.
+    fn release_runs(&mut self, allocator: usize, runs: &[(u64, u64)]) -> Result<()> {
         let mut bitmaps = self.bitmaps(allocator)?;
-        for &c in clusters {
-            if !bitmaps.iter().any(|(start, count, _)| *start <= c && c < start + count) {
-                self.unpack(allocator, c)?;
-                bitmaps = self.bitmaps(allocator)?;
+        for &(first, n) in runs {
+            let end = first
+                .checked_add(n)
+                .ok_or_else(|| format_err!("a run past the last cluster"))?;
+            let mut c = first;
+            while c < end {
+                let i = bitmaps.partition_point(|(start, count, _)| start + count <= c);
+                let Some(&(start, count, at)) = bitmaps.get(i).filter(|(start, _, _)| *start <= c) else {
+                    self.unpack(allocator, c)?;
+                    bitmaps = self.bitmaps(allocator)?;
+                    if !bitmaps.iter().any(|(start, count, _)| *start <= c && c < start + count) {
+                        return Err(format_err!("cluster {c:#x} in no bitmap of allocator {allocator}"));
+                    }
+                    continue;
+                };
+                let stop = end.min(start + count);
+                let v = self.value_mut(at);
+                for k in c - start..stop - start {
+                    let byte = &mut v[ALLOCATOR_HEADER + (k / 8) as usize];
+                    if *byte >> (k % 8) & 1 == 0 {
+                        return Err(format_err!("cluster {:#x} is not allocated", start + k));
+                    }
+                    *byte &= !(1 << (k % 8));
+                }
+                let free = le16(v, 0x10) + (stop - c) as u16;
+                v[0x10..0x12].copy_from_slice(&free.to_le_bytes());
+                self.freed.insert(c, stop);
+                c = stop;
             }
-            let &(start, _, at) = bitmaps
-                .iter()
-                .find(|(start, count, _)| *start <= c && c < start + count)
-                .ok_or_else(|| format_err!("cluster {c:#x} in no bitmap of allocator {allocator}"))?;
-            let j = c - start;
-            let v = self.value_mut(at);
-            let byte = &mut v[ALLOCATOR_HEADER + (j / 8) as usize];
-            if *byte >> (j % 8) & 1 == 0 {
-                return Err(format_err!("cluster {c:#x} is not allocated"));
-            }
-            *byte &= !(1 << (j % 8));
-            let free = le16(v, 0x10) + 1;
-            v[0x10..0x12].copy_from_slice(&free.to_le_bytes());
-            self.freed.insert(c);
         }
         Ok(())
     }
 
-    /// Frees a file's data clusters, minding block clones: a cluster the
-    /// block reference count table (root 6) counts further references for
-    /// loses one there (its count and the row's total at 0x18, as Windows
-    /// does; the row stays; a row of one count for its range first becomes
-    /// rows of counts where clusters lose one) and stays allocated; the
-    /// others become free.
+    /// Frees a file's data clusters (see `free_runs`).
     fn free_data(&mut self, clusters: &[u64]) -> Result<()> {
-        let virtuals = clusters
-            .iter()
-            .map(|&c| self.vol.virtual_of(c))
-            .collect::<Result<Vec<_>>>()?;
-        let last = self.unreference(&virtuals)?;
-        let free: Vec<u64> = clusters
-            .iter()
-            .zip(last)
-            .filter(|&(_, last)| last)
-            .map(|(&c, _)| c)
-            .collect();
-        self.release(ROOT_MEDIUM_ALLOCATOR, &free)
+        self.free_runs(&runs_of(clusters))
+    }
+
+    /// Frees runs of a file's data (first physical cluster, clusters),
+    /// minding block clones: a cluster the block reference count table
+    /// (root 6) counts further references for loses one there (its count
+    /// and the row's total at 0x18, as Windows does; the row stays; a row of
+    /// one count for its range first becomes rows of counts where clusters
+    /// lose one) and stays allocated; the others become free. A container
+    /// at a time, cluster by cluster only where the table counts them
+    /// (1.2.2 went cluster by cluster, searching the containers for each).
+    fn free_runs(&mut self, runs: &[(u64, u64)]) -> Result<()> {
+        let cpc = self.vol.clusters_per_container;
+        // (first physical cluster, its virtual cluster, clusters), each in
+        // one container.
+        let mut pieces = Vec::new();
+        for &(lcn, n) in runs {
+            let end = lcn
+                .checked_add(n)
+                .ok_or_else(|| format_err!("a run past the last cluster"))?;
+            let mut c = lcn;
+            while c < end {
+                let v = self.vol.virtual_of(c)?;
+                let len = (cpc - (v & (cpc - 1))).min(end - c);
+                pieces.push((c, v, len));
+                c += len;
+            }
+        }
+        let rows = self.refcount_rows()?;
+        let mut free = Vec::new();
+        let mut counted: Vec<(u64, u64)> = Vec::new();
+        for &(c, v, n) in &pieces {
+            let mut at = 0;
+            while at < n {
+                let i = rows.partition_point(|r| r.1 <= v + at);
+                match rows.get(i) {
+                    Some(&(first, past, _)) if first <= v + at => {
+                        let stop = (past - v).min(n);
+                        counted.extend((at..stop).map(|k| (c + k, v + k)));
+                        at = stop;
+                    }
+                    Some(&(first, _, _)) => {
+                        let stop = (first - v).min(n);
+                        free.push((c + at, stop - at));
+                        at = stop;
+                    }
+                    None => {
+                        free.push((c + at, n - at));
+                        at = n;
+                    }
+                }
+            }
+        }
+        if !counted.is_empty() {
+            let virtuals: Vec<u64> = counted.iter().map(|&(_, v)| v).collect();
+            let last = self.unreference(&virtuals)?;
+            free.extend(
+                counted
+                    .iter()
+                    .zip(last)
+                    .filter(|(_, last)| *last)
+                    .map(|(&(c, _), _)| (c, 1)),
+            );
+        }
+        self.release_runs(ROOT_MEDIUM_ALLOCATOR, &free)
     }
 
     /// Lets go of a file's clusters in compacted (compressed) containers
@@ -819,7 +883,7 @@ impl<'v, D: WriteAt> Transaction<'v, D> {
         let v = &self.pages[at.page].data[at.value..at.value + at.len];
         let free = le16(v, 0x10);
         let used =
-            |j: u64| v[ALLOCATOR_HEADER + (j / 8) as usize] >> (j % 8) & 1 != 0 || self.freed.contains(&(start + j));
+            |j: u64| v[ALLOCATOR_HEADER + (j / 8) as usize] >> (j % 8) & 1 != 0 || self.freed.contains(start + j);
         let class = vol.container_classes.get(&start).copied();
         let handed = self.handed_out.contains(&start);
         if free != 0 || (0..len).any(|j| !used(j)) || len != vol.clusters_per_container || !(class == Some(0) || handed)
@@ -838,7 +902,7 @@ impl<'v, D: WriteAt> Transaction<'v, D> {
             &row(&key, &uniform, 0),
             &u64_key_order,
         )?;
-        let Some((&id, _)) = vol.containers.iter().find(|&(_, &p)| p == start) else {
+        let Some(id) = vol.container_starting(start) else {
             return Ok(());
         };
         for table in [crate::volume::ROOT_CONTAINERS, crate::volume::ROOT_CONTAINERS_COPY] {
@@ -1740,7 +1804,7 @@ impl<'v, D: WriteAt> Transaction<'v, D> {
             let mut h = vol.held.lock().unwrap_or_else(|e| e.into_inner());
             let h = h.as_mut().ok_or_else(|| format_err!("the held commit went"))?;
             h.page = Some(new);
-            h.freed.extend(self.freed.iter().copied());
+            h.freed.extend(&self.freed);
             h.retiring.extend(self.retiring.iter().copied());
             return Ok(());
         }
@@ -1835,6 +1899,21 @@ fn retire<D>(vol: &Volume<D>, retiring: std::collections::HashSet<u64>, written:
     } else {
         retired.extend(retiring);
     }
+}
+
+/// Runs (first, clusters) sorted, those that overlap or meet joined (a
+/// file's levels can share runs).
+fn merged(runs: &[(u64, u64)]) -> Vec<(u64, u64)> {
+    let mut v: Vec<(u64, u64)> = runs.iter().copied().filter(|r| r.1 > 0).collect();
+    v.sort_unstable();
+    let mut out: Vec<(u64, u64)> = Vec::with_capacity(v.len());
+    for (s, n) in v {
+        match out.last_mut() {
+            Some(l) if s <= l.0 + l.1 => l.1 = l.1.max(s + n - l.0),
+            _ => out.push((s, n)),
+        }
+    }
+    out
 }
 
 /// The clusters of physical runs, each once.
@@ -3026,7 +3105,7 @@ impl<D: WriteAt> Volume<D> {
         let old_map = self.extent_map_pages(row_value(&rows[at]))?;
         let committed = {
             let mut tx = Transaction::begin(&*self)?;
-            let mut free = old_map;
+            let mut free = runs_of(&old_map);
             // Past the new end: its clusters free, its runs shortened.
             let mut kept_runs = Vec::with_capacity(xs.len());
             for (&(vcn, vlcn, n), &(lcn, _)) in xs.iter().zip(&physical) {
@@ -3034,7 +3113,9 @@ impl<D: WriteAt> Volume<D> {
                 if keep > 0 {
                     kept_runs.push((vcn, vlcn, keep));
                 }
-                free.extend(lcn + keep..lcn + n);
+                if keep < n {
+                    free.push((lcn + keep, n - keep));
+                }
             }
             xs = kept_runs;
             // New clusters: as Windows appends, new runs after the file's
@@ -3057,7 +3138,7 @@ impl<D: WriteAt> Volume<D> {
             }
             self.dev.flush()?;
             xs.sort_unstable();
-            tx.free_data(&free)?;
+            tx.free_runs(&free)?;
             let extents: Vec<(u64, u64, u64, Vec<u8>)> = xs.iter().map(|&(v, l, n)| (v, l, n, Vec::new())).collect();
             let logical = new_clusters * cluster;
             let allocated = if sparse {
@@ -3280,8 +3361,7 @@ impl<D: WriteAt> Volume<D> {
         let committed = {
             let mut tx = Transaction::begin(&*self)?;
             // The old data clusters become free (kept until the commit).
-            let clusters = clusters_of(&runs);
-            tx.free_data(&clusters)?;
+            tx.free_runs(&merged(&runs))?;
             tx.free_compacted(&clusters_of(&compacted))?;
             if let Some(shared) = shared {
                 tx.add_references(shared)?;
@@ -3401,8 +3481,7 @@ impl<D: WriteAt> Volume<D> {
         let committed = {
             let mut tx = Transaction::begin(&*self)?;
             // Its data clusters become free (kept until the commit).
-            let clusters = clusters_of(&runs);
-            tx.free_data(&clusters)?;
+            tx.free_runs(&merged(&runs))?;
             tx.free_compacted(&clusters_of(&compacted))?;
             tx.remove_row(Tree::Object(dir), &|k| is_name_row(k, &name))?;
             tx.remove_row(Tree::Object(dir), &|k| {
@@ -3522,11 +3601,30 @@ impl<D: WriteAt> Volume<D> {
         if rows.is_empty() {
             return Ok(false);
         }
+        let cpc = self.clusters_per_container;
         for &(lcn, n) in runs {
-            for c in lcn..lcn + n {
-                if self.counted(&rows, c)? {
-                    return Ok(true);
+            let end = lcn.saturating_add(n);
+            let mut c = lcn;
+            while c < end {
+                let v = self.virtual_of(c)?;
+                let len = (cpc - (v & (cpc - 1))).min(end - c);
+                let mut i = rows.partition_point(|r| r.0.saturating_add(r.1) <= v);
+                while let Some((first, count, value)) = rows.get(i)
+                    && *first < v + len
+                {
+                    // A row of one count: its first cluster says it.
+                    let (from, to) = (v.max(*first), (v + len).min(first.saturating_add(*count)));
+                    let to = if le32(value, 0x14) == refcount::COUNTS {
+                        to
+                    } else {
+                        from + 1
+                    };
+                    if (from..to).any(|x| refcount::count_of(value, x).is_none_or(|c| c > 0)) {
+                        return Ok(true);
+                    }
+                    i += 1;
                 }
+                c += len;
             }
         }
         Ok(false)
@@ -3559,8 +3657,10 @@ impl<D: WriteAt> Volume<D> {
     /// count they do not hold is taken as more).
     fn counted(&self, rows: &[(u64, u64, Vec<u8>)], c: u64) -> Result<bool> {
         let v = self.virtual_of(c)?;
-        Ok(rows.iter().any(|(first, count, value)| {
-            *first <= v && v < first.saturating_add(*count) && refcount::count_of(value, v).is_none_or(|c| c > 0)
+        let i = rows.partition_point(|r| r.0 <= v);
+        Ok(i.checked_sub(1).is_some_and(|i| {
+            let (first, count, value) = &rows[i];
+            v < first.saturating_add(*count) && refcount::count_of(value, v).is_none_or(|c| c > 0)
         }))
     }
 
@@ -4084,8 +4184,7 @@ impl<D: WriteAt> Volume<D> {
             tx.remove_row(Tree::Object(dir), &|k| is_entry_row(k, &name))?;
             let key = record_key(id, home);
             if last {
-                let clusters = clusters_of(&runs);
-                tx.free_data(&clusters)?;
+                tx.free_runs(&merged(&runs))?;
                 tx.free_compacted(&clusters_of(&compacted))?;
                 tx.remove_row(Tree::Object(home), &|k| k == key)?;
                 tx.remove_row(Tree::Object(home), &|k| {
@@ -5347,6 +5446,31 @@ mod tests {
     fn small() -> Volume<Overlay<SparseImage>> {
         let image = SparseImage::read_from(&include_bytes!("../tests/fixtures/r314small/disk.fixture")[..]).unwrap();
         Volume::open(Overlay::new(image), 16 << 20).unwrap()
+    }
+
+    /// The virtual clusters of a GiB of data on a volume of 160 000
+    /// containers (10 TiB of 4 KiB clusters), in the containers 1.2.2
+    /// searched last: in time with the clusters, not with them times the
+    /// containers (1.2.2 searched the containers from the first for every
+    /// cluster, as deleting or rewriting a file does: 140 us each, about an
+    /// hour for 100 GiB; audit M17).
+    #[test]
+    fn virtual_clusters_are_found_in_time_among_many_containers() {
+        let mut vol = small();
+        let cpc = vol.clusters_per_container;
+        let past = (vol.boot.volume_size() / vol.cluster).next_multiple_of(cpc);
+        let n = 160_000u64;
+        for i in 0..n {
+            vol.add_container(0x10_0000 + i, past + i * cpc);
+        }
+        let first = past + (n - 16) * cpc;
+        let t = std::time::Instant::now();
+        let shift = 64 - cpc.leading_zeros();
+        for c in first..first + 16 * cpc {
+            let v = vol.virtual_of(c).unwrap();
+            assert_eq!(v >> shift, 0x10_0000 + (c - past) / cpc);
+        }
+        assert!(t.elapsed() < std::time::Duration::from_secs(5), "{:?}", t.elapsed());
     }
 
     /// A file with snapshots whose live level has a cluster other files

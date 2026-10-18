@@ -65,6 +65,10 @@ pub struct Volume<D> {
     /// Clusters per container, and each container's first physical cluster.
     pub clusters_per_container: u64,
     pub(crate) containers: BTreeMap<u64, u64>,
+    /// The containers by their first physical cluster: their ids (1.2.2
+    /// searched `containers` from the start for every cluster). Made when
+    /// first asked for: reading needs none.
+    container_at: std::sync::OnceLock<BTreeMap<u64, u64>>,
     /// The class of each container, by its first physical cluster (u32 at
     /// 0x14 of its row: 0 data, 1 metadata, 0x2000 not handed out yet,
     /// 0x4000 full of data, others the log's and reserved areas).
@@ -90,6 +94,10 @@ pub struct Volume<D> {
     /// A commit failed and the volume could not be read again: what is on
     /// disk is not known, and changes are refused.
     pub(crate) unread: std::sync::atomic::AtomicBool,
+    /// The roots the container tables (and their index) and the object
+    /// table were last read from: read again only when they change.
+    loaded_containers: Option<[Option<PageRef>; 3]>,
+    loaded_objects: Option<PageRef>,
 }
 
 /// The commit several changes make together, until its checkpoint is
@@ -106,7 +114,7 @@ pub(crate) struct Held {
     pub page: Option<Vec<u8>>,
     /// The clusters they freed, which the checkpoint on disk may still
     /// use: nothing takes them before the commit.
-    pub freed: std::collections::HashSet<u64>,
+    pub freed: crate::util::Ranges,
     /// The clusters of the pages they replaced or dropped (`retired` once
     /// the checkpoint is written).
     pub retiring: std::collections::HashSet<u64>,
@@ -177,6 +185,7 @@ impl<D: ReadAt> Volume<D> {
             },
             clusters_per_container: 0,
             containers: BTreeMap::new(),
+            container_at: std::sync::OnceLock::new(),
             container_classes: BTreeMap::new(),
             objects: BTreeMap::new(),
             checkpoint_lcns: Vec::new(),
@@ -187,6 +196,8 @@ impl<D: ReadAt> Volume<D> {
             held: std::sync::Mutex::new(None),
             retired: Default::default(),
             unread: Default::default(),
+            loaded_containers: None,
+            loaded_objects: None,
         };
         vol.load()?;
         Ok(vol)
@@ -262,8 +273,23 @@ impl<D: ReadAt> Volume<D> {
             Some((slot, clock, page)) => Self::parse_checkpoint(slot, clock, &page)?,
             None => Self::parse_checkpoint(lcn, clock, &chkp)?,
         };
-        self.load_containers()?;
-        self.load_objects()
+        // The tables kept from it, read again only when their roots changed
+        // (copy on write gives a changed table a new root; 1.2.2 read both
+        // after every commit, a walk of every container on a large volume).
+        let containers = [ROOT_CONTAINERS, ROOT_CONTAINERS_COPY, ROOT_CONTAINER_INDEX]
+            .map(|i| self.checkpoint.roots.get(i).cloned());
+        if self.loaded_containers.as_ref() != Some(&containers) {
+            self.loaded_containers = None;
+            self.load_containers()?;
+            self.loaded_containers = Some(containers);
+        }
+        let objects = self.root(ROOT_OBJECTS)?;
+        if self.loaded_objects.as_ref() != Some(&objects) {
+            self.loaded_objects = None;
+            self.load_objects()?;
+            self.loaded_objects = Some(objects);
+        }
+        Ok(())
     }
 
     /// The other checkpoint the superblock lists, when it is valid and
@@ -447,6 +473,7 @@ impl<D: ReadAt> Volume<D> {
         let clusters = (self.boot.volume_size() / self.cluster).max(1);
         self.clusters_per_container = clusters.next_power_of_two();
         self.containers = BTreeMap::from([(0, 0)]);
+        self.container_at = std::sync::OnceLock::new();
         self.container_classes = BTreeMap::from([(0, 0)]);
         self.compacted.clear();
         self.units.lock().unwrap().clear();
@@ -616,11 +643,30 @@ impl<D: ReadAt> Volume<D> {
     pub fn virtual_of(&self, lcn: u64) -> Result<u64> {
         let cpc = self.clusters_per_container;
         let shift = 64 - cpc.leading_zeros();
-        self.containers
-            .iter()
-            .find(|&(_, &start)| start <= lcn && lcn - start < cpc)
-            .map(|(&cid, &start)| (cid << shift) | (lcn - start))
+        self.container_index()
+            .range(..=lcn)
+            .next_back()
+            .filter(|&(&start, _)| lcn - start < cpc)
+            .map(|(&start, &cid)| (cid << shift) | (lcn - start))
             .ok_or_else(|| format_err!("cluster {lcn:#x} in no container"))
+    }
+
+    /// The container whose first physical cluster is `start`.
+    pub(crate) fn container_starting(&self, start: u64) -> Option<u64> {
+        self.container_index().get(&start).copied()
+    }
+
+    fn container_index(&self) -> &BTreeMap<u64, u64> {
+        self.container_at
+            .get_or_init(|| self.containers.iter().map(|(&id, &start)| (start, id)).collect())
+    }
+
+    /// Tests at scale: a container more in the map (none of the volume's
+    /// clusters are in it).
+    #[cfg(test)]
+    pub(crate) fn add_container(&mut self, id: u64, start: u64) {
+        self.containers.insert(id, start);
+        self.container_at = std::sync::OnceLock::new();
     }
 
     /// The physical cluster of virtual cluster `vlcn`.
@@ -818,6 +864,7 @@ impl<D: ReadAt> Volume<D> {
             ));
         }
         self.clusters_per_container = cpc;
+        self.container_at = std::sync::OnceLock::new();
         self.containers = containers;
         self.container_classes = classes;
         // Their streams' ranges and kept clusters: root 10.

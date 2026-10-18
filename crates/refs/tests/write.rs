@@ -2779,3 +2779,75 @@ fn maps_have_the_room_windows_leaves() {
     }
     assert_eq!(vol.check(&skip).unwrap().problems, Vec::<String>::new());
 }
+
+/// A device that keeps the offsets of what is read from it.
+struct Reads<'a> {
+    inner: &'a Overlay<&'a SparseImage>,
+    at: Mutex<Vec<u64>>,
+}
+
+impl ReadAt for Reads<'_> {
+    fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> std::io::Result<()> {
+        self.at.lock().unwrap().push(offset);
+        self.inner.read_exact_at(buf, offset)
+    }
+    fn size(&self) -> std::io::Result<u64> {
+        self.inner.size()
+    }
+}
+
+impl storage_spaces::io::WriteAt for Reads<'_> {
+    fn write_all_at(&self, buf: &[u8], offset: u64) -> std::io::Result<()> {
+        storage_spaces::io::WriteAt::write_all_at(self.inner, buf, offset)
+    }
+    fn flush(&self) -> std::io::Result<()> {
+        storage_spaces::io::WriteAt::flush(self.inner)
+    }
+}
+
+#[test]
+fn a_commit_reads_no_table_it_left_alone() {
+    // A change of a file's times leaves the container tables as they were:
+    // they are not read again (1.2.2 read them and the object table after
+    // every commit: on a large volume a walk of every container; audit M17).
+    let (image, manifest, _) = load("r314small");
+    let offset = manifest["partition_offset"].as_u64().unwrap();
+    let overlay = Overlay::new(&image);
+    let dev = Reads {
+        inner: &overlay,
+        at: Mutex::new(Vec::new()),
+    };
+    let mut vol = Volume::open(&dev, offset).unwrap();
+    let cluster = vol.cluster;
+    let mut tables = BTreeSet::new();
+    for root in [7, 8] {
+        let r = vol.checkpoint.roots[root].clone();
+        let page = vol.read_page(&r, true).unwrap();
+        let node = Node::at(&page, PAGE_HEADER_SIZE).unwrap();
+        let mut refs = vec![r];
+        if !node.is_leaf() {
+            refs.extend(node.rows().map(|row| PageRef::parse(row.unwrap().value).unwrap()));
+        }
+        for r in refs {
+            tables.extend(r.lcns[..(vol.page_size / cluster) as usize].iter().copied());
+        }
+    }
+    let times = Times {
+        created: 1,
+        modified: 2,
+        changed: 3,
+        accessed: 4,
+    };
+    dev.at.lock().unwrap().clear();
+    vol.set_times("/small.txt", &times).unwrap();
+    assert_eq!(vol.lookup("/small.txt").unwrap().times, times);
+    let read: Vec<u64> = dev
+        .at
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|&at| (at - offset) / cluster)
+        .filter(|c| tables.contains(c))
+        .collect();
+    assert!(read.is_empty(), "container table clusters read: {read:x?}");
+}

@@ -268,6 +268,30 @@
   went and stayed allocated with a count of 0: a file's clusters are let
   go of once per reference, as clones count them (audit 2026-10-16, Low
   "ReFS writer").
+* `spaces status` listed the refused spaces of disks unplugged since
+  until the next boot: a report names its devices now, and one whose
+  devices are all gone is left out. An attach or detach waited for ever
+  for another one's lock, and for every program it ran (a `dmsetup` or
+  `nbd-client` hung on a device held every later run): the lock is waited
+  for until the run's time is up (10 minutes by hand), naming who holds
+  it, and a program is stopped after 120 s. `spaces attach --rw` of a pool
+  on image files failed, "Read-only file system": its server's view of the
+  system is read-only, and now lets it write the member images. The ready
+  files of the servers are written whole and renamed into place (attach
+  could read one empty). A `df` of a `refs mount` walked the medium
+  allocator every time; its count is kept until the allocator changes
+  (audit 2026-10-16, Low "Misc").
+* One reader of mountinfo fields for `spaces` and `refs` (the one of
+  `spaces` overflowed on `\4xx`, which the kernel does not write) and one
+  of block device attributes (audit 2026-10-16, "Duplicates that
+  drifted").
+* The packages and `contrib/install.sh` no longer list `ublk_drv` and `nbd`
+  in `modules-load.d`: `systemd-modules-load.service` failed at every boot
+  on a kernel without `ublk_drv`, and `spaces attach` loads a module when
+  it needs one. `install.sh` removes the list an earlier version wrote.
+  The Arch package names x86_64 only (aarch64 was never built). The user
+  guide says what has been tried, and what to expect of SELinux, WSL2 and
+  kernels before 6.0 (audit 2026-10-16, "Install story").
 
 ### Testing
 

@@ -2906,3 +2906,33 @@ fn new_names_go_where_the_upcase_table_puts_them() {
     }
     assert_eq!(vol.check(&[]).unwrap().problems, Vec::<String>::new());
 }
+
+/// The free clusters are counted once for each state of the allocator: a
+/// mount's `statfs` asks for them at every `df` (1.2.2 walked the medium
+/// allocator's tree each time). A change that takes clusters changes the
+/// count.
+#[test]
+fn free_clusters_are_counted_once_per_allocator_state() {
+    let (image, manifest, _) = load("r314small");
+    let offset = manifest["partition_offset"].as_u64().unwrap();
+    let rec = storage_spaces::io::Recording::new(&image);
+    let vol = Volume::open(&rec, offset).unwrap();
+    let free = vol.free_clusters().unwrap();
+    let reads = rec.reads().len();
+    for _ in 0..3 {
+        assert_eq!(vol.free_clusters().unwrap(), free);
+    }
+    assert_eq!(rec.reads().len(), reads, "the allocator read again");
+    drop(vol);
+    let disk = Overlay::new(image);
+    let mut vol = Volume::open(&disk, offset).unwrap();
+    assert_eq!(vol.free_clusters().unwrap(), free);
+    vol.create_file("/big.bin", &[0x5a; 1 << 20], 135_900_000_000_000_000)
+        .unwrap();
+    let after = vol.free_clusters().unwrap();
+    assert!(
+        after + 256 <= free,
+        "{after} free after 256 clusters taken, {free} before"
+    );
+    assert_eq!(Volume::open(&disk, offset).unwrap().free_clusters().unwrap(), after);
+}

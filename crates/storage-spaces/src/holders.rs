@@ -78,3 +78,44 @@ pub fn process(pid: u32) -> String {
     }
     format!("pid {pid} ({})", crate::report::printable(&line))
 }
+
+/// A field of /proc/self/mountinfo as it was before the kernel escaped it
+/// (`\040` for a space, `\134` for a backslash): the one unescaping of
+/// `spaces` and `refs` (1.2.2 had two, and the one of `spaces` overflowed
+/// on `\4xx`, which the kernel does not write). An escape past a byte
+/// gives `?`.
+pub fn unescape_mountinfo(field: &str) -> Vec<u8> {
+    let b = field.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        let digits = b
+            .get(i + 1..i + 4)
+            .filter(|d| d.iter().all(|c| (b'0'..=b'7').contains(c)));
+        match digits {
+            Some(d) if b[i] == b'\\' => {
+                let value = d.iter().fold(0u32, |v, c| v * 8 + u32::from(c - b'0'));
+                out.push(u8::try_from(value).unwrap_or(b'?'));
+                i += 4;
+            }
+            _ => {
+                out.push(b[i]);
+                i += 1;
+            }
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::unescape_mountinfo;
+
+    #[test]
+    fn mountinfo_fields_are_unescaped() {
+        assert_eq!(unescape_mountinfo("/run/media/a\\040b"), b"/run/media/a b");
+        assert_eq!(unescape_mountinfo("a\\134b\\011\\0"), b"a\\b\t\\0");
+        assert_eq!(unescape_mountinfo("\\777"), b"?");
+        assert_eq!(unescape_mountinfo("/mnt/plain\\"), b"/mnt/plain\\");
+    }
+}

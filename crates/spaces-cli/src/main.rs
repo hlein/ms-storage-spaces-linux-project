@@ -441,7 +441,7 @@ fn main() -> Result<()> {
             ublk::serve(pool, source, writer, move |dev| {
                 println!("{dev}");
                 if let Some(path) = &ready_file
-                    && let Err(e) = std::fs::write(path, dev)
+                    && let Err(e) = write_ready(path, dev)
                 {
                     eprintln!("cannot write {}: {e}", path.display());
                 }
@@ -857,6 +857,18 @@ fn export(pool: &Pool<File>, space: &Space, output: &PathBuf) -> Result<()> {
     Ok(())
 }
 
+/// Writes a ready file whole: beside it, then renamed into place, so that
+/// whoever waits for it (`spaces attach`) never reads it empty or in part
+/// (1.2.2 wrote it in place).
+pub(crate) fn write_ready(path: &Path, text: &str) -> std::io::Result<()> {
+    let name = path.file_name().ok_or(std::io::ErrorKind::InvalidInput)?;
+    let part = path.with_file_name(format!(".{}.{}", name.to_string_lossy(), std::process::id()));
+    std::fs::write(&part, text)?;
+    std::fs::rename(&part, path).inspect_err(|_| {
+        let _ = std::fs::remove_file(&part);
+    })
+}
+
 /// A listener on `socket` that only its owner may connect to, whatever the
 /// umask: bound in a directory of its own beside it (0700), made 0600 and
 /// then moved into place, so that nobody can connect before (1.2.2 made the
@@ -1075,7 +1087,7 @@ fn serve_nbd(
         socket.display()
     );
     if let Some(path) = ready_file {
-        std::fs::write(path, socket.display().to_string())?;
+        write_ready(path, &socket.display().to_string())?;
     }
     // SIGINT/SIGTERM: what was written becomes durable before the process
     // ends (the log slots of cached writes wait for a flush).

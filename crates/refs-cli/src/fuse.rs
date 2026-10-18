@@ -1953,36 +1953,13 @@ fn top_mount(mountinfo: &str, mountpoint: &Path) -> Option<(u64, String)> {
         .lines()
         .filter_map(|line| {
             let fields: Vec<&str> = line.split(' ').collect();
-            if unescape_octal(fields.get(4)?) != want {
+            if storage_spaces::holders::unescape_mountinfo(fields.get(4)?) != want {
                 return None;
             }
             let separator = fields.iter().position(|f| *f == "-")?;
             Some((fields[0].parse().ok()?, (*fields.get(separator + 1)?).to_owned()))
         })
         .next_back()
-}
-
-fn unescape_octal(s: &str) -> Vec<u8> {
-    let b = s.as_bytes();
-    let mut out = Vec::with_capacity(b.len());
-    let mut i = 0;
-    while i < b.len() {
-        let digits = b
-            .get(i + 1..i + 4)
-            .filter(|d| d.iter().all(|c| (b'0'..=b'7').contains(c)));
-        match digits {
-            Some(d) if b[i] == b'\\' => {
-                let value = d.iter().fold(0u32, |v, c| v * 8 + u32::from(c - b'0'));
-                out.push(u8::try_from(value).unwrap_or(b'?'));
-                i += 4;
-            }
-            _ => {
-                out.push(b[i]);
-                i += 1;
-            }
-        }
-    }
-    out
 }
 
 /// The refs tests' forging of fixtures (pages changed, their checksums
@@ -2062,8 +2039,6 @@ mod tests {
             Some((63, "tmpfs".to_owned()))
         );
         assert_eq!(top_mount(mountinfo, Path::new("/mnt")), None);
-        assert_eq!(unescape_octal("a\\134b\\011\\0"), b"a\\b\t\\0");
-        assert_eq!(unescape_octal("\\777"), b"?");
     }
 
     fn entry(name: &str) -> Entry {

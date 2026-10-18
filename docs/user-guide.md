@@ -44,6 +44,25 @@ disks are never written, unless a space is attached read-write
   `losetup`) as the last resort and for `refs mount`.
 * To use what is inside a space: a file system driver (`ntfs3`, `ntfs-3g`,
   ...); ReFS volumes need none, `refs` reads them.
+* What has been tried: Ubuntu 22.04 (kernel 6.8, systemd 249) and Ubuntu
+  26.10 (kernel 7.3, systemd 261, AppArmor), x86_64, as packaged and from
+  `contrib/install.sh`. Not tried: Fedora and other systems with SELinux
+  enforcing (the attach unit, the servers it starts and `mount.ReFS` run
+  as transient systemd units and open block devices, device-mapper and
+  `/dev/ublk-control`; if a policy denies them, `ausearch -m avc -ts recent`
+  shows it, and `spaces attach` run by hand from a root shell tells
+  whether the policy is the cause), other architectures, WSL. WSL2's kernel
+  (6.18.54.1-microsoft-standard-WSL2) has device-mapper, loop and FUSE
+  built in and `nbd` as a module, but no ublk: simple and mirror spaces
+  attach through device-mapper, the others through `nbd` (`nbd-client`)
+  or FUSE; WSL sees a disk only once Windows passes it with `wsl --mount
+  --bare` (not tried), and Windows must not have the pool attached then.
+* Kernels before 6.0 have no ublk: the attach picks device-mapper, `nbd`
+  or FUSE instead (`spaces attach --backend` names one). Where the kernel
+  has `ublk_drv` or `nbd` as a module, `spaces attach` loads it when it
+  needs it; until 1.3 the packages listed both in `modules-load.d`, and
+  `systemd-modules-load.service` failed at every boot on a kernel without
+  `ublk_drv`.
 * To build: Rust 1.89 or later and `libclang` (the ublk bindings; on
   Debian/Ubuntu `libclang-dev`, or just the library, `libclang1-21` with
   `LIBCLANG_PATH=/usr/lib/llvm-21/lib`). `--no-default-features` builds
@@ -63,7 +82,8 @@ disks are never written, unless a space is attached read-write
 built elsewhere) puts `spaces` in `/usr/local/sbin`, `refs` and its man
 page in `/usr/local/bin` when it was built next to `spaces`,
 `mount.ReFS` (and `mount.refs`) in `/sbin`, the udev rule and the
-unit, lists `ublk_drv` and `nbd` in `/etc/modules-load.d`, and enables
+unit, loads `ublk_drv` and `nbd` where the kernel has them (and removes the
+list of them an earlier version put in `/etc/modules-load.d`), and enables
 `storage-spaces-attach.service`. `contrib/uninstall.sh` (`-n` lists what it
 would do) removes it again; it refuses while spaces its `spaces` serves are
 attached (they would run on with no program left to detach them): detach
@@ -590,7 +610,9 @@ report goes to:
 * `/run/storage-spaces/reports/<space GUID>.txt` and `.json` (readable by
   every user), and `refs-<serial>.txt` for a refused ReFS mount (as root);
 * `spaces status` (the spaces not attached, and the verdict of those
-  attached), `spaces info` (the verdict of each space);
+  attached; since 1.3 a report names the devices it was made from, and
+  one whose devices are all gone, unplugged since, is left out),
+  `spaces info` (the verdict of each space);
 * `mount -t ReFS` prints the first failing check and the report's path.
   udisks2 shows "Unknown error when mounting" for whatever a mount helper
   refuses; the same line is in `journalctl -u udisks2`.

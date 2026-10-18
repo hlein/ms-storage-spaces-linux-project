@@ -199,3 +199,21 @@ fn the_udev_rule_hides_what_nothing_should_mount_unasked() {
     assert!(at("SYSTEMD_WANTS") > at("$parent.props"), "{rule}");
     assert!(at("SYSTEMD_WANTS") < at("LABEL=\"storage_spaces_end\""), "{rule}");
 }
+
+/// No kernel module is listed for systemd-modules-load: on a kernel without
+/// ublk_drv (before 6.0, or built without it) the service failed at every
+/// boot (1.2.2's package and install.sh listed ublk_drv and nbd). `spaces
+/// attach` loads a backend's module when it needs one.
+#[test]
+fn no_module_is_listed_to_load_at_boot() {
+    assert!(!contrib("deb/build-deb.sh").contains("modules-load.d"));
+    let install = contrib("install.sh");
+    assert!(
+        install
+            .lines()
+            .filter(|l| l.contains("modules-load.d") && !l.trim_start().starts_with('#'))
+            .all(|l| l.contains("rm -f") || l.contains("cat ")),
+        "install.sh writes a module list"
+    );
+    assert!(!contrib("arch/PKGBUILD").contains("modules-load.d"));
+}

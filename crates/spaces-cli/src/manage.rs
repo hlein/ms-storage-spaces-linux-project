@@ -370,21 +370,6 @@ fn open_rw(paths: &[PathBuf]) -> Result<Vec<File>> {
         .collect()
 }
 
-/// A sysfs attribute of a block device (through its parent for partitions).
-fn sysfs(dev: &Path, attr: &str) -> Option<String> {
-    let dev = std::fs::canonicalize(dev).ok()?;
-    let name = dev.file_name()?.to_str()?;
-    let sys = std::fs::canonicalize(Path::new("/sys/class/block").join(name)).ok()?;
-    let base = if sys.join("partition").exists() {
-        sys.parent()?.to_path_buf()
-    } else {
-        sys
-    };
-    std::fs::read_to_string(base.join(attr))
-        .ok()
-        .map(|s| s.trim().to_string())
-}
-
 fn describe(path: &Path, file: &File) -> Result<BlankDisk> {
     let size = file.size()?;
     // What the file is, not where its name points (1.2.2 took every path
@@ -394,7 +379,11 @@ fn describe(path: &Path, file: &File) -> Result<BlankDisk> {
     let block = std::os::unix::fs::FileTypeExt::is_block_device(&file.metadata()?.file_type());
     #[cfg(not(unix))]
     let block = false;
-    let number = |attr: &str, default: u64| sysfs(path, attr).and_then(|s| s.parse().ok()).unwrap_or(default);
+    let number = |attr: &str, default: u64| {
+        crate::members::block_attr(path, attr)
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(default)
+    };
     Ok(BlankDisk {
         size,
         logical_sector: if block {
@@ -407,8 +396,9 @@ fn describe(path: &Path, file: &File) -> Result<BlankDisk> {
         } else {
             4096
         },
-        manufacturer: sysfs(path, "device/vendor").unwrap_or_else(|| "Linux".into()),
-        model: sysfs(path, "device/model").unwrap_or_else(|| if block { "Disk".into() } else { "Image".into() }),
+        manufacturer: crate::members::block_attr(path, "device/vendor").unwrap_or_else(|| "Linux".into()),
+        model: crate::members::block_attr(path, "device/model")
+            .unwrap_or_else(|| if block { "Disk".into() } else { "Image".into() }),
     })
 }
 

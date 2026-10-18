@@ -210,6 +210,7 @@ fn report<D: ReadAt + 'static>(
     };
     let mut r = isolate::isolated(limit, work).unwrap_or_else(|stopped| stopped_report(pool, space, &stopped));
     r.environment = environment(pool);
+    r.devices = self::names(paths);
     r
 }
 

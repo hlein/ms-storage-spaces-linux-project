@@ -83,3 +83,21 @@ fn kernel_holders(p: &Path) -> String {
         held.join(", ")
     }
 }
+
+/// A sysfs attribute of a block device (through its parent for partitions:
+/// `queue/logical_block_size` is the disk's), from its kernel name
+/// (/dev/mapper and /dev/disk/by-* paths are links to it). The one reader
+/// of `spaces` (1.2.2 had one in attach and one in the management commands).
+pub(crate) fn block_attr(dev: &Path, attr: &str) -> Option<String> {
+    let dev = std::fs::canonicalize(dev).ok()?;
+    let name = dev.file_name()?.to_str()?;
+    let sys = std::fs::canonicalize(Path::new("/sys/class/block").join(name)).ok()?;
+    let base = if sys.join("partition").exists() {
+        sys.parent()?.to_path_buf()
+    } else {
+        sys
+    };
+    std::fs::read_to_string(base.join(attr))
+        .ok()
+        .map(|s| s.trim().to_string())
+}

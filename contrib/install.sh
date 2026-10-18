@@ -18,8 +18,13 @@ if [ -x "$(dirname "$bin")/refs" ]; then
   install -m 755 "$here/mount.refs" /sbin/mount.ReFS
   ln -sf mount.ReFS /sbin/mount.refs
 fi
-# Kernel modules the backends use.
-printf 'ublk_drv\nnbd\n' > /etc/modules-load.d/storage-spaces.conf
+# Kernel modules the backends use, where the kernel has them (spaces attach
+# loads them itself when it needs one). Until 1.3 they were listed in
+# /etc/modules-load.d, and systemd-modules-load failed at every boot on a
+# kernel without ublk_drv: that list goes.
+if [ "$(cat /etc/modules-load.d/storage-spaces.conf 2>/dev/null)" = "$(printf 'ublk_drv\nnbd')" ]; then
+  rm -f /etc/modules-load.d/storage-spaces.conf
+fi
 modprobe ublk_drv 2>/dev/null || true
 modprobe nbd 2>/dev/null || true
 systemctl daemon-reload

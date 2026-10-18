@@ -29,7 +29,6 @@ install -D -m 644 "$root/contrib/man/spaces.8" "$stage/usr/share/man/man8/spaces
 gzip -9n "$stage/usr/share/man/man8/spaces.8"
 install -D -m 644 "$root/contrib/man/refs.1" "$stage/usr/share/man/man1/refs.1"
 gzip -9n "$stage/usr/share/man/man1/refs.1"
-install -D -m 644 /dev/stdin "$stage/usr/lib/modules-load.d/storage-spaces.conf" <<<$'ublk_drv\nnbd'
 install -D -m 644 "$root/LICENSE" "$stage/usr/share/doc/storage-spaces/copyright"
 
 mkdir -p "$stage/DEBIAN"

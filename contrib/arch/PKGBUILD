@@ -4,7 +4,9 @@ pkgname=storage-spaces
 pkgver=1.2.2
 pkgrel=1
 pkgdesc='Read, write and manage Microsoft Storage Spaces pools (Windows 11) on Linux'
-arch=('x86_64' 'aarch64')
+# x86_64 only, the architecture the project is built and tested on (1.2.2
+# also named aarch64, which was never built).
+arch=('x86_64')
 url='https://github.com/woffko/ms-storage-spaces-linux-project'
 license=('GPL-2.0-or-later')
 depends=('device-mapper' 'systemd' 'gcc-libs')
@@ -47,7 +49,6 @@ package() {
   done
   install -Dm644 contrib/man/spaces.8 "$pkgdir/usr/share/man/man8/spaces.8"
   install -Dm644 contrib/man/refs.1 "$pkgdir/usr/share/man/man1/refs.1"
-  printf 'ublk_drv\nnbd\n' | install -Dm644 /dev/stdin "$pkgdir/usr/lib/modules-load.d/storage-spaces.conf"
   install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
   install -Dm644 docs/user-guide.md "$pkgdir/usr/share/doc/$pkgname/user-guide.md"
 }

@@ -289,7 +289,9 @@ pub fn remove_report(guid: &str) {
 }
 
 /// The spaces checked and not attached: each report's path and first line
-/// (the space, its verdict and why it was refused).
+/// (the space, its verdict and why it was refused). A report whose devices
+/// are all gone (unplugged since) is left out: 1.2.2 listed it until the
+/// next boot.
 pub fn refused(attached: &[State]) -> Vec<(PathBuf, String)> {
     refused_in(Path::new(REPORT_DIR), attached)
 }
@@ -307,8 +309,12 @@ fn refused_in(dir: &Path, attached: &[State]) -> Vec<(PathBuf, String)> {
             !attached.iter().any(|s| s.space_guid.eq_ignore_ascii_case(guid))
         })
         .filter_map(|p| {
-            let first = fs::read_to_string(&p).ok()?.lines().next()?.to_string();
-            Some((p, first))
+            let text = fs::read_to_string(&p).ok()?;
+            let devices = storage_spaces::report::devices_in_text(&text);
+            if !devices.is_empty() && !devices.iter().any(|d| Path::new(d).exists()) {
+                return None;
+            }
+            Some((p, text.lines().next()?.to_string()))
         })
         .collect();
     out.sort();
@@ -516,7 +522,20 @@ pub fn dm_name(pool: &str, space: &str) -> String {
     name
 }
 
+/// How long an external program may take (dmsetup, losetup, nbd-client,
+/// systemctl, udevadm, journalctl): at most 120 s, beyond systemd's default
+/// stop timeout, and no longer than what is left of the run's time. 1.2.2
+/// waited for ever: a program hung on a device held the run, and the lock
+/// of every later one.
+const PROGRAM_TIME: Duration = Duration::from_secs(120);
+
 fn run(program: &str, args: &[&str], stdin: Option<&str>) -> Result<String> {
+    let limit = crate::check::time_left().map_or(PROGRAM_TIME, |left| left.min(PROGRAM_TIME));
+    run_within(program, args, stdin, limit.max(Duration::from_secs(5)))
+}
+
+/// Runs `program`, stopped (SIGKILL) when it takes longer than `limit`.
+fn run_within(program: &str, args: &[&str], stdin: Option<&str>, limit: Duration) -> Result<String> {
     let mut cmd = Command::new(program);
     cmd.args(args).stdout(Stdio::piped()).stderr(Stdio::piped());
     cmd.stdin(if stdin.is_some() { Stdio::piped() } else { Stdio::null() });
@@ -524,15 +543,42 @@ fn run(program: &str, args: &[&str], stdin: Option<&str>) -> Result<String> {
     if let Some(input) = stdin {
         child.stdin.take().unwrap().write_all(input.as_bytes())?;
     }
-    let out = child.wait_with_output()?;
-    if !out.status.success() {
+    // The output is read beside the wait: a full pipe would stop it.
+    fn drain<R: std::io::Read + Send + 'static>(pipe: Option<R>) -> std::thread::JoinHandle<Vec<u8>> {
+        std::thread::spawn(move || {
+            let mut v = Vec::new();
+            if let Some(mut p) = pipe {
+                let _ = p.read_to_end(&mut v);
+            }
+            v
+        })
+    }
+    let (out, err) = (drain(child.stdout.take()), drain(child.stderr.take()));
+    let start = Instant::now();
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        if start.elapsed() >= limit {
+            let _ = child.kill();
+            let _ = child.wait();
+            bail!(
+                "{program} {} did not finish within {} s, and was stopped",
+                args.join(" "),
+                limit.as_secs_f32()
+            );
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    let (out, err) = (out.join().unwrap_or_default(), err.join().unwrap_or_default());
+    if !status.success() {
         bail!(
             "{program} {} failed: {}",
             args.join(" "),
-            String::from_utf8_lossy(&out.stderr).trim()
+            String::from_utf8_lossy(&err).trim()
         );
     }
-    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    Ok(String::from_utf8_lossy(&out).into_owned())
 }
 
 /// Makes the device-mapper device `name` and waits for udev to take it in.
@@ -568,18 +614,7 @@ fn dm_remove(name: &str) -> Result<()> {
 
 /// Logical block size of a block device (through its parent for partitions).
 fn logical_block_size(dev: &Path) -> Option<u32> {
-    // /dev/mapper/<name> and /dev/disk/by-* are links to the kernel name.
-    let dev = fs::canonicalize(dev).ok()?;
-    let name = dev.file_name()?.to_str()?;
-    let sys = fs::canonicalize(Path::new("/sys/class/block").join(name)).ok()?;
-    let queue = if sys.join("partition").exists() {
-        sys.parent()?.join("queue")
-    } else {
-        sys.join("queue")
-    };
-    fs::read_to_string(queue.join("logical_block_size"))
-        .ok()?
-        .trim()
+    crate::members::block_attr(dev, "queue/logical_block_size")?
         .parse()
         .ok()
 }
@@ -755,6 +790,12 @@ const SERVER_PRIVATE_VIEW: &[&str] = &[
     "ProtectProc=invisible",
 ];
 
+/// A path quoted for a unit file's list of paths: in double quotes, with
+/// backslashes and quotes escaped (a path may hold spaces).
+fn unit_quoted(path: &str) -> String {
+    format!("\"{}\"", path.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
 fn start_server(unit: &str, kind: &str, paths: &[PathBuf], space: &str, extra: &[&str]) -> Result<String> {
     ensure_state_dir()?;
     let ready = Path::new(STATE_DIR).join(format!("{unit}.ready"));
@@ -775,11 +816,22 @@ fn start_server(unit: &str, kind: &str, paths: &[PathBuf], space: &str, extra: &
         "--property=Before=local-fs-pre.target".into(),
     ];
     let private = if kind == "fuse" { &[][..] } else { SERVER_PRIVATE_VIEW };
-    let restrictions: Vec<String> = SERVER_RESTRICTIONS
+    let mut restrictions: Vec<String> = SERVER_RESTRICTIONS
         .iter()
         .chain(private)
         .map(|p| format!("--property={p}"))
         .collect();
+    // A --rw server writes the image files among the members, which its
+    // read-only view of the system and of /home would refuse (1.2.2: EROFS).
+    if !private.is_empty() && extra.contains(&"--rw") {
+        for p in paths.iter().filter(|p| fs::metadata(p).is_ok_and(|m| m.is_file())) {
+            let real = fs::canonicalize(p).with_context(|| format!("cannot resolve {}", p.display()))?;
+            restrictions.push(format!(
+                "--property=ReadWritePaths={}",
+                unit_quoted(&real.display().to_string())
+            ));
+        }
+    }
     let head = std::mem::take(&mut args);
     args.extend(["--".into(), exe.display().to_string()]);
     args.push(format!("serve-{kind}"));
@@ -827,12 +879,46 @@ fn free_nbd() -> Result<String> {
     bail!("no free NBD device")
 }
 
-/// Serializes attach and detach runs (udev can start one while another runs).
+/// How long a run started by hand waits for another attach or detach.
+const LOCK_WAIT: Duration = Duration::from_secs(600);
+
+/// Serializes attach and detach runs (udev can start one while another
+/// runs): waits for the other one, saying which it is, until the time of
+/// the run is up (`SPACES_ATTACH_TIMEOUT` of the units), or 10 minutes for
+/// a run started by hand. 1.2.2 waited for ever: a run hung on a dead disk
+/// held up every later one, `spaces detach` included.
 pub fn lock() -> Result<File> {
     ensure_state_dir()?;
-    let file = File::create(Path::new(STATE_DIR).join("lock"))?;
-    file.lock()?;
-    Ok(file)
+    lock_in(Path::new(STATE_DIR), crate::check::time_left().unwrap_or(LOCK_WAIT))
+}
+
+fn lock_in(dir: &Path, wait: Duration) -> Result<File> {
+    let file = File::create(dir.join("lock"))?;
+    let start = Instant::now();
+    let mut said = false;
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Ok(file),
+            Err(fs::TryLockError::WouldBlock) => {}
+            Err(fs::TryLockError::Error(e)) => return Err(e.into()),
+        }
+        let elapsed = start.elapsed();
+        if elapsed >= wait {
+            bail!(
+                "another attach or detach still runs after {} s: {}",
+                wait.as_secs(),
+                storage_spaces::holders::of_lock(&file)
+            );
+        }
+        if !said && elapsed >= Duration::from_secs(2) {
+            eprintln!(
+                "waiting for another attach or detach: {}",
+                storage_spaces::holders::of_lock(&file)
+            );
+            said = true;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
 }
 
 /// How far a space is attached: `None` when it is not.
@@ -1039,25 +1125,7 @@ fn kernel_of(path: &Path) -> Option<String> {
 
 /// A mount point as /proc/self/mountinfo writes it (\040 for a space).
 fn unescape_mount(field: &str) -> String {
-    let mut out = Vec::new();
-    let b = field.as_bytes();
-    let mut i = 0;
-    while i < b.len() {
-        let octal = b
-            .get(i + 1..i + 4)
-            .filter(|d| d.iter().all(|c| (b'0'..=b'7').contains(c)));
-        match (b[i], octal) {
-            (b'\\', Some(d)) => {
-                out.push((d[0] - b'0') * 64 + (d[1] - b'0') * 8 + (d[2] - b'0'));
-                i += 4;
-            }
-            (c, _) => {
-                out.push(c);
-                i += 1;
-            }
-        }
-    }
-    String::from_utf8_lossy(&out).into_owned()
+    String::from_utf8_lossy(&storage_spaces::holders::unescape_mountinfo(field)).into_owned()
 }
 
 /// The process ids in /proc.
@@ -1615,6 +1683,77 @@ mod state_tests {
         fs::remove_dir_all(&dir).unwrap();
     }
 
+    /// Paths go into a unit's list of paths whole: spaces, quotes and
+    /// backslashes kept.
+    #[test]
+    fn paths_are_quoted_for_units() {
+        assert_eq!(unit_quoted("/srv/pool/disk0.img"), "\"/srv/pool/disk0.img\"");
+        assert_eq!(unit_quoted("/home/a b/c\"d\\e"), "\"/home/a b/c\\\"d\\\\e\"");
+    }
+
+    /// An external program that hangs is stopped in time and the run says
+    /// so (1.2.2 waited for it for ever); one that finishes gives its
+    /// output, one that fails its error.
+    #[test]
+    fn programs_are_stopped_in_time() {
+        let start = Instant::now();
+        let e = run_within("sleep", &["30"], None, Duration::from_millis(300))
+            .unwrap_err()
+            .to_string();
+        assert!(start.elapsed() < Duration::from_secs(5), "{:?}", start.elapsed());
+        assert!(e.contains("did not finish within"), "{e}");
+        assert_eq!(
+            run_within("echo", &["hello"], None, Duration::from_secs(10)).unwrap(),
+            "hello\n"
+        );
+        assert_eq!(
+            run_within("cat", &[], Some("in"), Duration::from_secs(10)).unwrap(),
+            "in"
+        );
+        let e = run_within("sh", &["-c", "echo why >&2; exit 3"], None, Duration::from_secs(10)).unwrap_err();
+        assert!(e.to_string().ends_with("failed: why"), "{e}");
+    }
+
+    /// A run waits for the one holding the lock only as long as it may,
+    /// then says so (1.2.2 waited for ever).
+    #[test]
+    fn the_lock_is_waited_for_in_time() {
+        let dir = scratch("lock");
+        fs::create_dir_all(&dir).unwrap();
+        let held = lock_in(&dir, Duration::from_secs(1)).unwrap();
+        let start = Instant::now();
+        let e = lock_in(&dir, Duration::from_millis(500)).unwrap_err().to_string();
+        assert!(start.elapsed() < Duration::from_secs(5));
+        assert!(e.contains("another attach or detach still runs"), "{e}");
+        drop(held);
+        lock_in(&dir, Duration::from_millis(500)).unwrap();
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The report of a pool whose disks were unplugged since is not listed
+    /// as refused (1.2.2 listed it until the next boot); one whose devices
+    /// are there, or that names none (made before 1.3), is.
+    #[test]
+    fn reports_of_devices_since_gone_are_not_listed() {
+        let dir = scratch("gone");
+        let present = dir.join("disk0.img");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(&present, b"").unwrap();
+        for (guid, devices) in [
+            ("g1", vec![dir.join("unplugged0"), dir.join("unplugged1")]),
+            ("g2", vec![dir.join("unplugged2"), present.clone()]),
+            ("g3", vec![]),
+        ] {
+            let mut r = Report::new(format!("space \"{guid}\""));
+            r.space = Some((guid.into(), guid.into()));
+            r.devices = devices.iter().map(|p| p.display().to_string()).collect();
+            write_report_in(&dir, &r).unwrap();
+        }
+        let listed: Vec<PathBuf> = refused_in(&dir, &[]).into_iter().map(|r| r.0).collect();
+        assert_eq!(listed, [dir.join("g2.txt"), dir.join("g3.txt")]);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
     /// No state directory: nothing attached. One this user may not read:
     /// an error that says so, not "none attached".
     #[test]
@@ -1843,6 +1982,8 @@ mod user_tests {
         assert_eq!(unescape_mount("/run/media/a\\040b"), "/run/media/a b");
         assert_eq!(unescape_mount("/mnt/tab\\011x\\134y"), "/mnt/tab\tx\\y");
         assert_eq!(unescape_mount("/mnt/plain"), "/mnt/plain");
+        // An escape past a byte (the kernel writes none; 1.2.2 overflowed).
+        assert_eq!(unescape_mount("/mnt/\\777"), "/mnt/?");
         assert_eq!(unescape_mount("/mnt/odd\\9"), "/mnt/odd\\9");
     }
 

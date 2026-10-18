@@ -167,7 +167,7 @@ pub fn serve(
         }
     });
     if let Some(path) = ready_file {
-        std::fs::write(path, mountpoint.join(FILE_NAME).display().to_string())?;
+        crate::write_ready(path, &mountpoint.join(FILE_NAME).display().to_string())?;
     }
     session.join().context("FUSE session failed")?;
     Ok(())

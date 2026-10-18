@@ -8,7 +8,10 @@
 #      random writes with crc32c verification through /dev/mapper
 #   3. detach, attach it read-only and verify the fio data again
 #   4. detach, and check the verification pattern below the fio range
-# Usage: sudo tools/rw-attach-check.sh POOL [BACKEND] [MIB]
+# With IMAGES=1 step 1 leaves the loop devices out: the space is attached
+# from the copies' image files, which its server opens itself (1.2.2's
+# server, sandboxed with ProtectSystem=strict, could not write them).
+# Usage: sudo [IMAGES=1] tools/rw-attach-check.sh POOL [BACKEND] [MIB]
 set -euo pipefail
 cd "$(dirname "$0")/.."
 pool=$1 backend=${2:-auto} mib=${3:-256}
@@ -27,7 +30,9 @@ cleanup() {
 }
 trap cleanup EXIT
 k=0
+[[ ${IMAGES:-} == 1 ]] && parts=("$work"/disk*.img)
 for img in "$work"/disk*.img; do
+  [[ ${IMAGES:-} == 1 ]] && break
   for bs in 512 4096; do
     l=$(losetup -b "$bs" -f --show "$img")
     read -r start size < <(sfdisk -d "$l" 2>/dev/null | awk -F'[=,]' '/type=E75CAF8F/{gsub(/ /,""); print $2, $4}')

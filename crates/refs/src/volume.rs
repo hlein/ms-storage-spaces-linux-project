@@ -79,6 +79,10 @@ pub struct Volume<D> {
     log: std::sync::OnceLock<LogState>,
     /// The upcase table (`Volume::upcase`), read when first asked for.
     upcase: std::sync::OnceLock<std::sync::Arc<[u16]>>,
+    /// The free clusters last counted, with the checkpoint's clock and the
+    /// medium allocator's root page they were counted at
+    /// (`Volume::free_clusters`).
+    free_known: std::sync::Mutex<Option<((u64, u64), u64)>>,
     objects: BTreeMap<u64, PageRef>,
     /// The clock of the first checkpoint `refs` wrote through this value
     /// (0: none yet).
@@ -195,6 +199,7 @@ impl<D: ReadAt> Volume<D> {
             checkpoint_lcns: Vec::new(),
             log: std::sync::OnceLock::new(),
             upcase: std::sync::OnceLock::new(),
+            free_known: std::sync::Mutex::new(None),
             own_since: std::sync::atomic::AtomicU64::new(0),
             compacted: BTreeMap::new(),
             units: std::sync::Mutex::new(Vec::new()),
@@ -1015,12 +1020,23 @@ impl<D: ReadAt> Volume<D> {
         self.objects.keys().copied()
     }
 
-    /// Every leaf row of an object's tree, in key order.
     /// The clusters free for data (the medium allocator's bitmap rows'
-    /// free counts and its free uniform ranges).
+    /// free counts and its free uniform ranges). Counted once for each state
+    /// of the allocator: its tree changes by copy on write only, so its root
+    /// page names one state (1.2.2 walked the tree for every `statfs` of a
+    /// mount). With the checkpoint's clock: a later state may take the
+    /// root page's cluster again.
     pub fn free_clusters(&self) -> Result<u64> {
+        let root = self.root(1)?;
+        let state = (self.checkpoint.clock, root.lcns[0]);
+        let mut known = self.free_known.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((at, free)) = *known
+            && at == state
+        {
+            return Ok(free);
+        }
         let mut free = 0u64;
-        self.walk(&self.root(1)?, false, &mut |row| {
+        self.walk(&root, false, &mut |row| {
             let v = row.value;
             if v.len() >= 0x18 {
                 match (le16(v, 0x12), le16(v, 0x10)) {
@@ -1031,6 +1047,7 @@ impl<D: ReadAt> Volume<D> {
             }
             Ok(())
         })?;
+        *known = Some((state, free));
         Ok(free)
     }
 
@@ -1071,6 +1088,7 @@ impl<D: ReadAt> Volume<D> {
         Ok(self.upcase.get_or_init(|| table).clone())
     }
 
+    /// Every leaf row of an object's tree, in key order.
     pub fn object_rows(&self, oid: u64) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
         let root = self.object(oid)?.clone();
         let mut rows = Vec::new();

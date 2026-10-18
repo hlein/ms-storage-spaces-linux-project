@@ -308,6 +308,10 @@ pub struct Report {
     pub pool: Option<(String, String)>,
     /// The space's name and GUID.
     pub space: Option<(String, String)>,
+    /// The member devices the checks read, as named to the program (for
+    /// `spaces status`, which leaves out the reports of devices since
+    /// gone).
+    pub devices: Vec<String>,
     pub checks: Vec<Check>,
     /// Versions and the like: (name, value).
     pub environment: Vec<(String, String)>,
@@ -422,6 +426,9 @@ impl Report {
             let env: Vec<String> = self.environment.iter().map(|(k, v)| format!("{k} {v}")).collect();
             out.push_str(&wrap(&printable(&env.join(", ")), "  environment: ", "    ", 78));
         }
+        if !self.devices.is_empty() {
+            writeln!(out, "{DEVICES}{}", printable(&self.devices.join(", "))).unwrap();
+        }
         out
     }
 
@@ -478,6 +485,10 @@ impl Report {
             ("subject".into(), Json::Str(self.subject.clone())),
             ("pool".into(), named(&self.pool)),
             ("space".into(), named(&self.space)),
+            (
+                "devices".into(),
+                Json::Arr(self.devices.iter().cloned().map(Json::Str).collect()),
+            ),
             ("verdict".into(), Json::Str(self.verdict().as_str().into())),
             ("action".into(), opt(&self.action)),
             ("checks".into(), Json::Arr(checks)),
@@ -531,6 +542,18 @@ pub fn write_files(report: &Report, dir: &std::path::Path, name: &str) -> std::i
         std::fs::rename(&tmp, &path)?;
     }
     Ok(dir.join(format!("{name}.txt")))
+}
+
+/// How the text of a report starts its line of devices (one line, the
+/// devices separated by ", ").
+pub const DEVICES: &str = "  devices: ";
+
+/// The devices a report's text names (none in reports before 1.3).
+pub fn devices_in_text(text: &str) -> Vec<String> {
+    text.lines()
+        .find_map(|l| l.strip_prefix(DEVICES))
+        .map(|l| l.split(", ").map(str::to_owned).collect())
+        .unwrap_or_default()
 }
 
 /// Several reports as one JSON array.

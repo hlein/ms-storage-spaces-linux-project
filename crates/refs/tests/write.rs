@@ -2397,3 +2397,385 @@ fn updating_files_in_place() {
     assert_allocated(&vol, &skip, "updated");
     assert_pages_valid(&vol, &skip, "updated");
 }
+
+#[test]
+fn growing_past_a_gap_reads_zeros() {
+    // Truncated within its last cluster, then grown past the bytes that
+    // cluster still holds: they read as zeros, whatever the changed ranges
+    // say, for a file changed in place, an integrity stream and a file
+    // with snapshots (1.2.2 let the old bytes reappear; audit M16).
+    let now = 135_900_000_000_000_000;
+    let (image, manifest, skip) = load("r314small");
+    let offset = manifest["partition_offset"].as_u64().unwrap();
+    let overlay = Overlay::new(&image);
+    let mut vol = Volume::open(&overlay, offset).unwrap();
+    vol.create_file("/t.bin", &[0xaa; 8000], now).unwrap();
+    vol.create_file("/i.bin", b"", now).unwrap();
+    vol.set_integrity("/i.bin", true).unwrap();
+    vol.write_file("/i.bin", &[0xaa; 8000], now).unwrap();
+    for path in ["/t.bin", "/i.bin"] {
+        vol.update_file(path, &&[0xaa; 5000][..], &[], now).unwrap();
+        // Written at 8500: the cluster of the gap is not one it touches.
+        let mut data = vec![0u8; 9000];
+        data[..5000].fill(0xaa);
+        data[8500..].fill(0xbb);
+        vol.update_file(path, &data.as_slice(), &[(8500, 9000)], now).unwrap();
+        assert!(read_all(&vol, path) == data, "{path}");
+    }
+    assert_eq!(vol.check(&skip).unwrap().problems, Vec::<String>::new());
+    // A file with snapshots: cluster 0x80 is its live level's own.
+    let (image, manifest, skip) = load("r314feat");
+    let offset = manifest["partition_offset"].as_u64().unwrap();
+    let overlay = Overlay::new(&image);
+    let mut vol = Volume::open(&overlay, offset).unwrap();
+    let path = "/snap/file.txt";
+    let mut data = read_all(&vol, path);
+    data[0x80 * 4096..0x81 * 4096].fill(0xdd);
+    vol.update_file(path, &data.as_slice(), &[(0x80 * 4096, 0x81 * 4096)], now)
+        .unwrap();
+    data.truncate(0x80 * 4096 + 100);
+    vol.update_file(path, &data.as_slice(), &[], now).unwrap();
+    data.resize(0x83 * 4096, 0);
+    data[0x82 * 4096..0x82 * 4096 + 10].fill(0xcc);
+    vol.update_file(path, &data.as_slice(), &[(0x82 * 4096, 0x82 * 4096 + 10)], now)
+        .unwrap();
+    assert!(read_all(&vol, path) == data, "{path}");
+    assert_eq!(vol.check(&skip).unwrap().problems, Vec::<String>::new());
+}
+
+/// A sparse file's attribute, its record's allocated bytes, and its live
+/// level's allocated bytes (0x48) and flags (0x50).
+fn sparse_fields<D: ReadAt>(vol: &Volume<D>, path: &str) -> (u32, u64, u64, u32) {
+    let e = vol.lookup(path).unwrap();
+    let record = vol.record(&e).unwrap();
+    let node = Node::at(&record, 0).unwrap();
+    let value = node
+        .rows()
+        .map(|r| r.unwrap())
+        .find(|r| r.key.len() >= 0x18 && r.key[8..12] == [2, 0, 0, 0x80] && r.value.len() > 0x88)
+        .unwrap()
+        .value
+        .to_vec();
+    let le64 = |b: &[u8], at: usize| u64::from_le_bytes(b[at..at + 8].try_into().unwrap());
+    (
+        e.attributes,
+        le64(&record, 0x60),
+        le64(&value, 0x48),
+        u32::from_le_bytes(value[0x50..0x54].try_into().unwrap()),
+    )
+}
+
+#[test]
+fn changing_a_sparse_file_keeps_it_sparse() {
+    // Windows' sparse file of 25 000 clusters with holes between: changed
+    // in place, its holes stay (one written to takes a cluster); written
+    // anew, its clusters of zeros are holes; either way with attribute
+    // 0x200 and the sparse fields of its map (1.2.2 wrote it anew, dense:
+    // 200 MB where it had 100, without them; audit M16).
+    let (image, manifest, skip) = load("r314sparsemap");
+    let offset = manifest["partition_offset"].as_u64().unwrap();
+    let overlay = Overlay::new(&image);
+    let mut vol = Volume::open(&overlay, offset).unwrap();
+    let now = 135_900_000_000_000_000;
+    let path = "/holes.bin";
+    let (attributes, allocated, map, flags) = sparse_fields(&vol, path);
+    assert_eq!(
+        (attributes & 0x200, allocated, map, flags >> 31),
+        (0x200, 25_000 * 4096, 25_000 * 4096, 1)
+    );
+    let file = vol.open_file(&vol.lookup(path).unwrap()).unwrap();
+    let refs::Content::Extents(x) = file.data.unwrap().content else {
+        panic!("inline")
+    };
+    let i = x.windows(2).position(|w| w[1].vcn > w[0].vcn + w[0].clusters).unwrap();
+    let (held, hole) = (x[i].vcn * 4096, (x[i].vcn + x[i].clusters) * 4096);
+    let mut data = read_all(&vol, path);
+    data[held as usize] ^= 1;
+    data[hole as usize + 7] = 9;
+    vol.update_file(path, &data.as_slice(), &[(held, held + 1), (hole + 7, hole + 8)], now)
+        .unwrap();
+    assert!(read_all(&vol, path) == data);
+    assert_eq!(
+        sparse_fields(&vol, path),
+        (attributes, 25_001 * 4096, 25_001 * 4096, flags),
+        "one cluster more, sparse still"
+    );
+    assert_eq!(vol.check(&skip).unwrap().problems, Vec::<String>::new());
+    // Written anew: the clusters it keeps are those not all zeros (the
+    // fixture keeps the data of its first 64 KiB).
+    vol.write_file(path, &data, now).unwrap();
+    assert!(read_all(&vol, path) == data);
+    let held = data.chunks(4096).filter(|c| c.iter().any(|&b| b != 0)).count() as u64;
+    let (a, allocated, map, f) = sparse_fields(&vol, path);
+    assert_eq!(
+        (a & 0x200, allocated, map, f >> 31),
+        (0x200, held * 4096, held * 4096, 1),
+        "{held} clusters with data"
+    );
+    // Written with zeros only: no clusters, a map without records.
+    vol.clone_file(path, "/zeros.bin", now).unwrap();
+    vol.write_file("/zeros.bin", &vec![0u8; 3 << 20], now).unwrap();
+    let (a, allocated, map, f) = sparse_fields(&vol, "/zeros.bin");
+    assert_eq!((a & 0x200, allocated, map, f >> 31), (0x200, 0, 0, 1));
+    assert!(read_all(&vol, "/zeros.bin").iter().all(|&b| b == 0));
+    assert_eq!(vol.check(&skip).unwrap().problems, Vec::<String>::new());
+    assert_pages_valid(&vol, &skip, "sparse file changed");
+}
+
+/// Data of `fill` bytes that is read at most a MiB at a time.
+struct Pieces {
+    size: u64,
+    fill: u8,
+}
+
+impl refs::write::Source for Pieces {
+    fn len(&self) -> u64 {
+        self.size
+    }
+    fn read_into(&self, _offset: u64, buf: &mut [u8]) -> refs::Result<()> {
+        assert!(buf.len() <= 1 << 20, "{} bytes read at once", buf.len());
+        buf.fill(self.fill);
+        Ok(())
+    }
+}
+
+#[test]
+fn changes_in_place_read_their_data_a_piece_at_a_time() {
+    // Windows' file with a run of 14 335 clusters (56 MiB): 8 MiB changed
+    // in it are read and written a MiB at a time (1.2.2 read the whole
+    // range into memory; audit M16).
+    let (image, manifest, skip) = load("r314deferred");
+    let offset = manifest["partition_offset"].as_u64().unwrap();
+    let overlay = Overlay::new(&image);
+    let mut vol = Volume::open(&overlay, offset).unwrap();
+    let now = 135_900_000_000_000_000;
+    let path = "/win100.bin";
+    let size = vol.lookup(path).unwrap().size;
+    let from = 0x13c * 4096;
+    vol.update_file(path, &Pieces { size, fill: 0x5e }, &[(from, from + (8 << 20))], now)
+        .unwrap();
+    let file = vol.open_file(&vol.lookup(path).unwrap()).unwrap();
+    let data = file.data.unwrap();
+    let mut buf = vec![0u8; 4096];
+    for at in [
+        from - 4096,
+        from,
+        from + (4 << 20),
+        from + (8 << 20) - 4096,
+        from + (8 << 20),
+    ] {
+        vol.read_stream(&data, at, &mut buf).unwrap();
+        let inside = (from..from + (8 << 20)).contains(&at);
+        assert!(buf.iter().all(|&b| (b == 0x5e) == inside), "at {at:#x}");
+    }
+    assert_eq!(vol.check(&skip).unwrap().problems, Vec::<String>::new());
+}
+
+#[test]
+fn a_new_directory_counts_its_own_pages() {
+    // A directory made in one of several pages: its descriptor counts no
+    // page below its root (1.2.2 copied the parent's count with the rest
+    // of the parent's descriptor; audit M19).
+    let (image, manifest, skip) = load("r314small");
+    let offset = manifest["partition_offset"].as_u64().unwrap();
+    let overlay = Overlay::new(&image);
+    let mut vol = Volume::open(&overlay, offset).unwrap();
+    let now = 135_900_000_000_000_000;
+    for i in 0..150 {
+        let name = format!("/file-with-a-rather-long-name-to-fill-pages-{i:04}-xxxxxxxxxxxxxxxxxxxxxxxxxxxx");
+        vol.create_file(&name, b"x", now).unwrap();
+    }
+    let below_root = |vol: &Volume<_>, oid: u64| {
+        let page = vol.read_page(vol.object(oid).unwrap(), false).unwrap();
+        u64::from_le_bytes(
+            page[PAGE_HEADER_SIZE + 0x18..PAGE_HEADER_SIZE + 0x20]
+                .try_into()
+                .unwrap(),
+        )
+    };
+    assert!(below_root(&vol, ROOT_DIRECTORY) > 0, "the root of several pages");
+    vol.create_directory("/newdir", now).unwrap();
+    assert_eq!(below_root(&vol, vol_dir(&vol, "/newdir")), 0);
+    assert_eq!(vol.check(&skip).unwrap().problems, Vec::<String>::new());
+}
+
+#[test]
+fn copies_into_a_live_level_keep_runs_split() {
+    // A file with snapshots: clusters only older levels have, copied on
+    // write into the live level, stay in runs split at the file's clusters
+    // 1, 64 and multiples of 256 (1.2.2 joined clusters that lay together
+    // into one record across cluster 64; Windows bugchecked appending to
+    // such a run; audit M19).
+    let (image, manifest, skip) = load("r314feat");
+    let offset = manifest["partition_offset"].as_u64().unwrap();
+    let overlay = Overlay::new(&image);
+    let mut vol = Volume::open(&overlay, offset).unwrap();
+    let now = 135_900_000_000_000_000;
+    let path = "/snap/file.txt";
+    let mut data = read_all(&vol, path);
+    data[60 * 4096..70 * 4096].fill(0x6b);
+    vol.update_file(path, &data.as_slice(), &[(60 * 4096, 70 * 4096)], now)
+        .unwrap();
+    assert!(read_all(&vol, path) == data);
+    let file = vol.open_file(&vol.lookup(path).unwrap()).unwrap();
+    let refs::Content::Extents(x) = file.data.unwrap().content else {
+        panic!("inline")
+    };
+    for x in &x {
+        let split = (x.vcn + 1..x.vcn + x.clusters).find(|&c| c == 1 || c == 64 || c % 256 == 0);
+        assert_eq!(split, None, "a run from cluster {:#x} of {:#x}", x.vcn, x.clusters);
+    }
+    assert_eq!(vol.check(&skip).unwrap().problems, Vec::<String>::new());
+}
+
+/// A device whose `fail`-th flush fails (0: none), after the writes before
+/// it landed: a disk that reports an error when it took the data.
+struct FlushFails<'a> {
+    inner: &'a Overlay<&'a SparseImage>,
+    flushes: std::sync::atomic::AtomicUsize,
+    fail: usize,
+}
+
+impl ReadAt for FlushFails<'_> {
+    fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> std::io::Result<()> {
+        self.inner.read_exact_at(buf, offset)
+    }
+    fn size(&self) -> std::io::Result<u64> {
+        self.inner.size()
+    }
+}
+
+impl storage_spaces::io::WriteAt for FlushFails<'_> {
+    fn write_all_at(&self, buf: &[u8], offset: u64) -> std::io::Result<()> {
+        storage_spaces::io::WriteAt::write_all_at(self.inner, buf, offset)
+    }
+    fn flush(&self) -> std::io::Result<()> {
+        let n = self.flushes.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+        if n == self.fail {
+            return Err(std::io::Error::other("the flush failed"));
+        }
+        storage_spaces::io::WriteAt::flush(self.inner)
+    }
+}
+
+#[test]
+fn a_failed_commit_leaves_the_volume_as_on_disk() {
+    // The flush after the checkpoint fails (the checkpoint is down): the
+    // change reports it, and the volume in memory is the one on disk, the
+    // next change built on it (1.2.2 went on with the checkpoint before:
+    // the next commit's pages could land on those the checkpoint on disk
+    // names, and its checkpoint replaced it; audit M19).
+    let (image, manifest, skip) = load("r314small");
+    let offset = manifest["partition_offset"].as_u64().unwrap();
+    let now = 135_900_000_000_000_000;
+    let probe = Overlay::new(&image);
+    let dev = FlushFails {
+        inner: &probe,
+        flushes: Default::default(),
+        fail: 0,
+    };
+    let mut vol = Volume::open(&dev, offset).unwrap();
+    vol.create_file("/a.txt", b"first", now).unwrap();
+    let last = dev.flushes.load(std::sync::atomic::Ordering::SeqCst);
+    let overlay = Overlay::new(&image);
+    let dev = FlushFails {
+        inner: &overlay,
+        flushes: Default::default(),
+        fail: last,
+    };
+    let mut vol = Volume::open(&dev, offset).unwrap();
+    assert!(vol.create_file("/a.txt", b"first", now).is_err());
+    let on_disk = Volume::open(&overlay, offset).unwrap();
+    assert_eq!(
+        (vol.checkpoint.lcn, vol.checkpoint.clock),
+        (on_disk.checkpoint.lcn, on_disk.checkpoint.clock),
+        "the volume as on disk"
+    );
+    vol.create_file("/b.txt", b"second", now).unwrap();
+    let fresh = Volume::open(&overlay, offset).unwrap();
+    assert_eq!(read_all(&fresh, "/a.txt"), b"first");
+    assert_eq!(read_all(&fresh, "/b.txt"), b"second");
+    assert_eq!(fresh.check(&skip).unwrap().problems, Vec::<String>::new());
+    assert_pages_valid(&fresh, &skip, "after a failed flush");
+}
+
+#[test]
+fn the_older_checkpoint_stays_whole_through_the_next_commit() {
+    // Windows keeps the pages its last commit replaced until its next
+    // checkpoint takes the older one's slot, and so does `refs`: a commit
+    // writes nothing the older checkpoint reaches before its own
+    // checkpoint replaces it (1.2.2 took the pages the commit before had
+    // freed at once, losing the older checkpoint; audit M19).
+    let (image, manifest, skip) = load("r314small");
+    let offset = manifest["partition_offset"].as_u64().unwrap();
+    let overlay = Overlay::new(&image);
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let dev = Recorder::new(&overlay, 0, log.clone());
+    let mut vol = Volume::open(&dev, offset).unwrap();
+    let (now, cluster) = (135_900_000_000_000_000, vol.cluster);
+    for round in 0..3 {
+        // The volume now: the older one after the next commit.
+        let older = reachable(&vol, &skip);
+        let path = format!("/f{round}.txt");
+        vol.create_file(&path, b"x", now).unwrap();
+        log.lock().unwrap().clear();
+        vol.set_attributes(&path, 0x21).unwrap();
+        let events = log.lock().unwrap().clone();
+        // All but the last two (the checkpoint, into the older one's slot,
+        // and the flush after it).
+        for e in &events[..events.len() - 2] {
+            if let DeviceEvent::Write { offset: at, data, .. } = e {
+                for lcn in (at - offset) / cluster..(at - offset + data.len() as u64).div_ceil(cluster) {
+                    assert!(
+                        !older.contains(&lcn),
+                        "round {round}: cluster {lcn:#x} of the older checkpoint written"
+                    );
+                }
+            }
+        }
+        assert_eq!(vol.check(&skip).unwrap().problems, Vec::<String>::new());
+    }
+}
+
+/// A file's map node in its record: records, the node's area, free bytes.
+fn map_node<D: ReadAt>(vol: &Volume<D>, path: &str) -> (u32, u32, u32) {
+    let record = vol.record(&vol.lookup(path).unwrap()).unwrap();
+    let node = Node::at(&record, 0).unwrap();
+    let v = node
+        .rows()
+        .map(|r| r.unwrap())
+        .find(|r| r.key.len() >= 0x18 && r.key[8..12] == [2, 0, 0, 0x80] && r.value.len() > 0x88)
+        .unwrap()
+        .value
+        .to_vec();
+    let u = |at: usize| u32::from_le_bytes(v[0x88 + at..0x88 + at + 4].try_into().unwrap());
+    (u(0x14), u(0x20), u(8))
+}
+
+#[test]
+fn maps_have_the_room_windows_leaves() {
+    // Windows gives the map in a record room for two records at least
+    // (0x70 bytes), and Windows writing into a hole of a sparse file whose
+    // map `refs` had packed tight bugchecked (0x149 in PinRow; 1.2.2 packed
+    // every map: 0x48 bytes for one record).
+    let (image, manifest, skip) = load("r314small");
+    let offset = manifest["partition_offset"].as_u64().unwrap();
+    let overlay = Overlay::new(&image);
+    let mut vol = Volume::open(&overlay, offset).unwrap();
+    let now = 135_900_000_000_000_000;
+    // Windows' own: one record, two.
+    assert_eq!(map_node(&vol, "/dir/inner.txt"), (1, 0x70, 0x2c));
+    assert_eq!(map_node(&vol, "/mid.bin").1, 0x70);
+    // Runs split at clusters 1 and 64: 1, 2 (two), 3 (two), 65 (three).
+    for (clusters, node) in [
+        (1, (1, 0x70, 0x2c)),
+        (2, (2, 0x70, 0x10)),
+        (3, (2, 0x70, 0x10)),
+        (65, (3, 0x80, 0x4)),
+    ] {
+        let path = format!("/c{clusters}.bin");
+        vol.create_file(&path, &vec![0x5a; clusters * 4096 - 100], now).unwrap();
+        assert_eq!(map_node(&vol, &path), node, "{clusters} clusters");
+    }
+    assert_eq!(vol.check(&skip).unwrap().problems, Vec::<String>::new());
+}

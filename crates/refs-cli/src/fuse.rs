@@ -148,10 +148,15 @@ impl Pending {
         Ok(())
     }
 
+    /// Shortens or extends the buffer. What a shortening drops is changed
+    /// too: grown again before it is written back, the file reads zeros
+    /// there, not what the volume held (1.2.2 recorded nothing, and the
+    /// old bytes came back; audit M16). Growing needs no range:
+    /// `update_file` takes what lies past the file's end as written.
     fn set_len(&mut self, len: u64) -> Result<(), Errno> {
         self.file.set_len(len).map_err(|_| Errno::EIO)?;
-        if len > self.len {
-            self.ranges.push((self.len, len));
+        if len < self.len {
+            self.ranges.push((len, self.len));
         }
         self.len = len;
         Ok(())
@@ -1951,6 +1956,36 @@ mod tests {
         let mut buf = [0u8; 10];
         vol.read_stream(file.data.as_ref().unwrap(), 0, &mut buf).unwrap();
         assert_eq!(&buf, b"first then");
+    }
+
+    /// A file truncated and then written past its new end before the
+    /// write-back: the gap reads zeros (1.2.2 recorded neither the bytes
+    /// the truncation dropped nor the gap, and the volume's old bytes came
+    /// back there; audit M16).
+    #[test]
+    fn a_truncated_file_written_past_its_end_reads_zeros_between() {
+        let fs = served(true);
+        fs.vol.write_ok().create_file("/t.bin", &[0xaa; 8000], now()).unwrap();
+        let ino = fs.inode("/t.bin", None);
+        let w = fs.open_inode(ino, 1).unwrap();
+        {
+            // As setattr truncates a file open for writing.
+            let mut s = fs.state.lock_ok();
+            let p = s.pending.get_mut(&ino).unwrap();
+            p.set_len(5000).unwrap();
+            p.dirty = true;
+        }
+        assert_eq!(fs.write_inode(ino, 6990, &[0xbb; 20]), Ok(20));
+        fs.release_inode(ino, w).unwrap();
+        let mut want = vec![0xaa; 5000];
+        want.resize(6990, 0);
+        want.extend([0xbb; 20]);
+        let vol = fs.vol.read_ok();
+        let file = vol.open_file(&vol.lookup("/t.bin").unwrap()).unwrap();
+        let data = file.data.as_ref().unwrap();
+        let mut got = vec![0u8; data.size as usize];
+        assert_eq!(vol.read_stream(data, 0, &mut got).unwrap(), got.len());
+        assert_eq!(got, want);
     }
 
     /// A write-back that fails keeps what was written: every later flush

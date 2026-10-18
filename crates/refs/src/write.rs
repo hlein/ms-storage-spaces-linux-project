@@ -97,10 +97,11 @@ pub struct Transaction<'v, D> {
     loaded: HashMap<(Tree, u64), usize>,
     roots: HashMap<Tree, usize>,
     /// Clusters freed by this transaction: the old checkpoint still uses
-    /// them, so they are not taken again before the commit.
+    /// them, so they are not taken again before the commit; nor are those
+    /// of the pages the commit before replaced (the older checkpoint's).
     freed: std::collections::HashSet<u64>,
-    /// Set while committing: allocator rows are not restructured then.
-    committing: bool,
+    /// The clusters of the pages it replaces or drops.
+    retiring: std::collections::HashSet<u64>,
     /// Containers this transaction handed out for data (first clusters).
     handed_out: Vec<u64>,
 }
@@ -110,6 +111,11 @@ impl<'v, D: WriteAt> Transaction<'v, D> {
     /// Windows would replay over the checkpoint.
     pub fn begin(vol: &'v Volume<D>) -> Result<Self> {
         vol.writable_version()?;
+        if vol.unread.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(Error::Unsupported(
+                "changes, as a commit failed and the volume could not be read again: open it again".into(),
+            ));
+        }
         let log = vol.log_state().map_err(|e| {
             Error::Unsupported(format!(
                 "writing, as the volume's log cannot be read ({e}): whether Windows would replay \
@@ -130,22 +136,27 @@ impl<'v, D: WriteAt> Transaction<'v, D> {
 
     /// Frees the pages only the older checkpoint references, as Windows
     /// does when it writes the checkpoint that replaces that one (this
-    /// transaction's): left allocated, nothing would ever free them. The
-    /// older checkpoints `refs` wrote have none (it frees replaced pages
-    /// at once), and are not looked at.
+    /// transaction's): left allocated, nothing would ever free them. Those
+    /// already free (`refs` frees the pages a commit replaces at once) are
+    /// not taken before the commit either. An older checkpoint written
+    /// through this value is not looked at: its pages are `retired`.
     fn free_deferred(&mut self) -> Result<()> {
         use std::sync::atomic::Ordering;
         let own = self.vol.own_since.load(Ordering::Relaxed);
         if own != 0 && self.vol.older_checkpoint().is_none_or(|c| c.clock >= own) {
             return Ok(());
         }
-        for (allocator, lcns) in self.vol.deferred_pages()? {
+        for (allocator, lcns) in self.vol.older_pages()? {
             let mut used = true;
             for &c in &lcns {
                 used &= self.is_used(allocator, c)?;
             }
             if used {
                 self.release(allocator, &lcns)?;
+            } else {
+                // Free already (a commit by `refs` freed them): still the
+                // older checkpoint's until this commit replaces it.
+                self.freed.extend(&lcns);
             }
         }
         Ok(())
@@ -175,21 +186,23 @@ impl<'v, D: WriteAt> Transaction<'v, D> {
 
     fn new(vol: &'v Volume<D>) -> Self {
         // Within one commit of several changes, what the earlier ones freed
-        // the checkpoint on disk may still use.
-        let freed = vol
+        // the checkpoint on disk may still use; the pages the commit before
+        // replaced, the older checkpoint.
+        let mut freed: std::collections::HashSet<u64> = vol
             .held
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .as_ref()
             .map(|h| h.freed.clone())
             .unwrap_or_default();
+        freed.extend(vol.retired.lock().unwrap_or_else(|e| e.into_inner()).iter());
         Transaction {
             vol,
             pages: Vec::new(),
             loaded: HashMap::new(),
             roots: HashMap::new(),
             freed,
-            committing: false,
+            retiring: Default::default(),
             handed_out: Vec::new(),
         }
     }
@@ -449,13 +462,8 @@ impl<'v, D: WriteAt> Transaction<'v, D> {
                     j += 1;
                     continue;
                 }
-                let boundary = match *vcn {
-                    0 => 1,
-                    1..64 => 64,
-                    _ => (*vcn / 256 + 1) * 256,
-                };
                 let mut n = 0;
-                while j + n < to && n < *left && n < budget && *vcn + n < boundary && !used(j + n) {
+                while j + n < to && n < *left && n < budget && !(n > 0 && run_boundary(*vcn + n)) && !used(j + n) {
                     n += 1;
                 }
                 runs.push((j, n));
@@ -518,7 +526,7 @@ impl<'v, D: WriteAt> Transaction<'v, D> {
     fn release(&mut self, allocator: usize, clusters: &[u64]) -> Result<()> {
         let mut bitmaps = self.bitmaps(allocator)?;
         for &c in clusters {
-            if !self.committing && !bitmaps.iter().any(|(start, count, _)| *start <= c && c < start + count) {
+            if !bitmaps.iter().any(|(start, count, _)| *start <= c && c < start + count) {
                 self.unpack(allocator, c)?;
                 bitmaps = self.bitmaps(allocator)?;
             }
@@ -1531,6 +1539,7 @@ impl<'v, D: WriteAt> Transaction<'v, D> {
                 let old = std::mem::take(&mut self.pages[i].old);
                 if !old.is_empty() {
                     self.release(allocator, &old)?;
+                    self.retiring.extend(&old);
                 }
             }
         }
@@ -1546,6 +1555,7 @@ impl<'v, D: WriteAt> Transaction<'v, D> {
         let old = std::mem::take(&mut self.pages[page].old);
         if !old.is_empty() {
             self.release(tree.allocator()?, &old)?;
+            self.retiring.extend(&old);
         }
         self.count_pages(tree, -1);
         Ok(())
@@ -1588,7 +1598,6 @@ impl<'v, D: WriteAt> Transaction<'v, D> {
 
     /// Writes the changed pages and the new checkpoint.
     pub fn commit(mut self) -> Result<()> {
-        self.committing = true;
         let vol = self.vol;
         let reference_size = vol.checkpoint.reference_size;
         // Object trees whose root changes: their rows in both object tables.
@@ -1626,6 +1635,7 @@ impl<'v, D: WriteAt> Transaction<'v, D> {
                 let new = self.take(allocator, self.per_page())?;
                 let old = self.pages[i].old.clone();
                 self.release(allocator, &old)?;
+                self.retiring.extend(&old);
                 self.pages[i].new = Some(new);
             }
         }
@@ -1731,10 +1741,12 @@ impl<'v, D: WriteAt> Transaction<'v, D> {
             let h = h.as_mut().ok_or_else(|| format_err!("the held commit went"))?;
             h.page = Some(new);
             h.freed.extend(self.freed.iter().copied());
+            h.retiring.extend(self.retiring.iter().copied());
             return Ok(());
         }
-        vol.write_clusters(slot, &new)?;
-        vol.dev.flush()?;
+        let written = vol.write_clusters(slot, &new).and_then(|()| Ok(vol.dev.flush()?));
+        retire(vol, std::mem::take(&mut self.retiring), written.is_ok());
+        written?;
         let _ = vol.own_since.compare_exchange(
             0,
             clock,
@@ -1772,6 +1784,59 @@ impl<D: WriteAt> Volume<D> {
     }
 }
 
+/// The clusters of a sparse file's holes that the `dirty` byte ranges
+/// touch, below its new end: `runs` are its runs (first cluster in the
+/// file, virtual cluster, clusters) in order.
+fn touched_holes(dirty: &[(u64, u64)], runs: &[(u64, u64, u64)], size: u64, cluster: u64) -> Vec<u64> {
+    let mut ranges: Vec<(u64, u64)> = dirty
+        .iter()
+        .map(|&(from, to)| (from / cluster, to.min(size).div_ceil(cluster)))
+        .filter(|r| r.0 < r.1)
+        .collect();
+    ranges.sort_unstable();
+    let mut out = Vec::new();
+    let mut next = 0;
+    for (a, b) in ranges {
+        for c in a.max(next)..b {
+            let i = runs.partition_point(|r| r.0 + r.2 <= c);
+            if runs.get(i).is_none_or(|r| r.0 > c) {
+                out.push(c);
+            }
+        }
+        next = next.max(b);
+    }
+    out
+}
+
+/// Whether a run of a stream must end before its cluster `vcn`, as Windows
+/// splits runs: at the stream's clusters 1, 64, 256 and multiples of 256
+/// (`take_from_row` places data so; appending to a file whose run crossed
+/// cluster 64 bugchecked Windows).
+fn run_boundary(vcn: u64) -> bool {
+    vcn == 1 || vcn == 64 || (vcn != 0 && vcn.is_multiple_of(256))
+}
+
+/// The value of a sparse file's live level, as Windows keeps it: 0x48 the
+/// bytes its clusters hold (0x30 stays the size in whole clusters), bit 31
+/// of 0x50 set.
+fn sparse_value(live: &mut [u8], allocated: u64) {
+    live[0x48..0x50].copy_from_slice(&allocated.to_le_bytes());
+    let flags = le32(live, 0x50) | 0x8000_0000;
+    live[0x50..0x54].copy_from_slice(&flags.to_le_bytes());
+}
+
+/// After a checkpoint is written: the pages its commit replaced or
+/// dropped are the older checkpoint's now (those of the commit before are
+/// no checkpoint's). If writing it failed, it may be down or not: both.
+fn retire<D>(vol: &Volume<D>, retiring: std::collections::HashSet<u64>, written: bool) {
+    let mut retired = vol.retired.lock().unwrap_or_else(|e| e.into_inner());
+    if written {
+        *retired = retiring;
+    } else {
+        retired.extend(retiring);
+    }
+}
+
 /// The clusters of physical runs, each once.
 fn clusters_of(runs: &[(u64, u64)]) -> Vec<u64> {
     let mut clusters: Vec<u64> = runs.iter().flat_map(|&(lcn, n)| lcn..lcn + n).collect();
@@ -1785,6 +1850,19 @@ fn clusters_of(runs: &[(u64, u64)]) -> Vec<u64> {
 const SETTABLE_ATTRIBUTES: u32 = 0x1 | 0x2 | 0x4 | 0x20 | 0x100 | 0x1000 | 0x2000;
 
 impl<D: WriteAt> Volume<D> {
+    /// After a commit: the volume read again from what is on disk, also
+    /// after one that failed (it may have written its checkpoint, whole or
+    /// in part, or not; a change built on the volume as read before could
+    /// write over pages the checkpoint on disk names, 1.2.2 went on so).
+    /// One that cannot be read again takes no more changes.
+    pub(crate) fn committed(&mut self, result: Result<()>) -> Result<()> {
+        let loaded = self.load();
+        if loaded.is_err() {
+            self.unread.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        result.and(loaded)
+    }
+
     /// Makes the changes `change` makes one commit: they write their pages
     /// as ever, but the checkpoint stays back until the last is made, so
     /// that a crash leaves the volume as it was before or after all of
@@ -1809,8 +1887,7 @@ impl<D: WriteAt> Volume<D> {
                 clock: self.checkpoint.clock + 1,
                 generation: le64(&page, 0x68) + 1,
                 slot,
-                page: None,
-                freed: Default::default(),
+                ..Default::default()
             });
         }
         let result = change(self);
@@ -1819,23 +1896,35 @@ impl<D: WriteAt> Volume<D> {
         let value = match result {
             Ok(value) => value,
             Err(e) => {
-                self.load()?;
+                // As on disk again (what the steps wrote lies where its
+                // checkpoint does not reach).
+                if self.load().is_err() {
+                    self.unread.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
                 return Err(e);
             }
         };
         if let Some(page) = held.page {
             // The pages are on disk first, then the checkpoint naming them.
-            self.dev.flush()?;
-            self.write_clusters(held.slot, &page)?;
-            self.dev.flush()?;
-            let _ = self.own_since.compare_exchange(
-                0,
-                held.clock,
-                std::sync::atomic::Ordering::Relaxed,
-                std::sync::atomic::Ordering::Relaxed,
-            );
+            let written = self
+                .dev
+                .flush()
+                .map_err(Error::from)
+                .and_then(|()| self.write_clusters(held.slot, &page))
+                .and_then(|()| Ok(self.dev.flush()?));
+            retire(self, held.retiring, written.is_ok());
+            if written.is_ok() {
+                let _ = self.own_since.compare_exchange(
+                    0,
+                    held.clock,
+                    std::sync::atomic::Ordering::Relaxed,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+            }
+            self.committed(written)?;
+            return Ok(value);
         }
-        self.load()?;
+        self.committed(Ok(()))?;
         Ok(value)
     }
 
@@ -2059,7 +2148,7 @@ impl<D: WriteAt> Volume<D> {
         // Files take integrity streams from their directory, as on Windows.
         let own = self.own_row(dir)?;
         let integrity = own.len() >= 0x4c && le32(&own, 0x48) & INTEGRITY != 0;
-        {
+        let committed = {
             let mut tx = Transaction::begin(&*self)?;
             // The next file id, and the value every record of the
             // directory carries at 0x50.
@@ -2086,6 +2175,7 @@ impl<D: WriteAt> Volume<D> {
                 id: next_id,
                 security: common,
                 integrity,
+                sparse: false,
                 table: dir,
             };
             let record = self.new_record(&mut tx, band, data, file)?;
@@ -2102,9 +2192,9 @@ impl<D: WriteAt> Volume<D> {
                 &directory_key_order,
             )?;
             self.touch_directory(&mut tx, parent, dir, now)?;
-            tx.commit()?;
-        }
-        self.load()
+            tx.commit()
+        };
+        self.committed(committed)
     }
 
     /// A file record holding `data`: inline up to MAX_INLINE, else in
@@ -2136,14 +2226,78 @@ impl<D: WriteAt> Volume<D> {
                 "integrity streams of more than {MAX_INTEGRITY} bytes"
             )));
         }
-        let (extents, allocated) = self.write_data(tx, band, data, integrity)?;
-        let live = self.map_value(tx, file.table, data.len(), allocated, &extents)?;
-        let mut record = extent_record(data.len(), allocated, live, now, id, security);
-        if integrity {
-            let a = le32(&record, 0x48) | INTEGRITY;
-            record[0x48..0x4c].copy_from_slice(&a.to_le_bytes());
+        let (extents, allocated) = if file.sparse {
+            self.write_sparse_data(tx, band, data)?
+        } else {
+            self.write_data(tx, band, data, integrity)?
+        };
+        let logical = data.len().div_ceil(self.cluster) * self.cluster;
+        let mut live = self.map_value(tx, file.table, data.len(), logical, &extents)?;
+        if file.sparse {
+            sparse_value(&mut live, allocated);
         }
+        let mut record = extent_record(data.len(), allocated, live, now, id, security);
+        let mut a = le32(&record, 0x48);
+        if integrity {
+            a |= INTEGRITY;
+        }
+        if file.sparse {
+            a |= SPARSE;
+        }
+        record[0x48..0x4c].copy_from_slice(&a.to_le_bytes());
         Ok(record)
+    }
+
+    /// `write_data` for a sparse file: only the clusters that hold other
+    /// bytes than zeros, the rest holes (read 256 clusters at a time; all
+    /// holes, the map has no records, as Windows keeps such a file).
+    #[allow(clippy::type_complexity)]
+    fn write_sparse_data(
+        &self,
+        tx: &mut Transaction<'_, D>,
+        band: u64,
+        data: &dyn Source,
+    ) -> Result<(Vec<(u64, u64, u64, Vec<u8>)>, u64)> {
+        const CHUNK: u64 = 256;
+        let cluster = self.cluster;
+        let clusters = data.len().div_ceil(cluster);
+        let mut extents = Vec::new();
+        let mut buf = vec![0u8; (CHUNK * cluster) as usize];
+        let mut first = 0;
+        while first < clusters {
+            let n = CHUNK.min(clusters - first);
+            let at = first * cluster;
+            let len = (n * cluster).min(data.len() - at) as usize;
+            buf[len..].fill(0);
+            data.read_into(at, &mut buf[..len])?;
+            let held = |k: u64| {
+                buf[(k * cluster) as usize..((k + 1) * cluster) as usize]
+                    .iter()
+                    .any(|&b| b != 0)
+            };
+            let mut k = 0;
+            while k < n {
+                if !held(k) {
+                    k += 1;
+                    continue;
+                }
+                let start = k;
+                while k < n && held(k) {
+                    k += 1;
+                }
+                let mut vcn = first + start;
+                for (lcn, m) in tx.take_data(band, k - start, vcn)? {
+                    let o = ((vcn - first) * cluster) as usize;
+                    self.write_clusters(lcn, &buf[o..o + (m * cluster) as usize])?;
+                    extents.push((vcn, self.virtual_of(lcn)?, m, Vec::new()));
+                    vcn += m;
+                }
+            }
+            first += n;
+        }
+        self.dev.flush()?;
+        let allocated = extents.iter().map(|x| x.2).sum::<u64>() * cluster;
+        Ok((extents, allocated))
     }
 
     /// Writes `data` to clusters taken from the data band `band` (free until
@@ -2401,13 +2555,30 @@ impl<D: WriteAt> Volume<D> {
             }
         }
         // The clusters the changes touch, within those it keeps: written
-        // in place where the live level has them, else copied on write.
+        // in place where the live level has them, else copied on write; so
+        // are those of its own that other files share (block clones,
+        // deduplication: 1.2.2 wrote them in place, changing those files).
         let mut touched = std::collections::BTreeSet::new();
         for &(from, to) in dirty {
             let to = to.min(new_size).min(kept * cluster);
             if from < to {
                 touched.extend(from / cluster..to.div_ceil(cluster));
             }
+        }
+        let own: Vec<(u64, u64)> = touched
+            .iter()
+            .filter_map(|c| mine.get(c).map(|&v| (*c, v)))
+            .map(|(c, v)| Ok((c, self.translate(v)?)))
+            .collect::<Result<_>>()?;
+        let lcns: Vec<u64> = own.iter().map(|o| o.1).collect();
+        let shared: Vec<(u64, u64)> = own
+            .into_iter()
+            .zip(self.shared(&lcns)?)
+            .filter(|(_, s)| *s)
+            .map(|(o, _)| o)
+            .collect();
+        for &(c, _) in &shared {
+            mine.remove(&c);
         }
         let mut copies: Vec<(u64, u64)> = Vec::new();
         for &c in touched.iter().filter(|c| !mine.contains_key(c)) {
@@ -2457,8 +2628,9 @@ impl<D: WriteAt> Volume<D> {
             }
         }
         self.dev.flush()?;
-        // The live level's clusters past the new end go.
-        let mut free = Vec::new();
+        // The live level's clusters past the new end go, and its shared
+        // ones copied on write lose its reference.
+        let mut free: Vec<u64> = shared.iter().map(|&(_, lcn)| lcn).collect();
         for &vlcn in mine.range(new_clusters..).map(|(_, v)| v) {
             free.push(self.translate(vlcn)?);
         }
@@ -2466,7 +2638,7 @@ impl<D: WriteAt> Volume<D> {
         free.extend(self.extent_map_pages(row_value(&rows[at]))?);
         let table = fa.home.unwrap_or(fa.dir);
         let band = self.data_band(fa.dir)?;
-        {
+        let committed = {
             let mut tx = Transaction::begin(&*self)?;
             tx.free_data(&free)?;
             let mut writes: Vec<(u64, u64, Option<&[u8]>)> = copies
@@ -2502,11 +2674,12 @@ impl<D: WriteAt> Volume<D> {
                 }
             }
             self.dev.flush()?;
-            // Its records: runs of consecutive clusters.
+            // Its records: runs of consecutive clusters, split where Windows
+            // splits runs (1.2.2 joined them across those clusters).
             let mut records: Vec<(u64, u64, u64, Vec<u8>)> = Vec::new();
             for (&c, &v) in &mine {
                 match records.last_mut() {
-                    Some(r) if r.0 + r.2 == c && r.1 + r.2 == v => r.2 += 1,
+                    Some(r) if r.0 + r.2 == c && r.1 + r.2 == v && !run_boundary(c) => r.2 += 1,
                     _ => records.push((c, v, 1, Vec::new())),
                 }
             }
@@ -2524,9 +2697,9 @@ impl<D: WriteAt> Volume<D> {
                 record[at..at + 8].copy_from_slice(&now.to_le_bytes());
             }
             store_in(&mut tx, &fa, &record)?;
-            tx.commit()?;
-        }
-        self.load()?;
+            tx.commit()
+        };
+        self.committed(committed)?;
         Ok(true)
     }
 
@@ -2678,7 +2851,7 @@ impl<D: WriteAt> Volume<D> {
             .position(|r| live_key(row_key(r)))
             .ok_or_else(|| format_err!("{path}: no live level of its data"))?;
         free.extend(self.extent_map_pages(row_value(&rows[at]))?);
-        {
+        let committed = {
             let mut tx = Transaction::begin(&*self)?;
             tx.free_data(&free)?;
             // The copies and the clusters it grows by, to new clusters.
@@ -2721,9 +2894,9 @@ impl<D: WriteAt> Volume<D> {
                 record[at..at + 8].copy_from_slice(&now.to_le_bytes());
             }
             store_in(&mut tx, &fa, &record)?;
-            tx.commit()?;
-        }
-        self.load()?;
+            tx.commit()
+        };
+        self.committed(committed)?;
         Ok(true)
     }
 
@@ -2733,8 +2906,14 @@ impl<D: WriteAt> Volume<D> {
     /// clusters are written where they are, clusters it grows by are added
     /// as new runs after its own, clusters past its new end are freed, and
     /// its record gets the new sizes, extent map and modification and
-    /// change times `now`. Other files are rewritten whole
-    /// (`write_file_from`). The bytes outside `dirty` must be the file's.
+    /// change times `now`. What lies past its old end is new, whatever
+    /// `dirty` says: zeros where nothing was written there (1.2.2 left
+    /// what its last cluster held past the old end; audit M16). A sparse
+    /// file (attribute 0x200) keeps its holes: bytes written into one take
+    /// clusters unless they are zeros, and it grows by holes (1.2.2 wrote
+    /// it anew, dense and without the attribute). Other files are rewritten
+    /// whole (`write_file_from`). The bytes outside `dirty` must be the
+    /// file's.
     pub fn update_file(&mut self, path: &str, data: &dyn Source, dirty: &[(u64, u64)], now: u64) -> Result<()> {
         let fa = self.file_at(path)?;
         // Compressed data: the whole file copied on write.
@@ -2744,6 +2923,21 @@ impl<D: WriteAt> Volume<D> {
         let entry = self.lookup(path.trim_end_matches('/'))?;
         let file = self.open_file(&entry)?;
         let new_size = data.len();
+        let cluster = self.cluster;
+        let sparse = le32(&fa.record, 0x48) & SPARSE != 0;
+        // Past the old end: the rest of its last cluster, and the clusters
+        // it grows by (a sparse file grows by holes).
+        let old_size = file.data.as_ref().map_or(0, |s| s.size);
+        let mut dirty = dirty.to_vec();
+        if new_size > old_size {
+            let end = if sparse {
+                old_size.div_ceil(cluster) * cluster
+            } else {
+                new_size
+            };
+            dirty.push((old_size, end.min(new_size)));
+        }
+        let dirty = &dirty[..];
         let extents = match &file.data {
             Some(crate::file::Stream {
                 content: crate::file::Content::Extents(x),
@@ -2772,15 +2966,16 @@ impl<D: WriteAt> Volume<D> {
             }
             _ => return self.write_file_from(path, data, now),
         };
-        // Its runs from its first cluster on, without holes.
+        // Its runs in order: from its first cluster on without holes, or a
+        // sparse file's, with holes between them.
         let mut xs: Vec<(u64, u64, u64)> = extents.iter().map(|x| (x.vcn, x.vlcn, x.clusters)).collect();
         xs.sort_unstable();
         let mut old_clusters = 0;
         for &(vcn, _, n) in &xs {
-            if vcn != old_clusters {
+            if vcn < old_clusters || (vcn != old_clusters && !sparse) {
                 return self.write_file_from(path, data, now);
             }
-            old_clusters += n;
+            old_clusters = vcn + n;
         }
         let physical: Vec<(u64, u64)> = xs
             .iter()
@@ -2789,23 +2984,35 @@ impl<D: WriteAt> Volume<D> {
         if self.refcounted(&physical)? {
             return self.write_file_from(path, data, now);
         }
-        let cluster = self.cluster;
         let new_clusters = new_size.div_ceil(cluster);
         // The changed bytes within the clusters it keeps, where they are.
-        let kept = old_clusters.min(new_clusters) * cluster;
         for &(from, to) in dirty {
-            let to = to.min(kept).min(new_size);
+            let to = to.min(new_size);
             for (&(vcn, _, n), &(lcn, _)) in xs.iter().zip(&physical) {
                 let (start, stop) = (vcn * cluster, (vcn + n) * cluster);
                 let (a, b) = (from.max(start), to.min(stop));
                 if a < b {
-                    let mut buf = vec![0u8; (b - a) as usize];
-                    data.read_into(a, &mut buf)?;
-                    self.write_volume(lcn * cluster + (a - start), &buf)?;
+                    self.write_in_place(data, lcn, start, a, b)?;
                 }
             }
         }
         self.dev.flush()?;
+        // A sparse file: the clusters of its holes that the changes give
+        // other bytes than zeros, as ranges.
+        let mut filled: Vec<(u64, u64)> = Vec::new();
+        if sparse {
+            let mut buf = vec![0u8; cluster as usize];
+            for c in touched_holes(dirty, &xs, new_size, cluster) {
+                let len = (new_size - c * cluster).min(cluster) as usize;
+                data.read_into(c * cluster, &mut buf[..len])?;
+                if buf[..len].iter().any(|&b| b != 0) {
+                    match filled.last_mut() {
+                        Some(l) if l.1 == c => l.1 += 1,
+                        _ => filled.push((c, c + 1)),
+                    }
+                }
+            }
+        }
         let table = fa.home.unwrap_or(fa.dir);
         let band = self.data_band(fa.dir)?;
         let live_key = |k: &[u8]| {
@@ -2817,13 +3024,28 @@ impl<D: WriteAt> Volume<D> {
             .position(|r| live_key(row_key(r)))
             .ok_or_else(|| format_err!("{path}: no live level of its data"))?;
         let old_map = self.extent_map_pages(row_value(&rows[at]))?;
-        {
+        let committed = {
             let mut tx = Transaction::begin(&*self)?;
             let mut free = old_map;
-            if new_clusters > old_clusters {
-                // As Windows appends: new runs after the file's own.
-                let runs = tx.take_data(band, new_clusters - old_clusters, old_clusters)?;
-                let mut vcn = old_clusters;
+            // Past the new end: its clusters free, its runs shortened.
+            let mut kept_runs = Vec::with_capacity(xs.len());
+            for (&(vcn, vlcn, n), &(lcn, _)) in xs.iter().zip(&physical) {
+                let keep = new_clusters.saturating_sub(vcn).min(n);
+                if keep > 0 {
+                    kept_runs.push((vcn, vlcn, keep));
+                }
+                free.extend(lcn + keep..lcn + n);
+            }
+            xs = kept_runs;
+            // New clusters: as Windows appends, new runs after the file's
+            // own; a sparse file's, where its holes take bytes.
+            if !sparse && new_clusters > old_clusters {
+                filled.push((old_clusters, new_clusters));
+            }
+
+            for &(a, b) in &filled {
+                let runs = tx.take_data(band, b - a, a)?;
+                let mut vcn = a;
                 for (lcn, n) in runs {
                     let mut buf = vec![0u8; (n * cluster) as usize];
                     let len = (n * cluster).min(new_size - vcn * cluster);
@@ -2832,22 +3054,21 @@ impl<D: WriteAt> Volume<D> {
                     xs.push((vcn, self.virtual_of(lcn)?, n));
                     vcn += n;
                 }
-                self.dev.flush()?;
-            } else if new_clusters < old_clusters {
-                let mut kept_runs = Vec::new();
-                for (&(vcn, vlcn, n), &(lcn, _)) in xs.iter().zip(&physical) {
-                    let keep = new_clusters.saturating_sub(vcn).min(n);
-                    if keep > 0 {
-                        kept_runs.push((vcn, vlcn, keep));
-                    }
-                    free.extend(lcn + keep..lcn + n);
-                }
-                xs = kept_runs;
             }
+            self.dev.flush()?;
+            xs.sort_unstable();
             tx.free_data(&free)?;
             let extents: Vec<(u64, u64, u64, Vec<u8>)> = xs.iter().map(|&(v, l, n)| (v, l, n, Vec::new())).collect();
-            let allocated = new_clusters * cluster;
-            let live = self.map_value(&mut tx, table, new_size, allocated, &extents)?;
+            let logical = new_clusters * cluster;
+            let allocated = if sparse {
+                xs.iter().map(|x| x.2).sum::<u64>() * cluster
+            } else {
+                logical
+            };
+            let mut live = self.map_value(&mut tx, table, new_size, logical, &extents)?;
+            if sparse {
+                sparse_value(&mut live, allocated);
+            }
             let mut key = row_key(&rows[at]).to_vec();
             key[0..8].copy_from_slice(&(live.len() as u64).to_le_bytes());
             rows[at] = row(&key, &live, ROW_EMBEDS_NODE);
@@ -2858,9 +3079,28 @@ impl<D: WriteAt> Volume<D> {
                 record[at..at + 8].copy_from_slice(&now.to_le_bytes());
             }
             store_in(&mut tx, &fa, &record)?;
-            tx.commit()?;
+            tx.commit()
+        };
+        self.committed(committed)
+    }
+
+    /// Writes the bytes [from, to) of `data` where a run of clusters has
+    /// them (from physical cluster `lcn`, the stream's bytes from `start`
+    /// on), a MiB at a time (1.2.2 took the whole range into memory).
+    fn write_in_place(&self, data: &dyn Source, lcn: u64, start: u64, from: u64, to: u64) -> Result<()> {
+        const PIECE: u64 = 1 << 20;
+        let base = lcn
+            .checked_mul(self.cluster)
+            .ok_or_else(|| format_err!("cluster {lcn:#x} outside the volume"))?;
+        let mut buf = vec![0u8; (to - from).min(PIECE) as usize];
+        let mut at = from;
+        while at < to {
+            let n = (to - at).min(PIECE) as usize;
+            data.read_into(at, &mut buf[..n])?;
+            self.write_volume(base + (at - start), &buf[..n])?;
+            at += n as u64;
         }
-        self.load()
+        Ok(())
     }
 
     /// Replaces a file's whole content with `data` (appending, truncating
@@ -2980,9 +3220,7 @@ impl<D: WriteAt> Volume<D> {
         self.replace_data(to, now, true, Some(&shared), &|vol, tx, _, file| {
             let mut live = vol.map_value(tx, file.table, size, logical, &records)?;
             if sparse {
-                live[0x48..0x50].copy_from_slice(&allocated.to_le_bytes());
-                let flags = le32(&live, 0x50) | 0x8000_0000;
-                live[0x50..0x54].copy_from_slice(&flags.to_le_bytes());
+                sparse_value(&mut live, allocated);
             }
             let mut record = extent_record(size, allocated, live, file.now, file.id, file.security);
             let mut a = le32(&record, 0x48);
@@ -3039,7 +3277,7 @@ impl<D: WriteAt> Volume<D> {
             }) if x.iter().any(|x| x.checksums.is_some()));
         let band = if clustered { Some(self.data_band(dir)?) } else { None };
         let (id, security) = (le64(&old, 0x80), le64(&old, 0x50));
-        {
+        let committed = {
             let mut tx = Transaction::begin(&*self)?;
             // The old data clusters become free (kept until the commit).
             let clusters = clusters_of(&runs);
@@ -3053,6 +3291,9 @@ impl<D: WriteAt> Volume<D> {
                 id,
                 security,
                 integrity,
+                // A sparse file stays one (1.2.2 wrote it dense, without the
+                // attribute).
+                sparse: le32(&old, 0x48) & SPARSE != 0 && !integrity,
                 table: home.unwrap_or(dir),
             };
             let mut record = make(self, &mut tx, band, file)?;
@@ -3086,8 +3327,8 @@ impl<D: WriteAt> Volume<D> {
                 let record = record_with_names(&record, names, rows)?;
                 put_record(&mut tx, home, id, &record)?;
                 refresh_entry(&mut tx, dir, &name, &record)?;
-                tx.commit()?;
-                return self.load();
+                let committed = tx.commit();
+                return self.committed(committed);
             }
             tx.remove_row(Tree::Object(dir), &|k| is_name_row(k, &name))?;
             let utf16: Vec<u8> = name.encode_utf16().flat_map(|c| c.to_le_bytes()).collect();
@@ -3099,9 +3340,9 @@ impl<D: WriteAt> Volume<D> {
                 &directory_key_order,
             )?;
             self.touch_directory(&mut tx, &parent, dir, now)?;
-            tx.commit()?;
-        }
-        self.load()
+            tx.commit()
+        };
+        self.committed(committed)
     }
 
     /// The security descriptor reference (record 0x50) a new file in
@@ -3157,7 +3398,7 @@ impl<D: WriteAt> Volume<D> {
         runs.extend(stream_runs);
         compacted.extend(stream_compacted);
         let id = le64(&record, 0x80);
-        {
+        let committed = {
             let mut tx = Transaction::begin(&*self)?;
             // Its data clusters become free (kept until the commit).
             let clusters = clusters_of(&runs);
@@ -3168,9 +3409,9 @@ impl<D: WriteAt> Volume<D> {
                 k.len() >= 16 && le16(k, 0) == ROW_FILE_ID && le64(k, 8) == id
             })?;
             self.touch_directory(&mut tx, &parent, dir, now)?;
-            tx.commit()?;
-        }
-        self.load()
+            tx.commit()
+        };
+        self.committed(committed)
     }
 
     /// Renames a file or directory within its directory.
@@ -3207,7 +3448,7 @@ impl<D: WriteAt> Volume<D> {
         let id = le64(&record, 0x80);
         record[0x38..0x40].copy_from_slice(&now.to_le_bytes());
         let utf16: Vec<u8> = new_name.encode_utf16().flat_map(|c| c.to_le_bytes()).collect();
-        {
+        let committed = {
             let mut tx = Transaction::begin(&*self)?;
             tx.remove_row(Tree::Object(dir), &|k| is_name_row(k, &name))?;
             tx.remove_row(Tree::Object(dir), &|k| {
@@ -3223,9 +3464,9 @@ impl<D: WriteAt> Volume<D> {
                 &directory_key_order,
             )?;
             self.touch_directory(&mut tx, &parent, dir, now)?;
-            tx.commit()?;
-        }
-        self.load()
+            tx.commit()
+        };
+        self.committed(committed)
     }
 
     /// Renames or moves `path` to the path `to`, replacing what `to` names,
@@ -3277,6 +3518,33 @@ impl<D: WriteAt> Volume<D> {
     /// values hold, from 0x1c, a u16 per cluster counting the references
     /// beyond the first (0: one file's alone).
     fn refcounted(&self, runs: &[(u64, u64)]) -> Result<bool> {
+        let rows = self.refcount_table()?;
+        if rows.is_empty() {
+            return Ok(false);
+        }
+        for &(lcn, n) in runs {
+            for c in lcn..lcn + n {
+                if self.counted(&rows, c)? {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
+    }
+
+    /// For each of these physical clusters, whether the block reference
+    /// count table counts more references to it.
+    fn shared(&self, clusters: &[u64]) -> Result<Vec<bool>> {
+        let rows = self.refcount_table()?;
+        if rows.is_empty() {
+            return Ok(vec![false; clusters.len()]);
+        }
+        clusters.iter().map(|&c| self.counted(&rows, c)).collect()
+    }
+
+    /// The block reference count table's rows: first cluster, clusters,
+    /// value.
+    fn refcount_table(&self) -> Result<Vec<(u64, u64, Vec<u8>)>> {
         let mut rows = Vec::new();
         self.walk(&self.root(6)?, false, &mut |row| {
             if row.key.len() >= 16 {
@@ -3284,23 +3552,16 @@ impl<D: WriteAt> Volume<D> {
             }
             Ok(())
         })?;
-        if rows.is_empty() {
-            return Ok(false);
-        }
-        for &(lcn, n) in runs {
-            for c in lcn..lcn + n {
-                let v = self.virtual_of(c)?;
-                for (first, count, value) in &rows {
-                    if *first <= v && v < first.saturating_add(*count) {
-                        // A count it does not hold: taken as shared.
-                        if refcount::count_of(value, v).is_none_or(|c| c > 0) {
-                            return Ok(true);
-                        }
-                    }
-                }
-            }
-        }
-        Ok(false)
+        Ok(rows)
+    }
+
+    /// Whether `rows` count more references to physical cluster `c` (a
+    /// count they do not hold is taken as more).
+    fn counted(&self, rows: &[(u64, u64, Vec<u8>)], c: u64) -> Result<bool> {
+        let v = self.virtual_of(c)?;
+        Ok(rows.iter().any(|(first, count, value)| {
+            *first <= v && v < first.saturating_add(*count) && refcount::count_of(value, v).is_none_or(|c| c > 0)
+        }))
     }
 
     /// Moves a file whose record is in its directory entry into another
@@ -3356,7 +3617,7 @@ impl<D: WriteAt> Volume<D> {
             up = self.parent_of(up)?;
         }
         let name = entry.name.as_str();
-        {
+        let committed = {
             let mut tx = Transaction::begin(&*self)?;
             let at = tx.find(Tree::Object(from), &|k| is_entry_row(k, name))?;
             let value = tx.pages[at.page].data[at.value..at.value + at.len].to_vec();
@@ -3396,9 +3657,9 @@ impl<D: WriteAt> Volume<D> {
             if target != from {
                 self.touch_directory(&mut tx, to_parent, target, now)?;
             }
-            tx.commit()?;
-        }
-        self.load()
+            tx.commit()
+        };
+        self.committed(committed)
     }
 
     /// Deletes an empty directory (also a junction or directory symbolic
@@ -3425,7 +3686,7 @@ impl<D: WriteAt> Volume<D> {
         }
         let from = self.directory_of(parent)?;
         let name = entry.name.as_str();
-        {
+        let committed = {
             let mut tx = Transaction::begin(&*self)?;
             tx.remove_row(Tree::Object(from), &|k| is_entry_row(k, name))?;
             for table in [ROOT_OBJECTS, ROOT_OBJECTS_COPY] {
@@ -3437,9 +3698,9 @@ impl<D: WriteAt> Volume<D> {
             tx.remove_row(Tree::Root(ROOT_PARENT_CHILD), &|k| k == link)?;
             tx.drop_tree(Tree::Object(oid))?;
             self.touch_directory(&mut tx, parent, from, now)?;
-            tx.commit()?;
-        }
-        self.load()
+            tx.commit()
+        };
+        self.committed(committed)
     }
 
     /// The parent of a directory (the parent-child table).
@@ -3503,7 +3764,7 @@ impl<D: WriteAt> Volume<D> {
         let mut rows: Vec<Vec<u8>> = names.iter().map(|(d, n)| link_row(*d, n)).collect();
         rows.extend(embedded_rows(&record)?);
         let record = record_with_rows(&record, &rows, names.len() as u32)?;
-        {
+        let committed = {
             let mut tx = Transaction::begin(&*self)?;
             tx.remove_row(Tree::Object(home), &|k| is_name_row(k, &name))?;
             tx.remove_row(Tree::Object(home), &|k| {
@@ -3533,9 +3794,9 @@ impl<D: WriteAt> Volume<D> {
             if target != home {
                 self.touch_directory(&mut tx, to_parent, target, now)?;
             }
-            tx.commit()?;
-        }
-        self.load()
+            tx.commit()
+        };
+        self.committed(committed)
     }
 
     /// Writes a named stream (an alternate data stream) of a file, kept in
@@ -3625,7 +3886,7 @@ impl<D: WriteAt> Volume<D> {
                 .ok_or_else(|| format_err!("{}: no stream set id left after {last:#x}", file.name))?,
         };
         let band = self.data_band(file.dir)?;
-        {
+        let committed = {
             let mut tx = Transaction::begin(&*self)?;
             let (extents, allocated) = self.write_data(&mut tx, band, &data, false)?;
             let mut rows = embedded_rows(&file.record)?;
@@ -3665,9 +3926,9 @@ impl<D: WriteAt> Volume<D> {
                 record[at..at + 8].copy_from_slice(&now.to_le_bytes());
             }
             store_in(&mut tx, &file, &record)?;
-            tx.commit()?;
-        }
-        self.load()
+            tx.commit()
+        };
+        self.committed(committed)
     }
 
     /// Deletes a named stream, as Windows does: its row, and for one in
@@ -3714,13 +3975,13 @@ impl<D: WriteAt> Volume<D> {
     /// linked file in its home (and the index entry of the name used);
     /// `free` clusters become free.
     fn store_record(&mut self, file: &FileAt, record: &[u8], free: &[u64]) -> Result<()> {
-        {
+        let committed = {
             let mut tx = Transaction::begin(&*self)?;
             tx.free_data(free)?;
             store_in(&mut tx, file, record)?;
-            tx.commit()?;
-        }
-        self.load()
+            tx.commit()
+        };
+        self.committed(committed)
     }
 
     /// Gives one name of a file whose record is a row of type 0x40 of
@@ -3745,7 +4006,7 @@ impl<D: WriteAt> Volume<D> {
         names[at] = (target, utf16_bytes(to_name));
         record[0x38..0x40].copy_from_slice(&now.to_le_bytes());
         let record = record_with_names(&record, names, rows)?;
-        {
+        let committed = {
             let mut tx = Transaction::begin(&*self)?;
             tx.remove_row(Tree::Object(dir), &|k| is_entry_row(k, &name))?;
             put_record(&mut tx, home, id, &record)?;
@@ -3760,9 +4021,9 @@ impl<D: WriteAt> Volume<D> {
             if target != dir {
                 self.touch_directory(&mut tx, to_parent, target, now)?;
             }
-            tx.commit()?;
-        }
-        self.load()
+            tx.commit()
+        };
+        self.committed(committed)
     }
 
     /// Gives a file whose record is a row of type 0x40 of directory `home`
@@ -3775,7 +4036,7 @@ impl<D: WriteAt> Volume<D> {
         names.push((target, utf16_bytes(to_name)));
         record[0x38..0x40].copy_from_slice(&now.to_le_bytes());
         let record = record_with_names(&record, names, rows)?;
-        {
+        let committed = {
             let mut tx = Transaction::begin(&*self)?;
             put_record(&mut tx, home, id, &record)?;
             let mut key = vec![ROW_NAME as u8, 0, 2, 0];
@@ -3786,9 +4047,9 @@ impl<D: WriteAt> Volume<D> {
                 &directory_key_order,
             )?;
             self.touch_directory(&mut tx, to_parent, target, now)?;
-            tx.commit()?;
-        }
-        self.load()
+            tx.commit()
+        };
+        self.committed(committed)
     }
 
     /// Removes one name of a file whose record is a row of type 0x40 of
@@ -3818,7 +4079,7 @@ impl<D: WriteAt> Volume<D> {
             .ok_or_else(|| format_err!("{parent}/{name}: no link row for the name"))?;
         names.remove(at);
         let last = names.is_empty();
-        {
+        let committed = {
             let mut tx = Transaction::begin(&*self)?;
             tx.remove_row(Tree::Object(dir), &|k| is_entry_row(k, &name))?;
             let key = record_key(id, home);
@@ -3835,9 +4096,9 @@ impl<D: WriteAt> Volume<D> {
                 put_record(&mut tx, home, id, &record_with_names(&record, names, rows)?)?;
             }
             self.touch_directory(&mut tx, &parent, dir, now)?;
-            tx.commit()?;
-        }
-        self.load()
+            tx.commit()
+        };
+        self.committed(committed)
     }
 
     /// A file by path (see `FileAt`).
@@ -4012,7 +4273,7 @@ impl<D: WriteAt> Volume<D> {
         let parent_oid = self.directory_of(parent)?;
         let security = self.shared_directory_security(parent_oid)?;
         let utf16: Vec<u8> = name.encode_utf16().flat_map(|c| c.to_le_bytes()).collect();
-        {
+        let committed = {
             let mut tx = Transaction::begin(&*self)?;
             // The object id, from the object table's counter (both copies).
             let objects = tx.root(Tree::Root(ROOT_OBJECTS))?;
@@ -4063,9 +4324,9 @@ impl<D: WriteAt> Volume<D> {
             entry[0x40..0x44].copy_from_slice(&REFS_DIRECTORY_BIT.to_le_bytes());
             tx.insert_sorted(Tree::Object(parent_oid), &row(&key, &entry, 0), &directory_key_order)?;
             self.touch_directory(&mut tx, parent, parent_oid, now)?;
-            tx.commit()?;
-        }
-        self.load()
+            tx.commit()
+        };
+        self.committed(committed)
     }
 
     /// The security descriptor reference of a directory beside or below
@@ -4122,7 +4383,7 @@ impl<D: WriteAt> Volume<D> {
         let dir = self.directory_of(parent)?;
         let entry = self.lookup(trimmed)?;
         let name = entry.name.as_str();
-        {
+        let committed = {
             let mut tx = Transaction::begin(&*self)?;
             match entry.target {
                 Target::Embedded(_) => {
@@ -4147,9 +4408,9 @@ impl<D: WriteAt> Volume<D> {
                 }
                 Target::Directory(_) => return Err(Error::Unsupported(format!("{path} is a directory"))),
             }
-            tx.commit()?;
-        }
-        self.load()
+            tx.commit()
+        };
+        self.committed(committed)
     }
 }
 
@@ -4267,6 +4528,9 @@ fn all_of(data: &dyn Source) -> Result<Vec<u8>> {
 /// The largest extent map kept in its level's value; larger ones go to a
 /// page of their own.
 const MAP_INLINE: usize = 2048;
+/// The least room of a map's node in its value (from 0x28, its rows and
+/// key index), as Windows leaves it.
+const MAP_NODE_MIN: usize = 0x70;
 /// Rows of records kept apart from the names (files moved or linked).
 const ROW_RECORD: u16 = 0x40;
 /// The sparse file attribute.
@@ -4424,6 +4688,8 @@ struct NewRecord {
     id: u64,
     security: u64,
     integrity: bool,
+    /// A sparse file: clusters of zeros stay holes.
+    sparse: bool,
     /// The directory whose table holds the record (pages of a large
     /// extent map belong to it).
     table: u64,
@@ -4559,10 +4825,15 @@ fn level_value(size: u64, allocated: u64, extents: &[(u64, u64, u64, Vec<u8>)], 
     let integrity = extents.iter().any(|x| !x.3.is_empty());
     let slots: Vec<usize> = extents.iter().map(|x| (24 + x.3.len()).next_multiple_of(8)).collect();
     let used: usize = slots.iter().sum();
-    // The node ends 8-aligned: free bytes before an odd key index.
-    let free = 4 * n % 8;
-    let index = 0x28 + used + free;
-    let mut v = vec![0u8; NODE + index + 4 * n];
+    // The node ends 8-aligned (free bytes before an odd key index), and
+    // has room for two records at least, as Windows lays out maps (0x70
+    // bytes: 0x2c free with one record, 0x10 with two, 0x48 with none):
+    // writing into a hole of a file whose map `refs` had packed tighter
+    // bugchecked Windows (0x149 in PinRow; 1.2.2 packed every map).
+    let area = (0x28 + used + 4 * n % 8 + 4 * n).max(MAP_NODE_MIN);
+    let index = area - 4 * n;
+    let free = index - (0x28 + used);
+    let mut v = vec![0u8; NODE + area];
     let put32 = |v: &mut Vec<u8>, at: usize, x: u32| v[at..at + 4].copy_from_slice(&x.to_le_bytes());
     let put64 = |v: &mut Vec<u8>, at: usize, x: u64| v[at..at + 8].copy_from_slice(&x.to_le_bytes());
     put32(&mut v, 0, NODE as u32);
@@ -4587,12 +4858,13 @@ fn level_value(size: u64, allocated: u64, extents: &[(u64, u64, u64, Vec<u8>)], 
     put32(&mut v, h + 8, free as u32);
     // Node flag 8: the key index entries carry each record's first
     // cluster in the stream (their high half); when one is past 0xffff,
-    // Windows leaves the flag out and puts 0xffff in all of them.
-    let small = extents.iter().all(|x| x.0 <= 0xffff);
+    // Windows leaves the flag out and puts 0xffff in all of them, as it
+    // does for a map without records.
+    let small = n > 0 && extents.iter().all(|x| x.0 <= 0xffff);
     v[h + 0x0c..h + 0x10].copy_from_slice(&[0, if small { 0x0e } else { 0x06 }, 0, 0]);
     put32(&mut v, h + 0x10, index as u32);
     put32(&mut v, h + 0x14, n as u32);
-    put32(&mut v, h + 0x20, (index + 4 * n) as u32);
+    put32(&mut v, h + 0x20, area as u32);
     let mut at = 0x28;
     for (i, (vcn, vlcn, clusters, sums)) in extents.iter().enumerate() {
         let r = h + at;
@@ -4742,9 +5014,9 @@ fn directory_record(parent: u64, name_utf16: &[u8], now: u64, security: u64) -> 
 }
 
 /// The single page of a new directory's tree: the header and the table
-/// descriptor of `template` (another directory's root page; the row count
-/// set to 1, the table id at 0x48 set to `oid`), and a leaf node holding
-/// the own row with `record`.
+/// descriptor of `template` (another directory's root page; its counts
+/// set to no pages below the root and 1 row, the table id at 0x48 set to
+/// `oid`), and a leaf node holding the own row with `record`.
 fn directory_page(template: &[u8], oid: u64, record: &[u8]) -> Result<Vec<u8>> {
     let h = PAGE_HEADER_SIZE + le32(template, PAGE_HEADER_SIZE) as usize;
     let size = template.len();
@@ -4756,6 +5028,9 @@ fn directory_page(template: &[u8], oid: u64, record: &[u8]) -> Result<Vec<u8>> {
     let mut p = vec![0u8; size];
     p[..h].copy_from_slice(&template[..h]);
     p[0x48..0x50].copy_from_slice(&oid.to_le_bytes());
+    // One page, one row (1.2.2 kept the parent's count of pages below its
+    // root).
+    p[PAGE_HEADER_SIZE + 0x18..PAGE_HEADER_SIZE + 0x20].fill(0);
     p[PAGE_HEADER_SIZE + 0x20..PAGE_HEADER_SIZE + 0x28].copy_from_slice(&1u64.to_le_bytes());
     let put32 = |p: &mut Vec<u8>, at: usize, x: u32| p[at..at + 4].copy_from_slice(&x.to_le_bytes());
     put32(&mut p, h, 0x28);
@@ -5072,6 +5347,80 @@ mod tests {
     fn small() -> Volume<Overlay<SparseImage>> {
         let image = SparseImage::read_from(&include_bytes!("../tests/fixtures/r314small/disk.fixture")[..]).unwrap();
         Volume::open(Overlay::new(image), 16 << 20).unwrap()
+    }
+
+    /// A file with snapshots whose live level has a cluster other files
+    /// share (a reference count more, as deduplication leaves them): an
+    /// overwrite there copies it on write (1.2.2 wrote it in place through
+    /// the snapshot path, changing the others; audit M19).
+    #[test]
+    fn shared_clusters_of_a_live_level_are_copied_on_write() {
+        let image = SparseImage::read_from(&include_bytes!("../tests/fixtures/r314feat/disk.fixture")[..]).unwrap();
+        let mut vol = Volume::open(Overlay::new(image), 16 << 20).unwrap();
+        let now = 135_900_000_000_000_000;
+        let path = "/snap/file.txt";
+        let file = vol.open_file(&vol.lookup(path).unwrap()).unwrap();
+        let crate::file::Content::Extents(x) = &file.data.as_ref().unwrap().content else {
+            panic!("inline")
+        };
+        // Cluster 0x80, its live level's own.
+        let own = x.iter().find(|x| x.vcn == 0x80).unwrap().vlcn;
+        {
+            let mut tx = Transaction::begin(&vol).unwrap();
+            tx.add_references(&[(own, 1)]).unwrap();
+            tx.commit().unwrap();
+        }
+        vol.load().unwrap();
+        let lcn = vol.translate(own).unwrap();
+        let before = vol.read_physical(lcn, 1).unwrap();
+        vol.overwrite(path, 0x80 * 4096 + 10, b"xyz", now).unwrap();
+        assert_eq!(
+            vol.read_physical(lcn, 1).unwrap(),
+            before,
+            "the shared cluster as it was"
+        );
+        let file = vol.open_file(&vol.lookup(path).unwrap()).unwrap();
+        let mut buf = [0u8; 3];
+        vol.read_stream(file.data.as_ref().unwrap(), 0x80 * 4096 + 10, &mut buf)
+            .unwrap();
+        assert_eq!(&buf, b"xyz");
+    }
+
+    /// A page in a uniform row of the medium allocator (wholly used, as
+    /// Windows packs full containers): a change that replaces it frees its
+    /// clusters while committing, the row split (1.2.2 refused: "in no
+    /// bitmap of allocator 1"; audit M19).
+    #[test]
+    fn pages_in_uniform_allocator_rows_are_freed_when_committing() {
+        let mut vol = small();
+        let now = 135_900_000_000_000_000;
+        let root = vol.object(ROOT_DIRECTORY).unwrap().clone();
+        let lcn = vol.translate(root.lcns[0]).unwrap();
+        {
+            let mut tx = Transaction::begin(&vol).unwrap();
+            let tree = Tree::Root(ROOT_MEDIUM_ALLOCATOR);
+            let at = tx
+                .find(tree, &|k| {
+                    k.len() >= 16 && le64(k, 0) <= lcn && lcn < le64(k, 0) + le64(k, 8)
+                })
+                .unwrap();
+            let v = tx.pages[at.page].data[at.value..at.value + at.len].to_vec();
+            let key = v[..16].to_vec();
+            let mut uniform = vec![0u8; 0x18];
+            uniform[..16].copy_from_slice(&key);
+            uniform[0x12..0x14].copy_from_slice(&2u16.to_le_bytes());
+            uniform[0x14..0x16].copy_from_slice(&0x200u16.to_le_bytes());
+            tx.remove_quiet(at.page, &|k| k == key.as_slice()).unwrap();
+            tx.insert_sorted(tree, &row(&key, &uniform, 0), &u64_key_order).unwrap();
+            tx.commit().unwrap();
+        }
+        vol.load().unwrap();
+        vol.create_file("/new.txt", b"hello", now).unwrap();
+        let file = vol.open_file(&vol.lookup("/new.txt").unwrap()).unwrap();
+        let mut buf = [0u8; 5];
+        vol.read_stream(file.data.as_ref().unwrap(), 0, &mut buf).unwrap();
+        assert_eq!(&buf, b"hello");
+        assert_eq!(vol.check(&[]).unwrap().problems, Vec::<String>::new());
     }
 
     /// What 1.2.1's writer could leave: a file record with a row twice (two

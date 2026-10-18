@@ -47,6 +47,30 @@ pub(crate) fn count_of(value: &[u8], v: u64) -> Option<u16> {
     }
 }
 
+/// The counts of a row's value over the virtual clusters [from, from + n)
+/// (clipped to its range): ranges [start, end) of one count.
+pub(crate) fn pieces(value: &[u8], from: u64, n: u64) -> Vec<(u64, u64, u16)> {
+    let Some((first, len)) = range(value) else {
+        return Vec::new();
+    };
+    let (start, end) = (from.max(first), from.saturating_add(n).min(first.saturating_add(len)));
+    if start >= end {
+        return Vec::new();
+    }
+    if le32(value, 0x14) != COUNTS {
+        return vec![(start, end, le16(value, 0x1c) & COUNT_MASK)];
+    }
+    let mut out: Vec<(u64, u64, u16)> = Vec::new();
+    for v in start..end {
+        let count = count_of(value, v).unwrap_or(0);
+        match out.last_mut() {
+            Some(l) if l.2 == count => l.1 = v + 1,
+            _ => out.push((v, v + 1, count)),
+        }
+    }
+    out
+}
+
 /// A kind 0 row: every cluster of (first, n) counted `count`.
 pub(crate) fn uniform_value(first: u64, n: u64, count: u16, stamp: u32) -> Vec<u8> {
     let mut v = vec![0u8; 0x20];

@@ -109,7 +109,7 @@ directory of 5000 names spanning several pages.)
 or an ancestor, would have it read once per row, or forever) and expects
 a child node's level to be one less than its parent's; it refuses a tree
 otherwise, as it does one deeper than 16 levels. `refs check` reports such
-pages. Name rows (type 0x30) need keys of 4 bytes or more, resident data
+pages, and a key twice in a table, also in two of its leaves. Name rows (type 0x30) need keys of 4 bytes or more, resident data
 (at 0x3c of its value) must lie in its value.
 
 ### Virtual clusters and the container table
@@ -222,7 +222,12 @@ below the root have no table descriptor (the u32 8 at 0x50, the node
 header at 0x58); the root's descriptor counts the table's rows (0x20)
 and the pages below the root (0x18) (**verified**: directories `refs`
 grew this way, to three levels with index pages split, read on
-Windows).
+Windows). `refs check` compares both counts with the table: every table
+of the ReFS 3.4, 3.7 and 3.14 volumes of the corpus agrees; ReFS 3.1
+counts a row more in root 11's descriptor than the table has (on all
+four of its volumes), which is not compared. A new directory's one page
+counts no page below it (1.2.2 copied its parent's count with the rest
+of the parent's descriptor: 13 for a directory of 14 pages).
 `refs` shrinks tables too: a page below the root left with less than a
 quarter of its room filled merges with a sibling when both fit in three
 quarters of a page (the later page takes the rows, the earlier one
@@ -275,7 +280,24 @@ reads back with Windows' SHA-256):
   whose single run crossed cluster 64 made ReFS fail to find the run
   (bug check 0x149 in `TmsTableSet<CmsStreamSetCallbacks>::PinRow`, a row
   not found), while the same data in runs split at 64 worked
-  (**verified**, `refs create` splits the same way).
+  (**verified**, `refs create` splits the same way). Files Windows
+  writes whole can have runs across those clusters (the corpus'
+  `r314deferred`, `/win100.bin`: one run of 0x13b clusters from cluster
+  1), so `refs check` does not ask for the split; `refs` splits every run
+  it makes, also of clusters it copies on write into a stream's live
+  level (1.2.2 joined the clusters that lay together there). The node of
+  a map in its value has room for two records at least, as Windows lays
+  it out: 0x70 bytes from its header (0x2c free with one record, 0x10
+  with two, 0x48 with none; with three or more the rows and key index
+  fill it, but for alignment), on every volume of the corpus. Windows
+  adds a record to the room the node has: when Windows wrote into a hole
+  of a sparse file whose map `refs` had packed tight (1.2.2 packed every
+  map: 0x48 bytes for one record), it bugchecked the same way (0x149 in
+  `PinRow`), three times, each time it wrote there (**verified**); so the single run of the experiment
+  above may have failed for want of room as much as for crossing cluster
+  64. `refs` leaves Windows' room (**verified**: Windows wrote into a hole
+  of such a file and appended to files of one and two records `refs`
+  made, healthy, `refsutil leak` and triage as for the untouched volume).
   Runs without the written bit or with the hole bit read as zeros
   (**verified**: a sparse file of 1 GiB with three written MiB); index
   nodes point at pages of the same. **Integrity streams**: with flag 0x80
@@ -432,7 +454,14 @@ streams in one are not changed.
 whose runs name the clusters of other files, or the same cluster many
 times: a 5 MiB file of zeros became 1280 one-cluster runs of one cluster.
 Nothing else is needed to read them (**verified**: identical text and
-random files deduplicated, and the zero file).
+random files deduplicated, and the zero file). The block reference count
+table (root 6, see "Writing") counts references, not files: a cluster
+that one file's runs name at 1022 places counts 1021 (the corpus'
+`r314feat`, `/compress/zeros.bin`), while a stream snapshot and the live
+data naming a cluster at the same place in the stream are one reference.
+`refs check` compares every count with the references the files make
+(every volume of the corpus agrees) and reports a cluster counted for
+fewer references than it has, or for more, or named by no file.
 
 ## ReFS 3.1, 3.4 and 3.7 (Windows Server 2016, 2019 and 2022)
 
@@ -644,6 +673,12 @@ table's rows for a text diff):
   stay) and commits the new times with copy on write. Appending adds
   extent records after the file's own (its record count and sizes
   grow); `refs` appends and truncates the same way (Volume::update_file).
+  What lies past a file's old end is written as new data, zeros where
+  nothing was written there: a shortened file keeps its old bytes in the
+  rest of its last cluster (the level's valid length ends before them),
+  and 1.2.2 let them reappear when the file grew past them, in place
+  and through the mount alike. Changes in place are written a MiB at a
+  time.
 * Block reference counts (root 6): rows keyed by a range of virtual
   clusters (first, count), the key being the first 16 bytes of the value
   (row size 0x830 for a value of 0x820); empty on volumes without block
@@ -816,7 +851,16 @@ table's rows for a text diff):
   and the allocated size; a clone of one is sparse too (**verified**:
   Windows read a clone `refs` made of that file, with a map of an index
   page and 44 leaves, wrote into it and deleted the source; without the
-  sparse fields it took the clone for corrupt and removed it).
+  sparse fields it took the clone for corrupt and removed it). `refs`
+  keeps a sparse file sparse when it changes it (1.2.2 wrote it anew,
+  dense and without these fields): in place, bytes written into a hole
+  take clusters unless they are zeros and the file grows by holes;
+  written whole, its clusters of zeros are holes (written whole into its
+  record, up to 1 KiB, it is no sparse file any more, as before). A
+  sparse file of zeros only has a map without records, as Windows keeps
+  one (`fsutil sparse setrange` over all of it: the node's 0x70 bytes, no
+  key deltas, flags 6; **verified**: Windows read such a file `refs` wrote
+  and wrote into it).
 * Creating a file (step `create`) adds two rows to its directory: the
   name row (type 0x30) with the embedded record, and a row of type 0x20
   (key: 0x20, flags 0x8000, the file id as u64 at 8; value: the name's
@@ -866,7 +910,26 @@ table's rows for a text diff):
   after `refs` wrote such a volume, none once it freed them. The
   4 clusters `refsutil leak` reports on every untouched volume of the
   corpus are of that kind but referenced by neither checkpoint. `refs
-  check` counts the pages awaiting free.
+  check` counts the pages awaiting free. The pages a commit by `refs`
+  replaces are free at once (`refsutil leak` counts none), but the next
+  commit, which takes the older checkpoint's slot, takes none of them
+  before its own checkpoint is down: so both checkpoints stay whole, as
+  with Windows (1.2.2 took them in the next commit, and the older
+  checkpoint was overwritten before the new one was there). `refs check`
+  also counts the clusters of data and metadata containers that the
+  allocators mark used and nothing references, on ReFS 3.14 volumes:
+  every volume of the corpus has some (152 to 180 on 4 KiB clusters: 140
+  in the area of the boot sector, the superblock, the log's control area
+  and pages made when the volume was formatted, the rest a few pages; 55
+  on 64 KiB clusters; 528 on the compressed one), so they are counted, not
+  problems, and the tests and `refs_write` fuzzing require that a change
+  adds none.
+* **A failed commit.** A write or flush that fails while committing
+  ends the change with an error, and whether its checkpoint is down is
+  not known then: the volume is read again from the disk (a change built
+  on the checkpoint before could write over the pages of the one on disk
+  and then replace it; 1.2.2 went on so). If it cannot be read, every
+  later change is refused until the volume is opened again.
 * **Several changes, one commit.** A rename that replaces a file
   (`Volume::rename_replacing`: the name there goes, with its file when it
   was the last name, and the renamed file takes it), a block clone to a new

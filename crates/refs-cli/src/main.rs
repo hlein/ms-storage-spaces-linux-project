@@ -1555,6 +1555,15 @@ fn main() -> Result<()> {
                     report.deferred_clusters
                 )?;
             }
+            if report.leaked_clusters > 0 {
+                writeln!(
+                    out,
+                    "{} clusters used that nothing the checkpoint reaches references (not a problem \
+                     by itself: Windows leaves some on every volume, among them structures made when \
+                     it was formatted; a change should not add to them)",
+                    report.leaked_clusters
+                )?;
+            }
             for p in &report.problems {
                 writeln!(out, "problem: {}", printable(p))?;
             }

@@ -122,6 +122,35 @@
   (an empty file was made first) and a named stream in clusters replaced
   (deleted first): several steps, one checkpoint
   (`Volume::in_one_commit`).
+* ReFS writes: a file shortened and then grown again (truncate, then write
+  past the end, in place or through `refs mount --rw`) read the bytes its
+  last cluster still held between the two ends; they read as zeros now. A
+  change of a sparse file wrote it anew, dense (200 MB for Windows' file of
+  100 MB) and without its sparse attribute; it keeps its holes now, and
+  written whole its clusters of zeros stay holes. A change in place read
+  the whole changed range into memory; a MiB at a time now.
+* ReFS writes, structure: a new directory took its parent's count of pages
+  below its root; clusters copied into the live level of a file with
+  snapshots were joined into runs across cluster 64 or 256 (Windows splits
+  runs there and bugchecked appending to such a run), and clusters of its
+  own that other files share were written in place; a page in a wholly used
+  allocator row could not be freed while committing (the change was
+  refused); the commit after a commit took the clusters of the pages that
+  one had replaced, overwriting the older checkpoint before its own was
+  down (both checkpoints stay whole now, as Windows keeps them); and after
+  a commit that failed the volume went on with the checkpoint before (it is
+  read again from the disk now, and refuses changes if it cannot be).
+* ReFS writes: the extent map in a file's record was packed tight (a node
+  of 0x48 bytes for one record where Windows keeps 0x70, room for two):
+  Windows writing into a hole of a sparse file `refs` had written bugchecked
+  (0x149), as it adds a record only in the room the node has. Maps have
+  Windows' room now.
+* `refs check` finds a key in two leaves of a table, descriptor counts of
+  rows and pages that are not the table's, and reference counts that are
+  not the references the files make (a cluster counted for fewer, or more,
+  or named by no file), and counts the clusters used that nothing
+  references (on ReFS 3.14; Windows leaves some on every volume, so they
+  are not problems).
 
 ### Testing
 

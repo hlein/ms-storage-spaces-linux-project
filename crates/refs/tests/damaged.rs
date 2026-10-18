@@ -358,3 +358,163 @@ fn rows_counting_past_2_64_end_the_check() {
         report.problems
     );
 }
+
+/// Where the first row of a leaf page has its key, and the key.
+fn first_key(page: &[u8]) -> Option<(usize, Vec<u8>)> {
+    let node = Node::at(page, 0x50).ok()?;
+    let row = node.rows().next()?.ok()?;
+    (node.is_leaf()).then(|| (place(page, row.key), row.key.to_vec()))
+}
+
+#[test]
+fn check_finds_descriptor_counts_off() {
+    // The root directory's descriptor counting a row more than it has: a
+    // problem `refs check` names (1.2.2 did not look; audit M19).
+    let mut forge = Forge::fixture("r314small");
+    assert_eq!(
+        forge.volume().unwrap().check(&[]).unwrap().problems,
+        Vec::<String>::new()
+    );
+    forge.patch(
+        Tree::Object(ROOT_DIRECTORY),
+        |_| true,
+        |page| {
+            let rows = le64(page, 0x50 + 0x20) + 1;
+            page[0x50 + 0x20..0x50 + 0x28].copy_from_slice(&rows.to_le_bytes());
+        },
+    );
+    let problems = forge.volume().unwrap().check(&[]).unwrap().problems;
+    assert!(
+        problems
+            .iter()
+            .any(|p| p.contains("object 0x600: its descriptor counts") && p.contains("rows")),
+        "{problems:?}"
+    );
+}
+
+#[test]
+fn check_finds_a_key_in_two_leaves() {
+    // The medium allocator's second leaf starting with the key the first
+    // ends with (a lookup finds one of the two rows; 1.2.2 compared keys
+    // within a page only; audit M19).
+    let mut forge = Forge::fixture("r314small");
+    let vol = forge.volume().unwrap();
+    let root = vol.read_page(&vol.checkpoint.roots[1], false).unwrap();
+    let node = Node::at(&root, 0x50).unwrap();
+    let leaves: Vec<Vec<u8>> = node
+        .rows()
+        .map(|r| {
+            vol.read_page(&PageRef::parse(r.unwrap().value).unwrap(), false)
+                .unwrap()
+        })
+        .collect();
+    assert_eq!(leaves.len(), 2);
+    let last = Node::at(&leaves[0], 0x50)
+        .unwrap()
+        .rows()
+        .last()
+        .unwrap()
+        .unwrap()
+        .key
+        .to_vec();
+    let (_, second) = first_key(&leaves[1]).unwrap();
+    assert_eq!(last.len(), second.len());
+    drop(vol);
+    forge.patch(
+        Tree::Root(1),
+        |page| first_key(page).is_some_and(|(_, k)| k == second),
+        |page| {
+            let (at, _) = first_key(page).unwrap();
+            page[at..at + last.len()].copy_from_slice(&last);
+        },
+    );
+    let problems = forge.volume().unwrap().check(&[]).unwrap().problems;
+    assert!(
+        problems
+            .iter()
+            .any(|p| p.contains("root 1") && p.contains("in the leaf before too")),
+        "{problems:?}"
+    );
+}
+
+#[test]
+fn check_finds_reference_counts_too_high() {
+    // Clusters three files share counted as shared by four: the counts of
+    // a row of one count raised by one (1.2.2 saw a missing count only;
+    // audit M19).
+    let mut forge = Forge::fixture("r314uniform");
+    assert_eq!(
+        forge.volume().unwrap().check(&[]).unwrap().problems,
+        Vec::<String>::new()
+    );
+    let uniform = |page: &[u8]| {
+        Node::at(page, 0x50).ok().and_then(|n| {
+            n.is_leaf()
+                .then(|| {
+                    n.rows()
+                        .flatten()
+                        .find(|r| r.value.len() == 0x20)
+                        .map(|r| place(page, r.value))
+                })
+                .flatten()
+        })
+    };
+    forge.patch(
+        Tree::Root(6),
+        |page| uniform(page).is_some(),
+        |page| {
+            let at = uniform(page).unwrap();
+            let count = le16(page, at + 0x1c) + 1;
+            for o in [0x1c, 0x1e] {
+                page[at + o..at + o + 2].copy_from_slice(&count.to_le_bytes());
+            }
+        },
+    );
+    let problems = forge.volume().unwrap().check(&[]).unwrap().problems;
+    assert!(
+        problems
+            .iter()
+            .any(|p| p.contains("referenced") && p.contains("their reference count")),
+        "{problems:?}"
+    );
+}
+
+#[test]
+fn check_counts_leaked_clusters() {
+    // A free cluster of a metadata container marked used, and nothing
+    // referencing it: one leaked cluster more (counted, not a problem:
+    // Windows leaves some on every volume).
+    let mut forge = Forge::fixture("r314small");
+    let report = forge.volume().unwrap().check(&[]).unwrap();
+    let before = report.leaked_clusters;
+    assert!(before > 0, "Windows' own");
+    let bitmap = |page: &[u8]| {
+        Node::at(page, 0x50).ok().and_then(|n| {
+            n.is_leaf()
+                .then(|| {
+                    n.rows()
+                        .flatten()
+                        .find(|r| r.value.len() > 0x18 && le16(r.value, 0x12) == 1 && le16(r.value, 0x10) > 0)
+                        .map(|r| place(page, r.value))
+                })
+                .flatten()
+        })
+    };
+    forge.patch(
+        Tree::Root(1),
+        |page| bitmap(page).is_some(),
+        |page| {
+            let at = bitmap(page).unwrap();
+            let count = le64(page, at + 8);
+            let j = (0..count)
+                .find(|&j| page[at + 0x18 + (j / 8) as usize] >> (j % 8) & 1 == 0)
+                .unwrap();
+            page[at + 0x18 + (j / 8) as usize] |= 1 << (j % 8);
+            let free = le16(page, at + 0x10) - 1;
+            page[at + 0x10..at + 0x12].copy_from_slice(&free.to_le_bytes());
+        },
+    );
+    let report = forge.volume().unwrap().check(&[]).unwrap();
+    assert_eq!(report.problems, Vec::<String>::new());
+    assert_eq!(report.leaked_clusters, before + 1);
+}

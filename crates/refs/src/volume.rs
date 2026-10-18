@@ -82,6 +82,14 @@ pub struct Volume<D> {
     /// A checkpoint the writer holds back while several changes become
     /// one commit (`Volume::in_one_commit`).
     pub(crate) held: std::sync::Mutex<Option<Held>>,
+    /// The clusters of the pages the last commit through this value
+    /// replaced or dropped: the older checkpoint still names them, so the
+    /// next commit takes none of them (as Windows keeps them until its next
+    /// checkpoint takes the older one's slot).
+    pub(crate) retired: std::sync::Mutex<HashSet<u64>>,
+    /// A commit failed and the volume could not be read again: what is on
+    /// disk is not known, and changes are refused.
+    pub(crate) unread: std::sync::atomic::AtomicBool,
 }
 
 /// The commit several changes make together, until its checkpoint is
@@ -99,6 +107,9 @@ pub(crate) struct Held {
     /// The clusters they freed, which the checkpoint on disk may still
     /// use: nothing takes them before the commit.
     pub freed: std::collections::HashSet<u64>,
+    /// The clusters of the pages they replaced or dropped (`retired` once
+    /// the checkpoint is written).
+    pub retiring: std::collections::HashSet<u64>,
 }
 
 /// A decompressed unit: (container, range, unit), its bytes.
@@ -174,6 +185,8 @@ impl<D: ReadAt> Volume<D> {
             compacted: BTreeMap::new(),
             units: std::sync::Mutex::new(Vec::new()),
             held: std::sync::Mutex::new(None),
+            retired: Default::default(),
+            unread: Default::default(),
         };
         vol.load()?;
         Ok(vol)
@@ -322,6 +335,19 @@ impl<D: ReadAt> Volume<D> {
     /// the older checkpoint's checksums. Tables both checkpoints reference
     /// alike are not walked.
     pub fn deferred_pages(&self) -> Result<Vec<(usize, Vec<u64>)>> {
+        let mut allocators = BTreeMap::new();
+        for a in [1, 2, 12] {
+            allocators.insert(a, crate::check::Allocator::read(self, a)?);
+        }
+        let mut pages = self.older_pages()?;
+        pages.retain(|(a, lcns)| lcns.iter().all(|&c| allocators[a].used(c)));
+        Ok(pages)
+    }
+
+    /// The pages only the older checkpoint references (see
+    /// `deferred_pages`), allocated or not: by allocator, their physical
+    /// clusters.
+    pub(crate) fn older_pages(&self) -> Result<Vec<(usize, Vec<u64>)>> {
         use std::collections::HashSet;
         let Some(old) = self.older_checkpoint().filter(|_| !self.v1) else {
             return Ok(Vec::new());
@@ -361,10 +387,6 @@ impl<D: ReadAt> Volume<D> {
         if objects.is_err() {
             return Ok(Vec::new());
         }
-        let mut allocators = BTreeMap::new();
-        for a in [1, 2, 12] {
-            allocators.insert(a, crate::check::Allocator::read(self, a)?);
-        }
         let mut out = Vec::new();
         for (root, old_root, current) in tables {
             let physical = matches!(root, Some(7 | 8 | 12));
@@ -380,9 +402,7 @@ impl<D: ReadAt> Volume<D> {
                     .iter()
                     .map(|&l| if physical { Ok(l) } else { self.translate(l) })
                     .collect::<Result<Vec<_>>>()?;
-                if lcns.iter().all(|&c| allocators[&allocator(root)].used(c)) {
-                    out.push((allocator(root), lcns));
-                }
+                out.push((allocator(root), lcns));
             }
         }
         Ok(out)

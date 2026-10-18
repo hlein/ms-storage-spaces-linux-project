@@ -4,8 +4,8 @@
 //! and deduplicated, its stored bytes
 //! patched by the start of the input (as in refs_volume), then the
 //! operations the rest of the input picks (times, attributes, overwriting,
-//! creating, writing, changing in place, renaming, moving, linking,
-//! cloning and deleting files and
+//! creating, writing, changing in place, truncating, renaming, moving,
+//! linking, cloning and deleting files and
 //! directories, also through the names those operations give, writing and
 //! deleting named streams) on a
 //! writable overlay. Fuzzing builds accept every checksum. Whatever
@@ -13,7 +13,9 @@
 //! the volume; on the unpatched fixture, whatever the operations, the
 //! volume must check clean afterwards (refs check, which since 1.2.2 also
 //! finds a key twice in a page or record and named streams whose stream
-//! set has no rows).
+//! set has no rows, and since 1.3 a key in two leaves, descriptor counts
+//! that are not the table's and reference counts that are not the
+//! references') and leak no cluster the fixture did not.
 #![no_main]
 
 use std::sync::LazyLock;
@@ -30,6 +32,9 @@ static BASES: LazyLock<[SparseImage; 2]> = LazyLock::new(|| {
     .map(|f| SparseImage::read_from(f).unwrap())
 });
 const OFFSET: u64 = 16 << 20;
+/// The clusters each fixture leaks as Windows left it.
+static LEAKED: LazyLock<[u64; 2]> =
+    LazyLock::new(|| [0, 1].map(|i| Volume::open(&BASES[i], OFFSET).unwrap().check(&[]).unwrap().leaked_clusters));
 const PATHS: [&str; 14] = [
     "/small.txt",
     "/mid.bin",
@@ -90,7 +95,23 @@ fuzz_target!(|data: &[u8]| {
             1 => vol.set_attributes(path, n as u32),
             2 => vol.overwrite(path, (n % 4096) as u64, &arg[..arg.len().min(3)], now),
             3 => vol.create_file(path, &vec![0x5a; n % 6000], now),
-            4 if n % 2 == 0 => vol.write_file(path, &vec![0xa5; n % 9000], now),
+            4 if n % 3 == 0 => vol.write_file(path, &vec![0xa5; n % 9000], now),
+            4 if n % 3 == 1 => {
+                // Truncated, in place.
+                let data = vol
+                    .lookup(path)
+                    .and_then(|e| vol.open_file(&e))
+                    .ok()
+                    .and_then(|f| f.data)
+                    .map(|s| {
+                        let mut b = vec![0u8; (s.size as usize).min(1 << 20)];
+                        let _ = vol.read_stream(&s, 0, &mut b);
+                        b.truncate(n % (b.len() + 1));
+                        b
+                    })
+                    .unwrap_or_default();
+                vol.update_file(path, &data.as_slice(), &[], now)
+            }
             4 => {
                 // The file's data, appended to and patched, changed in place.
                 let mut data = vol
@@ -129,5 +150,12 @@ fuzz_target!(|data: &[u8]| {
     if patch_bytes.is_empty() {
         let report = vol.check(&[]).unwrap();
         assert!(report.problems.is_empty(), "{:?}", report.problems);
+        let leaked = LEAKED[usize::from(patches >> 7)];
+        assert!(
+            report.leaked_clusters <= leaked,
+            "{} clusters leaked, the fixture {leaked}: {:x?}",
+            report.leaked_clusters,
+            report.leaks
+        );
     }
 });

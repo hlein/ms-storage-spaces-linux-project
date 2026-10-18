@@ -749,7 +749,12 @@ kept in an unlinked temporary file, in `$REFS_TMPDIR` or the system's
 temporary directory; when it is closed or synced, what was written goes
 to the volume as Windows writes it: changed bytes where they are,
 appended data in new runs, a shortened file's tail freed, the touched
-clusters of an integrity stream copied on write; a file in its record,
+clusters of an integrity stream copied on write; what lies past a file's
+old end reads as zeros where nothing was written there, also after it
+was shortened and grown again (1.2.2 let the bytes it held there come
+back); a sparse file keeps its holes (bytes written into one take
+clusters unless they are zeros; written whole, its clusters of zeros
+stay holes; 1.2.2 wrote it dense); a file in its record,
 a new or truncated file and a file Windows compressed are written
 whole), copies (a whole file copied
 into an empty one with copy_file_range, as coreutils 9 `cp` and file
@@ -767,7 +772,11 @@ in one change and renamed in the next); so are a block clone to a new
 name and a named stream in clusters replaced. A file is created when it
 is opened and its data written when it is closed, two changes as on other
 file systems: a crash between them leaves it empty. A change `refs`
-refuses (a name that is not printable ASCII, for now) changes nothing. A request that stops on an internal error (a defect of `refs` that
+refuses (a name that is not printable ASCII, for now) changes nothing.
+A change whose writes fail on the disk reports the error, and the volume
+is read again from the disk (its checkpoint may be down or not); if that
+fails too, every later change is refused until the volume is mounted or
+opened again. A request that stops on an internal error (a defect of `refs` that
 the volume reaches) fails with EIO and the mount goes on, read-only or
 not; after one inside a change, the volume in memory may be half changed,
 so every later request fails with EIO: unmount it (the volume on disk is
@@ -872,7 +881,23 @@ created in a directory with
 integrity streams have them too.
 
 It writes the way Windows does (copy on write, then a new checkpoint), so
-an interruption leaves the volume as it was before.
+an interruption leaves the volume as it was before; both checkpoints stay
+whole, as Windows keeps them: a commit takes none of the clusters of the
+pages the commit before it replaced (1.2.2 took them, overwriting the
+older checkpoint).
+
+`refs check` reads the whole volume: every page the checkpoint reaches
+(its checksum, its rows, its clusters used in its allocator), every table
+(no key twice, also across its pages; the counts of rows and pages in its
+descriptor those it has), every file (its clusters used; a cluster
+referenced several times, by block clones or deduplication, counted so in
+the block reference count table, and no count for one referenced once or
+not at all) and the compressed containers, and exits 1 on a problem. It
+also counts the pages only the older checkpoint references (Windows frees
+them with its next checkpoint) and, on ReFS 3.14 volumes, the clusters
+used that nothing references; Windows leaves some on every volume (about
+150 on a small one), so they are no problem by themselves, but a change by
+`refs` should not add to them.
 
 Read: files (resident, in extents, sparse, block-cloned, deduplicated),
 directories of any size, named streams, stream snapshots (`refsutil

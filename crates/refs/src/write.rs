@@ -29,7 +29,7 @@ use crate::node::Node;
 use crate::page::{PAGE_HEADER_SIZE, PageRef, store_reference};
 use crate::refcount;
 use crate::util::{le16, le32, le64, utf16};
-use crate::volume::{ROOT_DIRECTORY, ROOT_OBJECTS, Volume};
+use crate::volume::{Held, ROOT_DIRECTORY, ROOT_OBJECTS, Volume};
 
 const ROOT_MEDIUM_ALLOCATOR: usize = 1;
 const ROOT_CONTAINER_ALLOCATOR: usize = 2;
@@ -174,12 +174,21 @@ impl<'v, D: WriteAt> Transaction<'v, D> {
     }
 
     fn new(vol: &'v Volume<D>) -> Self {
+        // Within one commit of several changes, what the earlier ones freed
+        // the checkpoint on disk may still use.
+        let freed = vol
+            .held
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .map(|h| h.freed.clone())
+            .unwrap_or_default();
         Transaction {
             vol,
             pages: Vec::new(),
             loaded: HashMap::new(),
             roots: HashMap::new(),
-            freed: Default::default(),
+            freed,
             committing: false,
             handed_out: Vec::new(),
         }
@@ -1620,8 +1629,15 @@ impl<'v, D: WriteAt> Transaction<'v, D> {
                 self.pages[i].new = Some(new);
             }
         }
-        // Headers: the page's new virtual clusters and the new clock.
-        let clock = vol.checkpoint.clock + 1;
+        // Headers: the page's new virtual clusters and the new clock (that
+        // of the commit held back, for several changes made one).
+        let held = vol
+            .held
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .map(|h| (h.clock, h.generation, h.slot, h.page.clone()));
+        let clock = held.as_ref().map_or(vol.checkpoint.clock + 1, |h| h.0);
         let mut names = HashMap::new();
         for (i, p) in self.pages.iter_mut().enumerate().filter(|(_, p)| p.dirty) {
             let new = p.new.as_ref().unwrap();
@@ -1672,12 +1688,18 @@ impl<'v, D: WriteAt> Transaction<'v, D> {
         }
         vol.dev.flush()?;
         let current = vol.checkpoint.lcn;
-        let slot = *vol
-            .checkpoint_lcns
-            .iter()
-            .find(|&&l| l != current)
-            .ok_or_else(|| format_err!("one checkpoint slot only"))?;
-        let mut new = vol.read_physical(current, 1)?;
+        let slot = match &held {
+            Some(h) => h.2,
+            None => *vol
+                .checkpoint_lcns
+                .iter()
+                .find(|&&l| l != current)
+                .ok_or_else(|| format_err!("one checkpoint slot only"))?,
+        };
+        let mut new = match held.as_ref().and_then(|h| h.3.clone()) {
+            Some(page) => page,
+            None => vol.read_physical(current, 1)?,
+        };
         for (tree, &i) in &self.roots {
             if let Tree::Root(r) = tree
                 && self.pages[i].dirty
@@ -1689,7 +1711,7 @@ impl<'v, D: WriteAt> Transaction<'v, D> {
         }
         new[0x10..0x18].copy_from_slice(&clock.to_le_bytes());
         new[0x60..0x68].copy_from_slice(&clock.to_le_bytes());
-        let generation = le64(&new, 0x68) + 1;
+        let generation = held.as_ref().map_or(le64(&new, 0x68) + 1, |h| h.1);
         new[0x68..0x70].copy_from_slice(&generation.to_le_bytes());
         for k in 0..4 {
             let l = if k == 0 { slot } else { 0 };
@@ -1703,6 +1725,14 @@ impl<'v, D: WriteAt> Transaction<'v, D> {
             .ok_or_else(|| format_err!("checkpoint reference outside the page"))?
             .fill(0);
         store_reference(&mut new[own..own + own_size], &[slot], &zeroed)?;
+        // Held back: the next change builds on it, the last writes it.
+        if held.is_some() {
+            let mut h = vol.held.lock().unwrap_or_else(|e| e.into_inner());
+            let h = h.as_mut().ok_or_else(|| format_err!("the held commit went"))?;
+            h.page = Some(new);
+            h.freed.extend(self.freed.iter().copied());
+            return Ok(());
+        }
         vol.write_clusters(slot, &new)?;
         vol.dev.flush()?;
         let _ = vol.own_since.compare_exchange(
@@ -1755,6 +1785,60 @@ fn clusters_of(runs: &[(u64, u64)]) -> Vec<u64> {
 const SETTABLE_ATTRIBUTES: u32 = 0x1 | 0x2 | 0x4 | 0x20 | 0x100 | 0x1000 | 0x2000;
 
 impl<D: WriteAt> Volume<D> {
+    /// Makes the changes `change` makes one commit: they write their pages
+    /// as ever, but the checkpoint stays back until the last is made, so
+    /// that a crash leaves the volume as it was before or after all of
+    /// them; if one fails, the volume stays as it was (what they wrote
+    /// lies where the checkpoint on disk does not reach). Inside another
+    /// such call, `change` just runs.
+    pub fn in_one_commit<T>(&mut self, change: impl FnOnce(&mut Self) -> Result<T>) -> Result<T> {
+        {
+            let mut held = self.held.lock().unwrap_or_else(|e| e.into_inner());
+            if held.is_some() {
+                drop(held);
+                return change(self);
+            }
+            let current = self.checkpoint.lcn;
+            let slot = *self
+                .checkpoint_lcns
+                .iter()
+                .find(|&&l| l != current)
+                .ok_or_else(|| format_err!("one checkpoint slot only"))?;
+            let page = self.read_physical(current, 1)?;
+            *held = Some(Held {
+                clock: self.checkpoint.clock + 1,
+                generation: le64(&page, 0x68) + 1,
+                slot,
+                page: None,
+                freed: Default::default(),
+            });
+        }
+        let result = change(self);
+        let held = self.held.lock().unwrap_or_else(|e| e.into_inner()).take();
+        let held = held.ok_or_else(|| format_err!("the held commit went"))?;
+        let value = match result {
+            Ok(value) => value,
+            Err(e) => {
+                self.load()?;
+                return Err(e);
+            }
+        };
+        if let Some(page) = held.page {
+            // The pages are on disk first, then the checkpoint naming them.
+            self.dev.flush()?;
+            self.write_clusters(held.slot, &page)?;
+            self.dev.flush()?;
+            let _ = self.own_since.compare_exchange(
+                0,
+                held.clock,
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
+        self.load()?;
+        Ok(value)
+    }
+
     /// Sets a file's four times (FILETIME).
     pub fn set_times(&mut self, path: &str, times: &Times) -> Result<()> {
         self.change_record(path, |v| {
@@ -2825,7 +2909,13 @@ impl<D: WriteAt> Volume<D> {
     /// Small files (data in the record) are copied instead. Named streams
     /// are not cloned; `from` must not have snapshots, and both must be
     /// integrity streams or neither.
+    /// One commit: a `to` made for it and the clone (1.2.2 made the empty
+    /// file one change and the clone another).
     pub fn clone_file(&mut self, from: &str, to: &str, now: u64) -> Result<()> {
+        self.in_one_commit(|v| v.clone_file_into(from, to, now))
+    }
+
+    fn clone_file_into(&mut self, from: &str, to: &str, now: u64) -> Result<()> {
         // Its runs inside the volume (as for any file changed).
         self.file_at(from)?;
         let source = self.open_file(&self.lookup(from)?)?;
@@ -3138,6 +3228,49 @@ impl<D: WriteAt> Volume<D> {
         self.load()
     }
 
+    /// Renames or moves `path` to the path `to`, replacing what `to` names,
+    /// in one commit: the name there goes (with its file when it was the
+    /// last name), and `path` takes its place, as `rename(2)` does and
+    /// Windows' rename with replacing. Both are files, or both directories
+    /// (the one replaced empty); a `to` that names `path` itself (its name
+    /// in another case) is only a rename. 1.2.2 had no such change: the
+    /// mount deleted the target in one and renamed in the next, and a crash
+    /// between left the target deleted and the source where it was.
+    pub fn rename_replacing(&mut self, path: &str, to: &str, now: u64) -> Result<()> {
+        let (path, to) = (path.trim_end_matches('/'), to.trim_end_matches('/'));
+        let parent = |p: &str| p.rsplit_once('/').map_or("", |(parent, _)| parent).to_string();
+        let to_name = to.rsplit_once('/').map_or(to, |(_, name)| name).to_string();
+        self.in_one_commit(|v| {
+            let source = v.lookup(path)?;
+            let same_dir = v.directory_of(&parent(path))? == v.directory_of(&parent(to))?;
+            match v.lookup(to) {
+                // The source itself: only the case of its name changes.
+                Ok(target) if same_dir && target.name == source.name => {}
+                Ok(target) => {
+                    let dirs = (
+                        matches!(source.target, Target::Directory(_)),
+                        matches!(target.target, Target::Directory(_)),
+                    );
+                    if dirs.0 != dirs.1 {
+                        return Err(Error::Unsupported(format!(
+                            "{to}: replacing a {} by a {}",
+                            if dirs.1 { "directory" } else { "file" },
+                            if dirs.0 { "directory" } else { "file" }
+                        )));
+                    }
+                    v.delete_file(to, now)?;
+                }
+                Err(Error::NotFound(_)) => {}
+                Err(e) => return Err(e),
+            }
+            if same_dir {
+                v.rename(path, &to_name, now)
+            } else {
+                v.move_file(path, to, now)
+            }
+        })
+    }
+
     /// Whether any cluster of these physical runs has other references
     /// (block clones, deduplication): the block reference count table
     /// (root 6) has rows keyed by first virtual cluster and count whose
@@ -3180,36 +3313,6 @@ impl<D: WriteAt> Volume<D> {
             return self.move_directory(path, to, now);
         }
         self.split_file(path, to, false, now)
-    }
-
-    /// What `rename` and `move_file` of `path` to `to` check before they
-    /// write, but that `to` is free: whoever replaces `to` deletes it
-    /// first, and checks this before (a move refused after that would
-    /// leave neither).
-    pub fn check_move(&self, path: &str, to: &str) -> Result<()> {
-        self.writable_version()?;
-        let entry = self.lookup(path.trim_end_matches('/'))?;
-        let to = to.trim_end_matches('/');
-        let (to_parent, to_name) = to.rsplit_once('/').unwrap_or(("", to));
-        check_name(to_name)?;
-        let target = self.directory_of(to_parent)?;
-        let Target::Directory(oid) = entry.target else {
-            return self.file_at(path).map(drop);
-        };
-        if entry.attributes & 0x400 != 0 || oid == ROOT_DIRECTORY {
-            return Err(Error::Unsupported(format!("{path}: a junction or the root")));
-        }
-        let mut up = target;
-        for _ in 0..4096 {
-            if up == oid {
-                return Err(Error::Unsupported(format!("{path}: moving a directory below itself")));
-            }
-            if up == ROOT_DIRECTORY {
-                break;
-            }
-            up = self.parent_of(up)?;
-        }
-        Ok(())
     }
 
     /// Moves or renames a directory, as Windows does: its entry (times
@@ -3440,7 +3543,13 @@ impl<D: WriteAt> Volume<D> {
     /// place of a stream of that name (compared without case; it keeps its
     /// name); the file's modification, change and access times become
     /// `now`.
+    /// One commit, also where a stream in clusters is replaced (1.2.2
+    /// deleted it in one change and wrote the new one in another).
     pub fn write_stream(&mut self, path: &str, stream: &str, data: &[u8], now: u64) -> Result<()> {
+        self.in_one_commit(|v| v.write_stream_now(path, stream, data, now))
+    }
+
+    fn write_stream_now(&mut self, path: &str, stream: &str, data: &[u8], now: u64) -> Result<()> {
         check_name(stream)?;
         if data.len() as u64 > MAX_CREATED {
             return Err(Error::Unsupported(format!("streams of more than {MAX_CREATED} bytes")));

@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex};
 use refs::node::Node;
 use refs::page::{PAGE_HEADER_SIZE, PageRef};
 use refs::volume::{ROOT_DIRECTORY, SUPERBLOCK_LCN};
-use refs::{Times, Volume};
+use refs::{Target, Times, Volume};
 use storage_spaces::io::{DeviceEvent, Overlay, ReadAt, Recorder, SparseImage};
 
 /// A fixture, its manifest and the objects it leaves out.
@@ -1370,45 +1370,123 @@ fn deleting_named_streams_in_clusters() {
     assert_pages_valid(&vol, &skip, "streams");
 }
 
+/// Every file of the root and /dir: its name, size and a digest of its data
+/// and named streams.
+fn contents<D: ReadAt>(vol: &Volume<D>) -> Vec<(String, u64, u64)> {
+    use std::hash::{Hash, Hasher};
+    let mut out = Vec::new();
+    for (dir, prefix) in [(ROOT_DIRECTORY, ""), (vol_dir(vol, "/dir"), "dir/")] {
+        for e in vol.read_dir(dir).unwrap() {
+            if matches!(e.target, Target::Directory(_)) {
+                continue;
+            }
+            let file = vol.open_file(&e).unwrap();
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            let named = file.streams.iter().map(|(n, s)| (n.as_str(), s));
+            for (name, stream) in file.data.iter().map(|s| ("", s)).chain(named) {
+                let mut buf = vec![0u8; stream.size as usize];
+                assert_eq!(vol.read_stream(stream, 0, &mut buf).unwrap(), buf.len());
+                (name, buf).hash(&mut h);
+            }
+            out.push((format!("{prefix}{}", e.name), e.size, h.finish()));
+        }
+    }
+    out.sort();
+    out
+}
+
 #[test]
 fn interrupted_writes_leave_the_old_or_the_new_volume() {
     // Each operation's writes, replayed up to every point (and the last
     // write torn in half), as a power cut would leave them: the volume
-    // opens as it was before or, once the checkpoint is down, after.
+    // opens as it was before or, once the checkpoint is down, after, its
+    // names and what its files hold. The changes that took two commits in
+    // 1.2.2 among them: a rename over an existing file (the mount deleted
+    // the target first), a clone to a new name (an empty file first) and
+    // a stream in clusters replaced (deleted first).
     let (image, manifest, skip) = load("r314small");
     let offset = manifest["partition_offset"].as_u64().unwrap();
     let now = 134_400_000_000_000_000;
     let big: Vec<u8> = (0..300_000u32).map(|i| (i % 251) as u8).collect();
-    type Op<'a> = Box<dyn Fn(&mut Volume<&Recorder<&Overlay<&SparseImage>>>) + 'a>;
-    let ops: Vec<(&str, Op)> = vec![
-        ("create", Box::new(|v| v.create_file("/new.bin", &big, now).unwrap())),
-        ("mkdir", Box::new(move |v| v.create_directory("/made", now).unwrap())),
-        ("delete", Box::new(move |v| v.delete_file("/mid.bin", now).unwrap())),
+    type Vol<'a> = Volume<&'a Overlay<&'a Overlay<&'a SparseImage>>>;
+    type Op<'a> = Box<dyn Fn(&mut Volume<&Recorder<&Overlay<&Overlay<&SparseImage>>>>) + 'a>;
+    type Setup<'a> = Box<dyn Fn(&mut Volume<&Overlay<&SparseImage>>) + 'a>;
+    let none = || -> Setup { Box::new(|_| {}) };
+    let ops: Vec<(&str, Setup, Op)> = vec![
+        (
+            "create",
+            none(),
+            Box::new(|v| v.create_file("/new.bin", &big, now).unwrap()),
+        ),
+        (
+            "mkdir",
+            none(),
+            Box::new(move |v| v.create_directory("/made", now).unwrap()),
+        ),
+        (
+            "delete",
+            none(),
+            Box::new(move |v| v.delete_file("/mid.bin", now).unwrap()),
+        ),
         (
             "link",
+            none(),
             Box::new(move |v| v.link_file("/last.txt", "/dir/l.txt", now).unwrap()),
         ),
         (
             "stream",
+            none(),
             Box::new(move |v| v.write_stream("/small.txt", "s", b"stream", now).unwrap()),
         ),
+        (
+            "rename over a file",
+            none(),
+            Box::new(move |v| v.rename_replacing("/small.txt", "/last.txt", now).unwrap()),
+        ),
+        (
+            "rename over a file in clusters",
+            none(),
+            Box::new(move |v| v.rename_replacing("/small.txt", "/mid.bin", now).unwrap()),
+        ),
+        (
+            "move over a file",
+            none(),
+            Box::new(move |v| v.rename_replacing("/mid.bin", "/dir/inner.txt", now).unwrap()),
+        ),
+        (
+            "clone to a new name",
+            Box::new(|v| v.create_file("/big.bin", &big, now).unwrap()),
+            Box::new(move |v| v.clone_file("/big.bin", "/clone.bin", now).unwrap()),
+        ),
+        (
+            "replace a stream in clusters",
+            Box::new(move |v| v.write_stream("/small.txt", "s", &[5u8; 20_000], now).unwrap()),
+            Box::new(move |v| v.write_stream("/small.txt", "s", &[6u8; 30_000], now).unwrap()),
+        ),
+        (
+            "replace a stream in clusters by one inline",
+            Box::new(move |v| v.write_stream("/small.txt", "s", &[5u8; 20_000], now).unwrap()),
+            Box::new(move |v| v.write_stream("/small.txt", "s", b"x", now).unwrap()),
+        ),
     ];
-    let listing = |vol: &Volume<&Overlay<&SparseImage>>| {
+    let state = |vol: &Vol<'_>| {
         let mut names: Vec<String> = Vec::new();
         for dir in [ROOT_DIRECTORY, vol_dir(vol, "/dir")] {
             names.extend(vol.read_dir(dir).unwrap().into_iter().map(|e| e.name));
         }
         names.sort();
-        names
+        (names, vol.checkpoint.clock, contents(vol))
     };
-    for (what, op) in ops {
-        let overlay = Overlay::new(&image);
+    for (what, setup, op) in ops {
+        let base = Overlay::new(&image);
+        setup(&mut Volume::open(&base, offset).unwrap());
+        let overlay = Overlay::new(&base);
         let log = Arc::new(Mutex::new(Vec::new()));
         let dev = Recorder::new(&overlay, 0, log.clone());
         let mut vol = Volume::open(&dev, offset).unwrap();
-        let before = (listing(&Volume::open(&overlay, offset).unwrap()), vol.checkpoint.clock);
+        let before = state(&Volume::open(&overlay, offset).unwrap());
         op(&mut vol);
-        let after = (listing(&Volume::open(&overlay, offset).unwrap()), vol.checkpoint.clock);
+        let after = state(&Volume::open(&overlay, offset).unwrap());
         assert_ne!(before, after, "{what}: changed something");
         let writes: Vec<(u64, Arc<[u8]>)> = log
             .lock()
@@ -1424,7 +1502,7 @@ fn interrupted_writes_leave_the_old_or_the_new_volume() {
                 if torn && k == writes.len() {
                     continue;
                 }
-                let replay = Overlay::new(&image);
+                let replay = Overlay::new(&base);
                 for (at, data) in &writes[..k] {
                     storage_spaces::io::WriteAt::write_all_at(&replay, data, *at).unwrap();
                 }
@@ -1439,21 +1517,22 @@ fn interrupted_writes_leave_the_old_or_the_new_volume() {
                         if torn { " and half" } else { "" }
                     )
                 });
-                let state = (listing(&vol), vol.checkpoint.clock);
+                let now = state(&vol);
                 assert!(
-                    state == before || state == after,
-                    "{what}: {k} of {} writes: neither the old nor the new volume",
-                    writes.len()
+                    now == before || now == after,
+                    "{what}: {k} of {} writes{}: neither the old nor the new volume",
+                    writes.len(),
+                    if torn { " and half" } else { "" }
                 );
                 // New once the checkpoint is down (a torn checkpoint whose
                 // written half holds all that differs counts as down).
                 let down = k == writes.len() || (torn && k + 1 == writes.len());
                 assert!(
-                    down || state == before,
+                    down || now == before,
                     "{what}: new after {k} of {} writes",
                     writes.len()
                 );
-                assert!(k < writes.len() || state == after, "{what}: old after all writes");
+                assert!(k < writes.len() || now == after, "{what}: old after all writes");
                 if k % 7 == 0 || k + 1 >= writes.len() {
                     assert_pages_valid(&vol, &skip, what);
                     assert_allocated(&vol, &skip, what);
@@ -2010,10 +2089,14 @@ fn cloning_files() {
     let (counts, total) = reference_counts(&vol);
     assert_eq!(total, 74, "300 000 bytes: 74 clusters, one reference more each");
     assert!(counts.iter().all(|&(_, c)| c == 1));
-    assert_eq!(
-        used(&vol, 1).difference(&used_once).count(),
-        0,
-        "no data clusters taken"
+    // No data clusters taken: what is used now and was not before are
+    // clusters of pages (one commit of two steps, the new file and the
+    // clone, gives the pages it changes twice clusters not used before).
+    let page_clusters: BTreeSet<u64> = pages(&vol, &skip).into_iter().map(|(c, _)| c).collect();
+    let more: Vec<u64> = used(&vol, 1).difference(&used_once).copied().collect();
+    assert!(
+        more.iter().all(|c| page_clusters.contains(c)),
+        "data clusters taken: {more:x?}"
     );
     assert_pages_valid(&vol, &skip, "cloned");
     // A third copy into an existing empty file; then the copies go.

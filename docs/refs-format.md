@@ -867,6 +867,22 @@ table's rows for a text diff):
   4 clusters `refsutil leak` reports on every untouched volume of the
   corpus are of that kind but referenced by neither checkpoint. `refs
   check` counts the pages awaiting free.
+* **Several changes, one commit.** A rename that replaces a file
+  (`Volume::rename_replacing`: the name there goes, with its file when it
+  was the last name, and the renamed file takes it), a block clone to a new
+  name (the empty file made for it, then the clone) and a named stream in
+  clusters replaced (the old one deleted, the new one written) are each one
+  commit since 1.3 (`Volume::in_one_commit`): every step writes its pages
+  as a transaction of its own, but its checkpoint stays in memory, the next
+  step builds on it, nothing takes the clusters the steps freed (the
+  checkpoint on disk may still use them), and the last step writes one
+  checkpoint, of one clock and generation more. A crash before that leaves
+  the volume as it was, one after it as after all of them (test
+  `interrupted_writes_leave_the_old_or_the_new_volume`, every write prefix
+  and torn write; 1.2.2 left the target deleted, an empty clone or no
+  stream in between). Windows attached such a volume healthy, read every
+  file and the replaced stream as written, and `refsutil leak` found only
+  the 4 clusters of the untouched volume (2026-10-18).
 
 ## The log (MLog)
 

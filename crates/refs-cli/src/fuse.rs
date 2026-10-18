@@ -769,10 +769,9 @@ impl RefsFs {
     }
 
     /// Renames `from` to `to` (paths), replacing what `to` names unless
-    /// `flags` say otherwise. Replacing takes two changes (the target is
-    /// deleted, then the source renamed): everything the rename checks is
-    /// checked before the first, so that a refused rename leaves the
-    /// target (1.2.1 deleted it, then the library refused the new name).
+    /// `flags` say otherwise, in one change (`Volume::rename_replacing`):
+    /// a crash leaves the target or the renamed file, never neither (1.2.2
+    /// deleted the target in one change and renamed in the next).
     fn rename_paths(&self, from: &str, to: &str, flags: RenameFlags) -> Result<(), Errno> {
         if flags.contains(RenameFlags::RENAME_EXCHANGE) {
             return Err(Errno::EINVAL);
@@ -791,20 +790,16 @@ impl RefsFs {
                 if source.is_dir() != target.is_dir() {
                     return Err(if target.is_dir() { Errno::EISDIR } else { Errno::ENOTDIR });
                 }
-                if !self.writable {
-                    return Err(Errno::EROFS);
-                }
-                self.vol.read_ok().check_move(from, to).map_err(|e| errno(to, e))?;
-                self.change(to, |v| v.delete_file(to, now()))?;
-                self.changed(Some(to));
             }
-        }
-        let (from_dir, _) = split(from);
-        let (to_dir, to_name) = split(to);
-        if from_dir == to_dir {
-            self.change(from, |v| v.rename(from, to_name, now()))?;
+            self.change(from, |v| v.rename_replacing(from, to, now()))?;
         } else {
-            self.change(from, |v| v.move_file(from, to, now()))?;
+            let (from_dir, _) = split(from);
+            let (to_dir, to_name) = split(to);
+            if from_dir == to_dir {
+                self.change(from, |v| v.rename(from, to_name, now()))?;
+            } else {
+                self.change(from, |v| v.move_file(from, to, now()))?;
+            }
         }
         self.moved(from, to);
         Ok(())
@@ -1915,6 +1910,22 @@ mod tests {
         fs.rename_paths("/names/plain.txt", "/names/with spaces.txt", RenameFlags::empty())
             .unwrap();
         let vol = fs.vol.read_ok();
+        assert!(vol.lookup("/names/plain.txt").is_err());
+        assert_eq!(vol.lookup("/names/with spaces.txt").unwrap().size, size);
+    }
+
+    /// Renaming a file over another is one change, one commit: a crash
+    /// leaves the file there or the renamed one in its place (1.2.2
+    /// deleted the target in one commit and renamed in the next).
+    #[test]
+    fn a_rename_over_a_file_is_one_commit() {
+        let fs = serve("r314basic4k", true, |image| Box::new(Overlay::new(image)));
+        let before = fs.vol.read_ok().checkpoint.clock;
+        let size = fs.vol.read_ok().lookup("/names/plain.txt").unwrap().size;
+        fs.rename_paths("/names/plain.txt", "/names/with spaces.txt", RenameFlags::empty())
+            .unwrap();
+        let vol = fs.vol.read_ok();
+        assert_eq!(vol.checkpoint.clock, before + 1);
         assert!(vol.lookup("/names/plain.txt").is_err());
         assert_eq!(vol.lookup("/names/with spaces.txt").unwrap().size, size);
     }

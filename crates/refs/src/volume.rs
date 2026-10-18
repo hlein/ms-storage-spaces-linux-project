@@ -79,6 +79,26 @@ pub struct Volume<D> {
     pub(crate) compacted: crate::compress::Map,
     /// The last units decompressed.
     units: std::sync::Mutex<Vec<Unit>>,
+    /// A checkpoint the writer holds back while several changes become
+    /// one commit (`Volume::in_one_commit`).
+    pub(crate) held: std::sync::Mutex<Option<Held>>,
+}
+
+/// The commit several changes make together, until its checkpoint is
+/// written: the changes write their pages, and this checkpoint, not the
+/// one on disk, is the volume's meanwhile.
+#[derive(Debug, Default)]
+pub(crate) struct Held {
+    /// The clock and generation of the commit, the one on disk's plus one.
+    pub clock: u64,
+    pub generation: u64,
+    /// The checkpoint slot it goes to (not the one on disk's).
+    pub slot: u64,
+    /// The checkpoint the changes so far make (none before the first).
+    pub page: Option<Vec<u8>>,
+    /// The clusters they freed, which the checkpoint on disk may still
+    /// use: nothing takes them before the commit.
+    pub freed: std::collections::HashSet<u64>,
 }
 
 /// A decompressed unit: (container, range, unit), its bytes.
@@ -153,6 +173,7 @@ impl<D: ReadAt> Volume<D> {
             own_since: std::sync::atomic::AtomicU64::new(0),
             compacted: BTreeMap::new(),
             units: std::sync::Mutex::new(Vec::new()),
+            held: std::sync::Mutex::new(None),
         };
         vol.load()?;
         Ok(vol)
@@ -217,7 +238,17 @@ impl<D: ReadAt> Volume<D> {
             }
         }
         let (lcn, clock, chkp) = best.ok_or_else(|| format_err!("no valid checkpoint"))?;
-        self.checkpoint = Self::parse_checkpoint(lcn, clock, &chkp)?;
+        // While changes are made one commit, the checkpoint they make.
+        let held = self
+            .held
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .and_then(|h| Some((h.slot, h.clock, h.page.clone()?)));
+        self.checkpoint = match held {
+            Some((slot, clock, page)) => Self::parse_checkpoint(slot, clock, &page)?,
+            None => Self::parse_checkpoint(lcn, clock, &chkp)?,
+        };
         self.load_containers()?;
         self.load_objects()
     }

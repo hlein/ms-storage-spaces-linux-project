@@ -115,6 +115,13 @@
   the device is removed and the server ends with an error. A SIGTERM before
   the ublk device started was lost. `spaces detach` deletes the ublk device
   of a server that was killed (1.2.2 left it DEAD).
+* ReFS writes: renaming a file over another on `refs mount --rw` (`mv -f`,
+  the way editors save) deleted the target in one change and renamed in
+  the next, so a crash between them lost the target. It is one change now
+  (`Volume::rename_replacing`), and so are a block clone to a new name
+  (an empty file was made first) and a named stream in clusters replaced
+  (deleted first): several steps, one checkpoint
+  (`Volume::in_one_commit`).
 
 ### Testing
 

@@ -761,11 +761,13 @@ crash or a pulled cable leaves the volume as it was after the last
 completed change. Symbolic links cannot be made. The mount is served by
 one thread; it suits copying files to or from a Dev Drive, not heavy
 use. Replacing a file by renaming another over it (`mv -f`, and the way
-editors save) takes two changes until 1.3: the file there is deleted, then
-the other renamed, so a crash between them leaves the first deleted and
-the other under its old name. What the rename needs is checked before the
-first change: a rename `refs` refuses (to a name that is not printable
-ASCII, for now) changes nothing. A request that stops on an internal error (a defect of `refs` that
+editors save) is one change too: a crash leaves the file that was there
+or the renamed one in its place, never neither (1.2.2 deleted the first
+in one change and renamed in the next); so are a block clone to a new
+name and a named stream in clusters replaced. A file is created when it
+is opened and its data written when it is closed, two changes as on other
+file systems: a crash between them leaves it empty. A change `refs`
+refuses (a name that is not printable ASCII, for now) changes nothing. A request that stops on an internal error (a defect of `refs` that
 the volume reaches) fails with EIO and the mount goes on, read-only or
 not; after one inside a change, the volume in memory may be half changed,
 so every later request fails with EIO: unmount it (the volume on disk is

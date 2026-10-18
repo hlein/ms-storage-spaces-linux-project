@@ -132,3 +132,10 @@ path = "fuzz_targets/policy_fields.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "report_json"
+path = "fuzz_targets/report_json.rs"
+test = false
+doc = false
+bench = false

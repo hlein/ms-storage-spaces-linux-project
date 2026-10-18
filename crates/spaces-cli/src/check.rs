@@ -469,32 +469,52 @@ pub fn run(
     only: Option<&str>,
     bundle_path: Option<&Path>,
     devices: &[PathBuf],
+    here: bool,
 ) -> Result<bool> {
     let groups: Vec<Vec<PathBuf>> = if devices.is_empty() {
         scanned()
-    } else {
+    } else if here {
         vec![devices.to_vec()]
+    } else {
+        groups_of(devices)
     };
     let mut all = Vec::new();
     let mut files = bundle::Files::new();
     let mut pools = 0;
-    for paths in groups {
-        match open_pool(&paths) {
-            Ok(pool) => {
-                pools += 1;
-                let pool = Arc::new(pool);
-                let reports = reports(&pool, &paths, only, deep)?;
-                if bundle_path.is_some()
-                    && let Err(stopped) = isolate::caught(|| bundle_files(&pool, &reports, &mut files))
-                {
-                    files.push((
-                        format!("pool-{}/bundle-error.txt", pool.guid),
-                        format!("packing the pool's files {stopped}\n").into_bytes(),
-                    ));
+    if here || bundle_path.is_some() {
+        // In this process: the child of `check` and `attach` (`--here`),
+        // and a bundle, which packs what it reads of each pool.
+        for paths in groups {
+            match open_pool(&paths) {
+                Ok(pool) => {
+                    pools += 1;
+                    #[cfg(feature = "test-hooks")]
+                    test_hooks(&pool);
+                    let pool = Arc::new(pool);
+                    let reports = reports(&pool, &paths, only, deep)?;
+                    if bundle_path.is_some()
+                        && let Err(stopped) = isolate::caught(|| bundle_files(&pool, &reports, &mut files))
+                    {
+                        files.push((
+                            format!("pool-{}/bundle-error.txt", pool.guid),
+                            format!("packing the pool's files {stopped}\n").into_bytes(),
+                        ));
+                    }
+                    all.extend(reports);
                 }
-                all.extend(reports);
+                Err(e) => all.push(unopened(&paths, &format!("{e:#}"))),
             }
-            Err(e) => all.push(unopened(&paths, &format!("{e:#}"))),
+        }
+        if here {
+            print!("{}", reports_to_json(&all));
+            return Ok(all.iter().all(|r| r.verdict() == Verdict::Healthy));
+        }
+    } else {
+        // Each pool in a child process of its own, with a memory limit
+        // and a deadline (`reports_in_children`).
+        for result in reports_in_children(&groups, only, deep) {
+            pools += 1;
+            all.extend(result?);
         }
     }
     if json {
@@ -552,6 +572,253 @@ pub fn run(
         );
     }
     Ok(all.iter().all(|r| r.verdict() == Verdict::Healthy))
+}
+
+/// Devices given together, by pool: those of several pools (their disk
+/// headers name the pool) are checked each pool on its own; devices of one
+/// pool, or whose headers cannot be read, stay together (as before 1.3,
+/// when every device given was one pool's).
+pub fn groups_of(devices: &[PathBuf]) -> Vec<Vec<PathBuf>> {
+    #[cfg(target_os = "linux")]
+    {
+        let found: Option<Vec<_>> = devices
+            .iter()
+            .map(|p| crate::scan::probe(p).ok().flatten().map(|c| c.pool_guid))
+            .collect();
+        if let Some(guids) = found {
+            let mut groups: Vec<(storage_spaces::Guid, Vec<PathBuf>)> = Vec::new();
+            for (guid, path) in guids.into_iter().zip(devices) {
+                match groups.iter_mut().find(|g| g.0 == guid) {
+                    Some(g) => g.1.push(path.clone()),
+                    None => groups.push((guid, vec![path.clone()])),
+                }
+            }
+            return groups.into_iter().map(|g| g.1).collect();
+        }
+    }
+    vec![devices.to_vec()]
+}
+
+/// How much memory the checks of one pool may take: SPACES_POOL_MEMORY MiB
+/// (0: no limit), 2048 by default.
+fn pool_memory() -> Option<u64> {
+    match std::env::var("SPACES_POOL_MEMORY")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+    {
+        Some(0) => None,
+        Some(mib) => Some(mib),
+        None => Some(2048),
+    }
+}
+
+/// How long the checks of one pool may take: SPACES_POOL_TIMEOUT seconds
+/// (0: no limit), 120 by default, and no longer than what is left of the
+/// time of `spaces attach`.
+fn pool_deadline() -> Option<Duration> {
+    let own = match std::env::var("SPACES_POOL_TIMEOUT")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+    {
+        Some(0) => None,
+        Some(s) => Some(Duration::from_secs(s)),
+        None => Some(Duration::from_secs(120)),
+    };
+    match (own, time_left()) {
+        (Some(own), Some(left)) => Some(own.min(left)),
+        (own, left) => own.or(left),
+    }
+}
+
+/// The reports on each pool of `groups` (its member devices), each made by
+/// `spaces check --json --here` in a child process of its own, all at once:
+/// with a memory limit (`ulimit -v`, [`pool_memory`]) and killed at the
+/// [`pool_deadline`]. A child that ended without reports gives a failed
+/// `space.checks` report on the pool naming why (the limit it reached);
+/// one that refused the request (a `--space` that names two spaces) its
+/// error. The threads that bound each check stay inside the child, which
+/// ends with them: 1.2.2 checked every pool on threads of one process,
+/// where a thread that hung stayed to the end and memory had no bound
+/// (audit 2026-10-16, E9).
+pub fn reports_in_children(groups: &[Vec<PathBuf>], only: Option<&str>, deep: bool) -> Vec<Result<Vec<Report>>> {
+    let (memory, deadline) = (pool_memory(), pool_deadline());
+    let children: Vec<_> = groups
+        .iter()
+        .map(|paths| spawn_child(paths, only, deep, memory))
+        .collect();
+    let start = Instant::now();
+    children
+        .into_iter()
+        .zip(groups)
+        .map(|(child, paths)| {
+            child.and_then(|c| {
+                c.wait(
+                    paths,
+                    deadline.map(|d| d.saturating_sub(start.elapsed())),
+                    memory,
+                    deadline,
+                )
+            })
+        })
+        .collect()
+}
+
+/// A child checking one pool, its output read beside it.
+struct Child {
+    process: std::process::Child,
+    out: std::thread::JoinHandle<Vec<u8>>,
+    err: std::thread::JoinHandle<Vec<u8>>,
+}
+
+fn spawn_child(paths: &[PathBuf], only: Option<&str>, deep: bool, memory: Option<u64>) -> Result<Child> {
+    use std::process::{Command, Stdio};
+    let exe = std::env::current_exe().context("cannot find this program to check the pool in a child")?;
+    let mut cmd = match memory {
+        // The shell sets the limit and becomes the child (exec).
+        Some(mib) => {
+            let mut c = Command::new("/bin/sh");
+            c.arg("-c")
+                .arg(format!("ulimit -v {} 2>/dev/null; exec \"$0\" \"$@\"", mib * 1024))
+                .arg(&exe);
+            c
+        }
+        None => Command::new(&exe),
+    };
+    // Global options first (`--unclean-parity`), then the command.
+    cmd.args(crate::inherited_args()).args(["check", "--json", "--here"]);
+    if deep {
+        cmd.arg("--deep");
+    }
+    if let Some(key) = only {
+        cmd.args(["--space", key]);
+    }
+    cmd.arg("--").args(paths);
+    cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut process = cmd.spawn().context("cannot start the child that checks the pool")?;
+    fn drain<R: std::io::Read + Send + 'static>(pipe: Option<R>) -> std::thread::JoinHandle<Vec<u8>> {
+        std::thread::spawn(move || {
+            let mut v = Vec::new();
+            if let Some(mut p) = pipe {
+                let _ = p.read_to_end(&mut v);
+            }
+            v
+        })
+    }
+    let (out, err) = (drain(process.stdout.take()), drain(process.stderr.take()));
+    Ok(Child { process, out, err })
+}
+
+impl Child {
+    /// Waits for the child until `left` is up (then kills it) and reads its
+    /// reports; `memory` and `deadline` name the limits in a report.
+    fn wait(
+        mut self,
+        paths: &[PathBuf],
+        left: Option<Duration>,
+        memory: Option<u64>,
+        deadline: Option<Duration>,
+    ) -> Result<Vec<Report>> {
+        let start = Instant::now();
+        let mut timed_out = false;
+        let status = loop {
+            if let Some(status) = self.process.try_wait()? {
+                break status;
+            }
+            if left.is_some_and(|l| start.elapsed() >= l) {
+                let _ = self.process.kill();
+                timed_out = true;
+                break self.process.wait()?;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        let out = self.out.join().unwrap_or_default();
+        let err = String::from_utf8_lossy(&self.err.join().unwrap_or_default()).into_owned();
+        // What it said besides its reports (warnings), as said.
+        eprint!(
+            "{}",
+            err.lines()
+                .filter(|l| !l.starts_with("Error: "))
+                .map(|l| format!("{l}\n"))
+                .collect::<String>()
+        );
+        let reports = std::str::from_utf8(&out).ok().and_then(Report::list_from_json);
+        if let (false, Some(reports)) = (timed_out, reports) {
+            return Ok(reports);
+        }
+        // Its own refusal of the request: the error it gave.
+        if !timed_out && status.code() == Some(2) {
+            let error = err
+                .lines()
+                .filter_map(|l| l.strip_prefix("Error: "))
+                .collect::<Vec<_>>()
+                .join("; ");
+            bail!("{error}");
+        }
+        let why = if timed_out {
+            format!(
+                "did not end within {} s (SPACES_POOL_TIMEOUT), and were stopped",
+                deadline.map_or(0, |d| d.as_secs())
+            )
+        } else if err.contains("memory allocation of") {
+            format!(
+                "needed more than {} MiB of memory (SPACES_POOL_MEMORY), and were stopped",
+                memory.unwrap_or(0)
+            )
+        } else {
+            let last = err.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("no output");
+            format!(
+                "ended without reports ({status}): {}",
+                storage_spaces::report::printable(last)
+            )
+        };
+        Ok(vec![stopped_pool(paths, &why)])
+    }
+}
+
+/// The report on a space of `pool` the child that checked the pool gave no
+/// report on: failed (the pool changed between the child's look and this
+/// one).
+pub fn no_report<D>(pool: &Pool<D>, space: &Space, paths: &[PathBuf]) -> Report {
+    let mut r = guard::empty_report(pool, space);
+    r.devices = names(paths);
+    r.checks.push(Check::new(
+        "space.checks",
+        Status::Failed,
+        "the checks of the pool gave no report on this space",
+    ));
+    r
+}
+
+/// The report on the pool on `paths` whose checks in a child process ended
+/// without reports (`why`).
+fn stopped_pool(paths: &[PathBuf], why: &str) -> Report {
+    let mut r = Report::new(format!("the pool on {}", names(paths).join(", ")));
+    r.devices = names(paths);
+    r.checks.push(
+        Check::new("space.checks", Status::Failed, format!("the checks of the pool {why}")).advice(
+            "A pool whose checks take that much is damaged or made to be read so; nothing of it is attached. \
+                 The limits are SPACES_POOL_MEMORY (MiB) and SPACES_POOL_TIMEOUT (seconds); 0 lifts one.",
+        ),
+    );
+    r
+}
+
+/// The test hooks of the checks (feature test-hooks): the checks of the
+/// pool SPACES_TEST_HOG_POOL names allocate without bound, those of
+/// SPACES_TEST_HANG_POOL hang (tests/pool_children.rs).
+#[cfg(feature = "test-hooks")]
+fn test_hooks<D>(pool: &Pool<D>) {
+    if std::env::var("SPACES_TEST_HOG_POOL").is_ok_and(|n| n == pool.name) {
+        let mut held: Vec<Vec<u8>> = Vec::new();
+        loop {
+            held.push(vec![1u8; 64 << 20]);
+        }
+    }
+    if std::env::var("SPACES_TEST_HANG_POOL").is_ok_and(|n| n == pool.name) {
+        loop {
+            std::thread::sleep(Duration::from_secs(1));
+        }
+    }
 }
 
 /// The member devices of every pool found by scanning.

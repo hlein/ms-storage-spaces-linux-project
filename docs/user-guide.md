@@ -556,7 +556,15 @@ volume in a space attached with `--degraded` or `--force` mounts only with
   space; checks that take longer than 40 s make it suspect
   (`SPACES_CHECK_TIMEOUT=SECONDS` sets the limit, 0 none; `--deep` has
   none). Either way the other pools and spaces are checked and attached
-  as usual.
+  as usual. Since 1.3 each pool is checked in a child process of its own,
+  with a memory limit of 2048 MiB (`SPACES_POOL_MEMORY=MIB`, 0 none; the
+  84 pools of the corpus check within 512) and a deadline of 120 s
+  (`SPACES_POOL_TIMEOUT=SECONDS`, 0 none; never past the time of
+  `spaces attach`): a pool whose checks reach either gets one failed
+  `space.checks` report naming the limit, and nothing of it is attached
+  (1.2.2 checked every pool in one process, where such a pool took the
+  whole run with it). `spaces check` and `spaces attach` take the devices
+  of several pools at once and check each pool on its own.
 * With `spaces check --deep`: every listed parity stripe, `deep.scrub`
   (every copy compared, as `spaces pool scrub` does; a scrub that cannot
   run, as on a pool that is not clean, makes the space suspect) and

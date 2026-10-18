@@ -281,6 +281,14 @@
   could read one empty). A `df` of a `refs mount` walked the medium
   allocator every time; its count is kept until the allocator changes
   (audit 2026-10-16, Low "Misc").
+* `spaces attach` and `spaces check` checked every pool in one process: a
+  pool whose checks allocated without bound or hung took the whole run,
+  and every other pool, with it. Each pool is checked in a child process
+  of its own now, all at once, with a memory limit (2048 MiB,
+  `SPACES_POOL_MEMORY`) and a deadline (120 s, `SPACES_POOL_TIMEOUT`, within
+  the attach units' time): such a pool fails alone, with a `space.checks`
+  report naming the limit (audit 2026-10-16, E9). The devices of several
+  pools can be given together; each pool is checked on its own.
 * One reader of mountinfo fields for `spaces` and `refs` (the one of
   `spaces` overflowed on `\4xx`, which the kernel does not write) and one
   of block device attributes (audit 2026-10-16, "Duplicates that
@@ -295,6 +303,12 @@
 
 ### Testing
 
+* `tools/attach-crash-check.sh` case `children` (one attach of two pools,
+  the second's checks made to allocate without bound, then to hang:
+  test builds), `tools/rw-attach-check.sh` with `IMAGES=1` (a pool on image
+  files attached read-write), the fuzz target `report_json` (the reports
+  read back from a pool's child), and tests with the feature `test-hooks`
+  (`cargo test -p spaces-cli --features test-hooks`).
 * `tools/mount-vm-check.sh` cases `nosandbox` (`systemd-run` failing),
   `unitlog` (the unit's log after a mount) and `reportmode` (the report
   directory's mode). The write tests' scripts write their pattern with

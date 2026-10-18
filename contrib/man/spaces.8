@@ -414,6 +414,17 @@ has none). Checks that take longer make the space suspect (space.checks);
 checks that stop on an internal error fail it. Either way the other pools
 and spaces are checked and attached as usual.
 .TP
+.B SPACES_POOL_MEMORY
+MiB of address space the checks of one pool may take: each pool is checked
+in a child process of its own (2048 by default, 0 for no limit). A pool
+whose checks need more fails (space.checks), and nothing of it is attached.
+.TP
+.B SPACES_POOL_TIMEOUT
+Seconds the child that checks one pool may take (120 by default, 0 for no
+limit; never past
+.BR SPACES_ATTACH_TIMEOUT ).
+A child that takes longer is killed, and its pool fails (space.checks).
+.TP
 .B SPACES_ATTACH_TIMEOUT
 Seconds a run of
 .B attach

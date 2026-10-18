@@ -25,6 +25,13 @@
 #             kernel's count of openers shows), and detaches once released
 #             (1.2.2 removed the devices it could and stopped at the busy
 #             one)
+#   children  one attach of two pools, the checks of the second made to
+#             allocate without bound, then to hang (SPACES_TEST_HOG_POOL,
+#             SPACES_TEST_HANG_POOL; test builds only): the first pool's
+#             space is attached, the second pool refused with the limit it
+#             reached (SPACES_POOL_MEMORY, SPACES_POOL_TIMEOUT), in time
+#             (1.2.2 checked every pool in one process: such a pool took
+#             the whole run with it)
 # Build: cargo build --release --target x86_64-unknown-linux-musl -p spaces-cli --features test-hooks
 # Usage: [LINUX_VM_HOST=user@address] tools/attach-crash-check.sh SPACES [CASE...]
 # Pools: wc4k in ~/sstest/pools on the VM (tools/guard-check.sh copies it
@@ -34,7 +41,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 binary=${1:?usage: tools/attach-crash-check.sh SPACES [CASE...]}
 shift
-cases=${*:-steps kill names leftovers busy}
+cases=${*:-steps kill names leftovers busy children}
 host=${LINUX_VM_HOST:-claude@192.168.189.143}
 [[ $host == *@* ]] || host=codex@$host
 ssh_opts=(-o BatchMode=yes -o ConnectTimeout=10 -o IdentitiesOnly=yes -i "$HOME/.ssh/rustadmin_vm_ed25519")
@@ -90,7 +97,7 @@ cleanup() {
     sudo rm -f "/run/storage-spaces/$g.state"
   done
   # Devices without a UUID (1.2.2's) by the names of these pools.
-  for d in $(ls /dev/mapper | grep -E '^ss-ss_(wc4k|crash|names)-' | sort -r); do
+  for d in $(ls /dev/mapper | grep -E '^ss-ss_(wc4k|crash|names|hog)-' | sort -r); do
     sudo dmsetup remove --retry "$d" >/dev/null 2>&1 || true
   done
   sudo dmsetup remove "$leftover" >/dev/null 2>&1 || true
@@ -306,6 +313,32 @@ for c in $CASES; do
     else
       result fail leftovers "status: $(one "$st"); detach --leftovers: exit $rc: $(one "$out")"
     fi ;;
+  children)
+    truncate -s 3G "$scratch/hog.img"
+    if ! "$spaces" pool create --name ss_hog --yes "$scratch/hog.img" >/dev/null 2>&1 ||
+      ! "$spaces" space create --name hog --resiliency simple --size 1G --yes "$scratch/hog.img" >/dev/null 2>&1; then
+      result fail children "cannot make the pool ss_hog"
+      continue
+    fi
+    newloop "$scratch/hog.img" -r
+    hog_loop=$LOOP
+    hog=$(guid hog "$hog_loop")
+    guids+=("$hog")
+    for hook in "SPACES_TEST_HOG_POOL SPACES_POOL_MEMORY=512 512 MiB" "SPACES_TEST_HANG_POOL SPACES_POOL_TIMEOUT=5 5 s"; do
+      read -r var limit want <<<"$hook"
+      start=$(date +%s)
+      out=$(sudo env "$var=ss_hog" "$limit" "$spaces" attach "$crash_loop" "$hog_loop" 2>&1)
+      rc=$? took=$(($(date +%s) - start))
+      sudo "$spaces" detach "$crash" >/dev/null 2>&1
+      sudo "$spaces" detach "$hog" >/dev/null 2>&1
+      if [[ $out != *"$want"* && $out == *'attached "hog"'* ]]; then
+        result skip "children ${var#SPACES_TEST_}" "this build has no test hooks"
+      elif [[ $rc != 0 && $out == *'attached "crash"'* && $out != *'attached "hog"'* && $out == *"$want"* && $took -lt 60 ]]; then
+        result ok "children ${var#SPACES_TEST_}" "${took} s"
+      else
+        result fail "children ${var#SPACES_TEST_}" "exit $rc after ${took} s: $(one "$out")"
+      fi
+    done ;;
   *) result fail "$c" "unknown case" ;;
   esac
 done

@@ -139,7 +139,12 @@ enum Command {
         /// (no file data) for a bug report.
         #[arg(long, value_name = "FILE")]
         bundle: Option<PathBuf>,
-        /// Member devices of one pool (default: every pool scan finds).
+        /// Check in this process (the child each pool is checked in; JSON
+        /// only, exit code 2 for an error).
+        #[arg(long, hide = true, requires = "json")]
+        here: bool,
+        /// Member devices of one or more pools, each checked on its own
+        /// (default: every pool scan finds).
         devices: Vec<PathBuf>,
     },
     /// Show the pool, its disks and spaces.
@@ -495,9 +500,17 @@ fn main() -> Result<()> {
             deep,
             space,
             bundle,
+            here,
             devices,
         } => {
-            let healthy = check::run(json, deep, space.as_deref(), bundle.as_deref(), &devices)?;
+            let healthy = match check::run(json, deep, space.as_deref(), bundle.as_deref(), &devices, here) {
+                Ok(healthy) => healthy,
+                Err(e) if here => {
+                    eprintln!("Error: {e:#}");
+                    std::process::exit(2);
+                }
+                Err(e) => return Err(e),
+            };
             if !healthy {
                 std::io::stdout().flush()?;
                 std::process::exit(1);
@@ -1206,25 +1219,54 @@ fn cmd_attach(
             .map(|m| m.into_iter().map(|c| c.path).collect())
             .collect()
     } else {
-        vec![devices.to_vec()]
+        check::groups_of(devices)
     };
     // On a terminal the whole report of a refused space; under the attach
     // unit (the journal) a line for the space and one per failing check.
     let interactive = std::io::stderr().is_terminal();
     let (mut failures, mut matched) = (0, 0);
     let mut pools = Vec::new();
-    for paths in groups {
-        match check::open_pool(&paths) {
-            Ok(pool) => pools.push((paths, Arc::new(pool))),
+    // The checks of each pool, in a child process of its own with a memory
+    // limit and a deadline; a pool is opened here only once its child
+    // returned reports on its spaces (1.2.2 checked every pool on threads
+    // of this process).
+    let named = |paths: &[PathBuf]| {
+        paths
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    for (paths, result) in groups.iter().zip(check::reports_in_children(&groups, None, false)) {
+        let reports = match result {
+            Ok(reports) => reports,
             Err(e) => {
+                eprintln!("the pool on {}: {e:#}", named(paths));
+                failures += 1;
+                continue;
+            }
+        };
+        // A pool that cannot be assembled, or whose checks were stopped:
+        // its one report says why.
+        if let [only] = reports.as_slice()
+            && only.space.is_none()
+        {
+            eprintln!("{}; not attached", only.headline());
+            for c in only.problems() {
                 eprintln!(
-                    "the pool on {}: {e:#}",
-                    paths
-                        .iter()
-                        .map(|p| p.display().to_string())
-                        .collect::<Vec<_>>()
-                        .join(", ")
+                    "  {} {}: {}",
+                    c.status.as_str().to_uppercase(),
+                    c.id,
+                    storage_spaces::report::printable(&c.summary)
                 );
+            }
+            failures += 1;
+            continue;
+        }
+        match check::open_pool(paths) {
+            Ok(pool) => pools.push((paths.clone(), Arc::new(pool), reports)),
+            Err(e) => {
+                eprintln!("the pool on {}: {e:#}", named(paths));
                 failures += 1;
             }
         }
@@ -1232,7 +1274,7 @@ fn cmd_attach(
     // The pool --pool names among them all (a name two pools share names
     // neither).
     if let Some(key) = pool_sel {
-        let keys: Vec<_> = pools.iter().map(|(_, p)| (p.name.as_str(), p.guid)).collect();
+        let keys: Vec<_> = pools.iter().map(|(_, p, _)| (p.name.as_str(), p.guid)).collect();
         match check::select_pool(&keys, key) {
             Ok(Some(i)) => pools = vec![pools.swap_remove(i)],
             Ok(None) => pools.clear(),
@@ -1243,7 +1285,7 @@ fn cmd_attach(
             }
         }
     }
-    for (paths, pool) in pools {
+    for (paths, pool, reports) in pools {
         // The space --space names in this pool, as every command reads it.
         let chosen = match space_sel.map(|s| pool.select_space(s)) {
             None => None,
@@ -1255,7 +1297,6 @@ fn cmd_attach(
                 continue;
             }
         };
-        let health = check::pool_health(&pool, check::deadline());
         for space in pool.user_spaces() {
             if chosen.is_some_and(|id| id != space.id()) {
                 continue;
@@ -1285,7 +1326,14 @@ fn cmd_attach(
                 failures += 1;
                 continue;
             }
-            let mut report = check::space_report(&pool, &health, &paths, space);
+            // Its report from the child (one made here says the child
+            // gave none for it).
+            let guid = space.info.guid.to_string();
+            let mut report = reports
+                .iter()
+                .find(|r| r.space.as_ref().is_some_and(|s| s.1.eq_ignore_ascii_case(&guid)))
+                .cloned()
+                .unwrap_or_else(|| check::no_report(&pool, space, &paths));
             let verdict = report.verdict();
             let decision = check::gate(verdict, rw, degraded, force);
             let mut command = format!("spaces attach --space {}", space.info.guid);

@@ -110,6 +110,20 @@ impl Status {
         }
     }
 
+    pub fn parse(s: &str) -> Option<Status> {
+        [
+            Status::Ok,
+            Status::Info,
+            Status::Warning,
+            Status::Skipped,
+            Status::Degraded,
+            Status::Suspect,
+            Status::Failed,
+        ]
+        .into_iter()
+        .find(|v| v.as_str() == s)
+    }
+
     /// The verdict a check of this status leads to: warnings, information
     /// and skipped checks leave a report healthy.
     pub fn verdict(self) -> Verdict {
@@ -200,6 +214,12 @@ impl Truth {
             Truth::CrossCheck => "cross-check",
             Truth::Format => "format",
         }
+    }
+
+    pub fn parse(s: &str) -> Option<Truth> {
+        [Truth::Windows, Truth::CrossCheck, Truth::Format]
+            .into_iter()
+            .find(|v| v.as_str() == s)
     }
 
     fn describe(self) -> &'static str {
@@ -653,6 +673,238 @@ impl Json {
     }
 }
 
+impl Report {
+    /// Reports as `reports_to_json` wrote them (what `spaces check --json`
+    /// prints): how `spaces attach` and `spaces check` read the reports of
+    /// a pool checked in a child process. `None` for anything else.
+    pub fn list_from_json(text: &str) -> Option<Vec<Report>> {
+        let mut p = Parser {
+            s: text.as_bytes(),
+            at: 0,
+        };
+        let value = p.value()?;
+        p.space();
+        if p.at != p.s.len() {
+            return None;
+        }
+        match value {
+            Json::Arr(items) => items.iter().map(Report::from_json).collect(),
+            _ => None,
+        }
+    }
+
+    fn from_json(v: &Json) -> Option<Report> {
+        let named = |v: &Json| match v {
+            Json::Null => Some(None),
+            obj => Some(Some((
+                obj.field("name")?.str()?.to_owned(),
+                obj.field("guid")?.str()?.to_owned(),
+            ))),
+        };
+        let opt = |v: Option<&Json>| match v {
+            None | Some(Json::Null) => Some(None),
+            Some(s) => s.str().map(|s| Some(s.to_owned())),
+        };
+        let strings = |v: Option<&Json>| -> Option<Vec<String>> {
+            match v {
+                None => Some(Vec::new()),
+                Some(Json::Arr(items)) => items.iter().map(|i| i.str().map(str::to_owned)).collect(),
+                _ => None,
+            }
+        };
+        let checks = match v.field("checks")? {
+            Json::Arr(items) => items
+                .iter()
+                .map(|c| {
+                    let evidence = match c.field("evidence") {
+                        None => Vec::new(),
+                        Some(Json::Arr(items)) => items
+                            .iter()
+                            .map(|e| {
+                                Some(Evidence {
+                                    what: e.field("what")?.str()?.to_owned(),
+                                    location: opt(e.field("where"))?,
+                                    expected: opt(e.field("expected"))?,
+                                    found: opt(e.field("found"))?,
+                                })
+                            })
+                            .collect::<Option<Vec<_>>>()?,
+                        _ => return None,
+                    };
+                    Some(Check {
+                        id: c.field("id")?.str()?.to_owned(),
+                        status: Status::parse(c.field("status")?.str()?)?,
+                        summary: c.field("summary")?.str()?.to_owned(),
+                        evidence,
+                        truth: match opt(c.field("truth"))? {
+                            None => None,
+                            Some(t) => Some(Truth::parse(&t)?),
+                        },
+                        advice: opt(c.field("advice"))?,
+                    })
+                })
+                .collect::<Option<Vec<_>>>()?,
+            _ => return None,
+        };
+        let environment = match v.field("environment") {
+            None => Vec::new(),
+            Some(Json::Obj(fields)) => fields
+                .iter()
+                .map(|(k, v)| Some((k.clone(), v.str()?.to_owned())))
+                .collect::<Option<Vec<_>>>()?,
+            _ => return None,
+        };
+        Some(Report {
+            subject: v.field("subject")?.str()?.to_owned(),
+            pool: named(v.field("pool")?)?,
+            space: named(v.field("space")?)?,
+            devices: strings(v.field("devices"))?,
+            checks,
+            environment,
+            action: opt(v.field("action"))?,
+            notes: strings(v.field("notes"))?,
+        })
+    }
+}
+
+impl Json {
+    fn field(&self, name: &str) -> Option<&Json> {
+        match self {
+            Json::Obj(fields) => fields.iter().find(|(k, _)| k == name).map(|(_, v)| v),
+            _ => None,
+        }
+    }
+
+    fn str(&self) -> Option<&str> {
+        match self {
+            Json::Str(s) => Some(s),
+            _ => None,
+        }
+    }
+}
+
+/// Reads what `Json::write` writes: null, strings, arrays and objects.
+struct Parser<'a> {
+    s: &'a [u8],
+    at: usize,
+}
+
+impl Parser<'_> {
+    fn space(&mut self) {
+        while self.s.get(self.at).is_some_and(|c| c.is_ascii_whitespace()) {
+            self.at += 1;
+        }
+    }
+
+    fn eat(&mut self, c: u8) -> Option<()> {
+        self.space();
+        (self.s.get(self.at) == Some(&c)).then(|| self.at += 1)
+    }
+
+    /// A value, nested at most 16 deep (reports nest 4).
+    fn value(&mut self) -> Option<Json> {
+        self.nested(0)
+    }
+
+    fn nested(&mut self, depth: usize) -> Option<Json> {
+        if depth > 16 {
+            return None;
+        }
+        self.space();
+        match *self.s.get(self.at)? {
+            b'n' if self.s[self.at..].starts_with(b"null") => {
+                self.at += 4;
+                Some(Json::Null)
+            }
+            b'"' => self.string().map(Json::Str),
+            b'[' => {
+                self.at += 1;
+                let mut items = Vec::new();
+                if self.eat(b']').is_some() {
+                    return Some(Json::Arr(items));
+                }
+                loop {
+                    items.push(self.nested(depth + 1)?);
+                    if self.eat(b']').is_some() {
+                        return Some(Json::Arr(items));
+                    }
+                    self.eat(b',')?;
+                }
+            }
+            b'{' => {
+                self.at += 1;
+                let mut fields = Vec::new();
+                if self.eat(b'}').is_some() {
+                    return Some(Json::Obj(fields));
+                }
+                loop {
+                    self.space();
+                    let key = self.string()?;
+                    self.eat(b':')?;
+                    fields.push((key, self.nested(depth + 1)?));
+                    if self.eat(b'}').is_some() {
+                        return Some(Json::Obj(fields));
+                    }
+                    self.eat(b',')?;
+                }
+            }
+            _ => None,
+        }
+    }
+
+    fn string(&mut self) -> Option<String> {
+        if self.s.get(self.at) != Some(&b'"') {
+            return None;
+        }
+        self.at += 1;
+        let mut out = String::new();
+        loop {
+            let start = self.at;
+            while !matches!(self.s.get(self.at), Some(b'"' | b'\\') | None) {
+                self.at += 1;
+            }
+            out.push_str(std::str::from_utf8(&self.s[start..self.at]).ok()?);
+            match *self.s.get(self.at)? {
+                b'"' => {
+                    self.at += 1;
+                    return Some(out);
+                }
+                _ => {
+                    let e = *self.s.get(self.at + 1)?;
+                    self.at += 2;
+                    match e {
+                        b'"' => out.push('"'),
+                        b'\\' => out.push('\\'),
+                        b'/' => out.push('/'),
+                        b'n' => out.push('\n'),
+                        b'r' => out.push('\r'),
+                        b't' => out.push('\t'),
+                        b'b' => out.push('\u{8}'),
+                        b'f' => out.push('\u{c}'),
+                        b'u' => {
+                            let unit = |p: &mut Self| -> Option<u32> {
+                                let hex = std::str::from_utf8(p.s.get(p.at..p.at + 4)?).ok()?;
+                                p.at += 4;
+                                u32::from_str_radix(hex, 16).ok()
+                            };
+                            let u = unit(self)?;
+                            let c = if (0xd800..0xdc00).contains(&u) && self.s[self.at..].starts_with(b"\\u") {
+                                self.at += 2;
+                                let low = unit(self)?;
+                                char::from_u32(0x10000 + ((u - 0xd800) << 10) + low.checked_sub(0xdc00)?)
+                            } else {
+                                char::from_u32(u)
+                            };
+                            out.push(c.unwrap_or('\u{fffd}'));
+                        }
+                        _ => return None,
+                    }
+                }
+            }
+        }
+    }
+}
+
 fn quote(s: &str, out: &mut String) {
     out.push('"');
     for c in s.chars() {
@@ -672,6 +924,52 @@ fn quote(s: &str, out: &mut String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Reports read back from their JSON as written: every field, names
+    /// with any character (escapes, a lone surrogate's replacement,
+    /// characters outside the BMP); anything else is refused.
+    #[test]
+    fn reports_read_back_from_their_json() {
+        let mut a = Report::new("space \"d\\a\u{1b}[31m\u{1f600}\" (g) of pool \"p\" (pg)");
+        a.pool = Some(("p\n\t\r".into(), "pg".into()));
+        a.space = Some(("d\u{7}".into(), "g".into()));
+        a.devices = vec!["/dev/sdb2".into(), "/srv/a b.img".into()];
+        a.checks.push(
+            Check::new("pool.members", Status::Degraded, "1 of 2 disks")
+                .evidence(Evidence::new("the disks").at("/dev/sdb2").expected("2").found("1"))
+                .truth(Truth::Windows)
+                .advice("replace it"),
+        );
+        a.checks.push(Check::new("space.layout", Status::Ok, "fine"));
+        a.environment = vec![("spaces".into(), "1.3.0".into())];
+        a.action = Some("not attached".into());
+        a.notes = vec!["spaces attach --degraded".into()];
+        let b = Report::new("the pool on /dev/sdc");
+        let text = reports_to_json(&[a.clone(), b.clone()]);
+        let back = Report::list_from_json(&text).unwrap();
+        assert_eq!(back.len(), 2);
+        assert_eq!(reports_to_json(&back), text);
+        assert_eq!(back[0].to_text(), a.to_text());
+        assert_eq!(Report::list_from_json("[]").unwrap().len(), 0);
+        let escaped =
+            "[{\"subject\": \"\\u00e9\\ud83d\\ude00\\ud800x\", \"pool\": null, \"space\": null, \"checks\": []}]";
+        assert_eq!(
+            Report::list_from_json(escaped).unwrap()[0].subject,
+            "\u{e9}\u{1f600}\u{fffd}x"
+        );
+        for bad in [
+            "",
+            "[",
+            "{}",
+            "[1]",
+            "[{}]",
+            "[] x",
+            "[{\"subject\": \"a\"}]",
+            "[[[[[[[[[[[[[[[[[[]]]]]]]]]]]]]]]]]]",
+        ] {
+            assert!(Report::list_from_json(bad).is_none(), "{bad:?}");
+        }
+    }
 
     /// Names with escape sequences, carriage returns, line breaks, NUL,
     /// bell, NEL and a right-to-left override reach the report text and

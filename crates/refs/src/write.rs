@@ -90,6 +90,46 @@ struct RowAt {
     len: usize,
 }
 
+/// Where a page's node keeps its rows, as its header says: the header's
+/// offset in the page, then (from the header) the start and end of the
+/// rows, the free bytes, the start of the key index, the row count.
+struct Layout {
+    h: usize,
+    start: usize,
+    end: usize,
+    free: usize,
+    index: usize,
+    rows: usize,
+}
+
+impl Layout {
+    /// The layout of a page's node, refused unless its rows lie between
+    /// the node header and the key index (and the key index in the node):
+    /// so on every page Windows writes, and the writer moves no row over
+    /// the header, the key index or past the page.
+    fn of(d: &[u8]) -> Result<Self> {
+        let h = Node::at(d, PAGE_HEADER_SIZE)?.header();
+        let field = |o: usize| le32(d, h + o) as usize;
+        let l = Layout {
+            h,
+            start: field(0),
+            end: field(4),
+            free: field(8),
+            index: field(0x10),
+            rows: field(0x14),
+        };
+        if l.start < 0x28 || l.start > l.end || l.end > l.index {
+            return Err(format_err!(
+                "a node's rows at {:#x}..{:#x}, its key index at {:#x}",
+                l.start,
+                l.end,
+                l.index
+            ));
+        }
+        Ok(l)
+    }
+}
+
 pub struct Transaction<'v, D> {
     vol: &'v Volume<D>,
     pages: Vec<Page>,
@@ -1021,13 +1061,14 @@ impl<'v, D: WriteAt> Transaction<'v, D> {
     /// (leaf rows). False: no room in the page.
     fn place(&mut self, page: usize, row: &[u8], before: &dyn Fn(&[u8]) -> bool, count: bool) -> Result<bool> {
         let d = &self.pages[page].data;
-        let h = PAGE_HEADER_SIZE + le32(d, PAGE_HEADER_SIZE) as usize;
-        let (end, free, index, rows) = (
-            le32(d, h + 4) as usize,
-            le32(d, h + 8) as usize,
-            le32(d, h + 0x10) as usize,
-            le32(d, h + 0x14) as usize,
-        );
+        let Layout {
+            h,
+            end,
+            free,
+            index,
+            rows,
+            ..
+        } = Layout::of(d)?;
         let size = row.len().next_multiple_of(8);
         if free < size + 4 {
             return Ok(false);
@@ -1069,7 +1110,7 @@ impl<'v, D: WriteAt> Transaction<'v, D> {
         let root = self.roots[&self.pages[page].tree];
         self.mark(root);
         let d = &mut self.pages[root].data;
-        let rows = (le64(d, PAGE_HEADER_SIZE + 0x20) as i64 + by) as u64;
+        let rows = le64(d, PAGE_HEADER_SIZE + 0x20).wrapping_add_signed(by);
         d[PAGE_HEADER_SIZE + 0x20..PAGE_HEADER_SIZE + 0x28].copy_from_slice(&rows.to_le_bytes());
     }
 
@@ -1380,14 +1421,16 @@ impl<'v, D: WriteAt> Transaction<'v, D> {
     /// Moves a leaf page's rows together (in key order) so that its free
     /// space is all at the end of the row area.
     fn compact(&mut self, page: usize) -> Result<()> {
+        let Layout {
+            h,
+            start,
+            end,
+            index,
+            rows: count,
+            ..
+        } = Layout::of(&self.pages[page].data)?;
         self.mark(page);
         let d = &mut self.pages[page].data;
-        let h = PAGE_HEADER_SIZE + le32(d, PAGE_HEADER_SIZE) as usize;
-        let (start, index, count) = (
-            le32(d, h) as usize,
-            le32(d, h + 0x10) as usize,
-            le32(d, h + 0x14) as usize,
-        );
         let mut rows = Vec::with_capacity(count);
         for i in 0..count {
             let entry = le32(d, h + index + 4 * i);
@@ -1396,9 +1439,14 @@ impl<'v, D: WriteAt> Transaction<'v, D> {
             rows.push((
                 entry & 0xffff_0000,
                 d.get(h + at..h + at + size)
+                    .filter(|_| at >= start && at + size <= end)
                     .ok_or_else(|| format_err!("row outside its page"))?
                     .to_vec(),
             ));
+        }
+        // Rows the key index names twice may not fit once moved together.
+        if rows.iter().map(|(_, r)| r.len()).sum::<usize>() > index - start {
+            return Err(format_err!("rows past their page's key index"));
         }
         let mut at = start;
         d[h + start..h + index].fill(0);
@@ -1441,15 +1489,16 @@ impl<'v, D: WriteAt> Transaction<'v, D> {
             .rows()
             .position(|r| r.is_ok_and(|r| this(r.key)))
             .ok_or_else(|| Error::NotFound("row to remove".into()))?;
+        let Layout {
+            h,
+            end,
+            free,
+            index,
+            rows: count,
+            ..
+        } = Layout::of(&self.pages[page].data)?;
         self.mark(page);
         let d = &mut self.pages[page].data;
-        let h = PAGE_HEADER_SIZE + le32(d, PAGE_HEADER_SIZE) as usize;
-        let (end, free, index, count) = (
-            le32(d, h + 4) as usize,
-            le32(d, h + 8) as usize,
-            le32(d, h + 0x10) as usize,
-            le32(d, h + 0x14) as usize,
-        );
         let at = (le32(d, h + index + 4 * pos) & 0xffff) as usize;
         let size = le32(d, h + at) as usize;
         // The row stays as a tombstone (flag 4): Windows walks the row area
@@ -1465,10 +1514,7 @@ impl<'v, D: WriteAt> Transaction<'v, D> {
         put(d, h + 8, (free + size + 4) as u32);
         put(d, h + 0x10, (index + 4) as u32);
         put(d, h + 0x14, (count - 1) as u32);
-        let root = self.roots[&self.pages[page].tree];
-        let d = &mut self.pages[root].data;
-        let rows = le64(d, PAGE_HEADER_SIZE + 0x20) - 1;
-        d[PAGE_HEADER_SIZE + 0x20..PAGE_HEADER_SIZE + 0x28].copy_from_slice(&rows.to_le_bytes());
+        self.count_rows(page, -1);
         Ok(())
     }
 

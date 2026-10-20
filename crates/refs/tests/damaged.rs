@@ -14,7 +14,7 @@ use refs::node::Node;
 use refs::page::{PageHeader, PageRef};
 use refs::volume::ROOT_DIRECTORY;
 use refs::{Content, Target, Volume};
-use storage_spaces::io::{ReadAt, SparseImage};
+use storage_spaces::io::{Overlay, ReadAt, SparseImage};
 
 struct Rng(u64);
 
@@ -517,4 +517,126 @@ fn check_counts_leaked_clusters() {
     let report = forge.volume().unwrap().check(&[]).unwrap();
     assert_eq!(report.problems, Vec::<String>::new());
     assert_eq!(report.leaked_clusters, before + 1);
+}
+
+/// The root directory's leaf with its node header changed by `change`
+/// (given the page and the header's offset).
+fn forged_leaf(change: impl FnOnce(&mut Vec<u8>, usize)) -> Forge {
+    let mut forge = Forge::fixture("r314small");
+    forge.patch(
+        Tree::Object(ROOT_DIRECTORY),
+        |page| Node::at(page, 0x50).is_ok_and(|n| n.is_leaf()),
+        |page| {
+            let h = 0x50 + le32(page, 0x50);
+            change(page, h);
+        },
+    );
+    forge
+}
+
+/// A change of a node header: the page and the header's offset.
+type HeaderChange = fn(&mut Vec<u8>, usize);
+
+fn put32(page: &mut [u8], at: usize, v: usize) {
+    page[at..at + 4].copy_from_slice(&(v as u32).to_le_bytes());
+}
+
+#[test]
+fn rows_a_leaf_header_puts_out_of_place_are_refused() {
+    // Rows starting past the key index, over the node header, or ending
+    // past the key index (the end at the key index: a new row needs a
+    // compaction). A row written there is an error, the volume as it was,
+    // and the check names the page. 1.2.2 and 1.3 until its fuzz round
+    // panicked compacting the first (found by the fuzz target refs_write),
+    // moved rows over the header of the second (in memory: the change then
+    // failed) and added the row to the third.
+    let now = 134_700_000_000_000_000;
+    let cases: [(&str, HeaderChange); 3] = [
+        ("past the key index", |page, h| {
+            let index = le32(page, h + 0x10);
+            put32(page, h, 0x2800_0020);
+            put32(page, h + 4, index);
+        }),
+        ("over the header", |page, h| {
+            let index = le32(page, h + 0x10);
+            put32(page, h, 0x10);
+            put32(page, h + 4, index);
+        }),
+        ("ending past the key index", |page, h| {
+            let index = le32(page, h + 0x10);
+            put32(page, h + 4, index + 8);
+        }),
+    ];
+    for (what, change) in cases {
+        let forge = forged_leaf(change);
+        let overlay = Overlay::new(&forge.image);
+        let mut vol = Volume::open(&overlay, forge.offset).unwrap();
+        let e = vol
+            .create_file("/new.txt", b"new", now)
+            .expect_err(&format!("rows {what}: written"));
+        assert!(e.to_string().contains("key index"), "{what}: {e}");
+        let fresh = Volume::open(&overlay, forge.offset).unwrap();
+        assert!(fresh.lookup("/new.txt").is_err(), "{what}");
+        assert!(fresh.lookup("/small.txt").is_ok(), "{what}");
+        assert!(!fresh.check(&[]).unwrap().problems.is_empty(), "{what}");
+    }
+}
+
+#[test]
+fn descriptor_row_counts_at_their_ends_do_not_panic_the_writer() {
+    // The root directory's descriptor counting no rows, or 2^63 - 1: a
+    // row deleted and a row added change the count as far as it goes
+    // (wrapping, as the count of pages does), and the check names it.
+    // 1.2.2 and 1.3 until its fuzz round panicked subtracting from 0 and
+    // adding past 2^63 (found reading the code of the finding above).
+    let now = 134_700_000_000_000_000;
+    for count in [0, i64::MAX as u64] {
+        let mut forge = Forge::fixture("r314small");
+        forge.patch(
+            Tree::Object(ROOT_DIRECTORY),
+            |_| true,
+            |page| page[0x50 + 0x20..0x50 + 0x28].copy_from_slice(&count.to_le_bytes()),
+        );
+        let overlay = Overlay::new(&forge.image);
+        let mut vol = Volume::open(&overlay, forge.offset).unwrap();
+        if count == 0 {
+            vol.delete_file("/small.txt", now).unwrap();
+        } else {
+            vol.create_file("/new.txt", b"new", now).unwrap();
+        }
+        let problems = vol.check(&[]).unwrap().problems;
+        assert!(
+            problems
+                .iter()
+                .any(|p| p.contains("object 0x600: its descriptor counts") && p.contains("rows")),
+            "{count:#x}: {problems:?}"
+        );
+    }
+}
+
+#[test]
+fn check_finds_rows_named_past_their_area() {
+    // A leaf whose rows are one row as long as the row area, which every
+    // key index entry names: more bytes of rows than the area holds, a
+    // problem the check names (1.2.2 and 1.3 until its fuzz round
+    // panicked subtracting them from the area; found reading the code of
+    // the finding above).
+    let forge = forged_leaf(|page, h| {
+        let (start, index, count) = (le32(page, h), le32(page, h + 0x10), le32(page, h + 0x14));
+        assert!(count >= 2);
+        let size = (index - start) & !7;
+        put32(page, h + 4, start + size);
+        put32(page, h + start, size);
+        let flags = le16(page, h + start + 8) & !4;
+        page[h + start + 8..h + start + 10].copy_from_slice(&flags.to_le_bytes());
+        page[h + 0x0d] &= !8;
+        for i in 0..count {
+            put32(page, h + index + 4 * i, 0xffff_0000 | start);
+        }
+    });
+    let problems = forge.volume().unwrap().check(&[]).unwrap().problems;
+    assert!(
+        problems.iter().any(|p| p.contains("past the key index")),
+        "{problems:?}"
+    );
 }

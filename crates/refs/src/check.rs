@@ -472,13 +472,14 @@ fn page_problems(page: &[u8]) -> Option<String> {
         }
         live += size;
     }
-    if index.checked_sub(start + live) != Some(free) {
-        return Some(format!(
-            "{free:#x} free bytes, the rows leave {:#x}",
-            index - start - live
-        ));
+    match index.checked_sub(start + live) {
+        Some(left) if left == free => None,
+        Some(left) => Some(format!("{free:#x} free bytes, the rows leave {left:#x}")),
+        // Rows the key index names more than once.
+        None => Some(format!(
+            "{live:#x} bytes of rows from {start:#x}, past the key index at {index:#x}"
+        )),
     }
-    None
 }
 
 impl<D: ReadAt> Volume<D> {

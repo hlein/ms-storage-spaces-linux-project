@@ -151,6 +151,15 @@
   or named by no file), and counts the clusters used that nothing
   references (on ReFS 3.14; Windows leaves some on every volume, so they
   are not problems).
+* ReFS on a damaged volume: a page whose node header put its rows past its
+  key index panicked the writer when it compacted the page to add a row
+  (found by the 24-hour fuzzing of the writer). The writer now refuses a
+  page whose rows do not lie between its node header and its key index (no
+  page Windows wrote in the corpus has them elsewhere); `refs check` names
+  such a page. A table whose descriptor counted no rows (or 2^63 - 1)
+  panicked the writer deleting (adding) a row, and a page whose key index
+  names more bytes of rows than the page holds panicked `refs check`: the
+  count wraps now, as the count of pages did, and the check names both.
 * `refs mount --rw`: a `refs write` (or any writing command) during the
   mount was lost when the mount wrote its view of the volume over it. The
   writing commands and the mount for writing take the device or image

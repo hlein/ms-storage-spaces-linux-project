@@ -186,6 +186,17 @@
   directory of more than 200 000 names, so every name looked up there read
   all of it again; it trims when the idle ones are more than it keeps, and
   keeps such a listing alone.
+* ReFS at scale, block clones: cloning a large file walked the whole block
+  reference count table twice for every block of 1024 clusters it shares,
+  and each step down the table went over every page of the change, so that
+  the time grew with the square of the file (280 s for 32 GiB; found by the
+  24-hour fuzzing of the writer, a clone of a file patched to 15 GB that ran
+  past its 5-minute limit); deleting a copy of such a file did the same for
+  every block of a row of one count (139 s). Each block's row is found by
+  its key now (0.3 s for either). A row of one count reaching past cluster
+  2^64, and a row whose total of counts was at 2^32 - 1, panicked the writer
+  counting a block of it; the first is an error now, the second keeps its
+  total.
 * Storage Spaces writers and management (audit 2026-10-16): a copy of the
   pool database was written header first, in one write with its entries,
   so that a write torn by a crash made it the newest copy and could make a

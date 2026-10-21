@@ -740,8 +740,9 @@ impl<'v, D: WriteAt> Transaction<'v, D> {
             }
         }
         if !blocks.is_empty() {
+            let mut ranges = self.refcount_ranges(rows.iter().map(|r| r.2));
             for block in blocks {
-                self.unpack_refcounts(block)?;
+                self.unpack_refcounts(&mut ranges, block)?;
             }
             rows = self.refcount_rows()?;
         }
@@ -790,37 +791,83 @@ impl<'v, D: WriteAt> Transaction<'v, D> {
         Ok(rows)
     }
 
+    /// The ranges of the block reference count table's `rows`, by first
+    /// cluster: (clusters, whether a row of counts). A change that goes
+    /// over many blocks reads them once and keeps them as it changes the
+    /// rows, so that it finds each block's row by its key instead of
+    /// walking the table for every block.
+    fn refcount_ranges(&self, rows: impl Iterator<Item = RowAt>) -> BTreeMap<u64, (u64, bool)> {
+        rows.filter_map(|r| {
+            let v = &self.pages[r.page].data[r.value..r.value + r.len];
+            let (first, n) = refcount::range(v)?;
+            Some((first, (n, le32(v, 0x14) == refcount::COUNTS)))
+        })
+        .collect()
+    }
+
+    /// The leaf row whose key is `key` in a table ordered by `order`: in
+    /// the leaf the index leads to (where `insert_sorted` puts it), else
+    /// (a table whose index leads elsewhere) wherever a walk finds it.
+    fn find_key(
+        &mut self,
+        tree: Tree,
+        key: &[u8],
+        order: &dyn Fn(&[u8], &[u8]) -> std::cmp::Ordering,
+    ) -> Result<RowAt> {
+        let page = self.find_leaf(tree, key, order)?;
+        let d = &self.pages[page].data;
+        let base = d.as_ptr() as usize;
+        for row in Node::at(d, PAGE_HEADER_SIZE)?.rows() {
+            let row = row?;
+            if row.key == key {
+                return Ok(RowAt {
+                    page,
+                    value: row.value.as_ptr() as usize - base,
+                    len: row.value.len(),
+                });
+            }
+        }
+        self.find(tree, &|k| k == key)
+    }
+
     /// Turns the row of one count for a range (kind 0) that holds `block`
     /// into a row of counts for that block, the rest of its range staying
     /// in rows of one count before and after it (none to do for a row of
-    /// counts).
-    fn unpack_refcounts(&mut self, block: u64) -> Result<()> {
+    /// counts, nor where no row holds the block). `ranges` (see
+    /// `refcount_ranges`) names the row and follows the change.
+    fn unpack_refcounts(&mut self, ranges: &mut BTreeMap<u64, (u64, bool)>, block: u64) -> Result<()> {
         const REFCOUNTS: usize = 6;
         let tree = Tree::Root(REFCOUNTS);
-        let at = self.find(tree, &|k| {
-            k.len() >= 16 && le64(k, 0) <= block && block < le64(k, 0).saturating_add(le64(k, 8))
-        })?;
-        let val = self.pages[at.page].data[at.value..at.value + at.len].to_vec();
-        if le32(&val, 0x14) == refcount::COUNTS {
+        let Some((&first, &(n, counts))) = ranges.range(..=block).next_back() else {
+            return Ok(());
+        };
+        if counts || block >= first.saturating_add(n) {
             return Ok(());
         }
-        let (first, n) =
-            refcount::range(&val).ok_or_else(|| format_err!("reference count row of {} bytes", val.len()))?;
+        let key = [first.to_le_bytes(), n.to_le_bytes()].concat();
+        let at = self.find_key(tree, &key, &u64_key_order)?;
+        let val = self.pages[at.page].data[at.value..at.value + at.len].to_vec();
         let (count, stamp) = (le16(&val, 0x1c), le32(&val, 0x10));
         if !first.is_multiple_of(refcount::BLOCK) || !n.is_multiple_of(refcount::BLOCK) {
             return Err(format_err!(
                 "reference count row ({first:#x}, {n:#x}) not of whole blocks"
             ));
         }
-        let old = val[..16].to_vec();
-        self.remove_quiet(at.page, &|k| k == old.as_slice())?;
+        let past = first
+            .checked_add(n)
+            .ok_or_else(|| format_err!("reference count row ({first:#x}, {n:#x}) past the last cluster"))?;
+        self.remove_quiet(at.page, &|k| k == key.as_slice())?;
         let mut rows = vec![refcount::counts_value(block, count, stamp)];
+        ranges.remove(&first);
+        ranges.insert(block, (refcount::BLOCK, true));
         if block > first {
             rows.push(refcount::uniform_value(first, block - first, count, stamp));
+            ranges.insert(first, (block - first, false));
         }
         let end = block + refcount::BLOCK;
-        if end < first + n {
-            rows.push(refcount::uniform_value(end, first + n - end, count, stamp));
+        if end < past {
+            rows.push(refcount::uniform_value(end, past - end, count, stamp));
+            ranges.insert(end, (past - end, false));
         }
         for v in rows {
             self.insert_sorted(tree, &row_keyed_by_value(&v, 16), &u64_key_order)?;
@@ -866,17 +913,14 @@ impl<'v, D: WriteAt> Transaction<'v, D> {
                 by_block.entry(v & !(BLOCK - 1)).or_default().push(v);
             }
         }
+        let mut ranges = self.refcount_ranges(existing.into_iter());
         for (block, clusters) in by_block {
             // A row of one count over the block: rows of counts first.
-            let covered = self.find(tree, &|k| {
-                k.len() >= 16 && le64(k, 0) <= block && block < le64(k, 0).saturating_add(le64(k, 8))
-            });
-            if covered.is_ok() {
-                self.unpack_refcounts(block)?;
-            }
+            self.unpack_refcounts(&mut ranges, block)?;
             let key = [block.to_le_bytes(), BLOCK.to_le_bytes()].concat();
-            match self.find(tree, &|k| k == key.as_slice()) {
-                Ok(at) => {
+            match ranges.get(&block) {
+                Some(&(BLOCK, true)) => {
+                    let at = self.find_key(tree, &key, &u64_key_order)?;
                     let v = self.value_mut(at);
                     if v.len() < 0x1c + 2 * BLOCK as usize {
                         return Err(format_err!("reference count row of {} bytes", v.len()));
@@ -890,10 +934,10 @@ impl<'v, D: WriteAt> Transaction<'v, D> {
                         }
                         v[i..i + 2].copy_from_slice(&(raw + 1).to_le_bytes());
                     }
-                    let total = le32(v, 0x18) + clusters.len() as u32;
+                    let total = le32(v, 0x18).saturating_add(clusters.len() as u32);
                     v[0x18..0x1c].copy_from_slice(&total.to_le_bytes());
                 }
-                Err(Error::NotFound(_)) => {
+                _ => {
                     let mut value = refcount::counts_value(block, 0, stamp);
                     value[0x18..0x1c].copy_from_slice(&(clusters.len() as u32).to_le_bytes());
                     for &c in &clusters {
@@ -901,8 +945,8 @@ impl<'v, D: WriteAt> Transaction<'v, D> {
                         value[i..i + 2].copy_from_slice(&1u16.to_le_bytes());
                     }
                     self.insert_sorted(tree, &row_keyed_by_value(&value, 16), &u64_key_order)?;
+                    ranges.insert(block, (BLOCK, true));
                 }
-                Err(e) => return Err(e),
             }
         }
         Ok(())
@@ -1176,7 +1220,7 @@ impl<'v, D: WriteAt> Transaction<'v, D> {
         if let Some(i) = self
             .pages
             .iter()
-            .position(|p| p.parent.as_ref() == Some(&(parent, key.clone())))
+            .position(|p| p.parent.as_ref().is_some_and(|(q, k)| *q == parent && *k == key))
         {
             return Ok(i);
         }
@@ -5970,5 +6014,94 @@ mod tests {
         assert!(!archived(&vol, path), "set_times set it");
         assert!(!archived(&vol, "/elsewhere"));
         assert_eq!(vol.check(&[]).unwrap().problems, Vec::<String>::new());
+    }
+
+    /// The clusters of a clone of 32 GiB (8192 blocks of the block
+    /// reference count table, some 2800 pages of its rows) counted once
+    /// more: in time with the blocks, not with them times the table's
+    /// pages (0.3 s; 1.2.2 took 280 s). 1.2.2 walked the whole table twice
+    /// for every block, and each step down it went over every page of the
+    /// transaction (1.3's fuzzing of the writer found the clone of a file
+    /// patched to 15 GB taking over 7 minutes).
+    #[test]
+    fn references_of_a_large_clone_are_counted_in_time() {
+        let vol = small();
+        let mut tx = Transaction::begin(&vol).unwrap();
+        let (first, blocks) = (0x30_0000u64, 8192u64);
+        let before = tx.refcount_rows().unwrap().len();
+        let t = std::time::Instant::now();
+        tx.add_references(&[(first, blocks * refcount::BLOCK)]).unwrap();
+        let took = t.elapsed();
+        let rows = tx.refcount_rows().unwrap();
+        assert_eq!(rows.len(), before + blocks as usize);
+        let ours: Vec<_> = rows.iter().filter(|r| r.0 >= first).collect();
+        for (i, (start, end, at)) in ours.iter().enumerate() {
+            let v = &tx.pages[at.page].data[at.value..at.value + at.len];
+            assert_eq!(
+                (*start, *end),
+                (first + i as u64 * 0x400, first + (i as u64 + 1) * 0x400)
+            );
+            assert_eq!(le32(v, 0x18), 0x400, "block {i}: one reference more for each cluster");
+        }
+        assert!(took < std::time::Duration::from_secs(30), "{took:?}");
+    }
+
+    /// A row of one count over 8192 blocks (Windows packs counts so), one
+    /// cluster of each block then referenced once less, as deleting a copy
+    /// does: every block unpacked into a row of counts, in time with the
+    /// blocks (0.3 s; 1.2.2 walked the table for every block, as above,
+    /// and took 139 s).
+    #[test]
+    fn rows_of_one_count_are_unpacked_in_time() {
+        let vol = small();
+        let mut tx = Transaction::begin(&vol).unwrap();
+        let (first, blocks) = (0x30_0000u64, 8192u64);
+        let v = refcount::uniform_value(first, blocks * refcount::BLOCK, 1, REFCOUNT_STAMP);
+        tx.insert_sorted(Tree::Root(6), &row_keyed_by_value(&v, 16), &u64_key_order)
+            .unwrap();
+        let virtuals: Vec<u64> = (0..blocks).map(|b| first + b * refcount::BLOCK + 5).collect();
+        let t = std::time::Instant::now();
+        let last = tx.unreference(&virtuals).unwrap();
+        let took = t.elapsed();
+        assert!(last.iter().all(|&l| !l), "one reference left each");
+        let rows = tx.refcount_rows().unwrap();
+        let ours: Vec<_> = rows.iter().filter(|r| r.0 >= first).collect();
+        assert_eq!(ours.len(), blocks as usize);
+        for (i, (start, _, at)) in ours.iter().enumerate() {
+            let v = &tx.pages[at.page].data[at.value..at.value + at.len];
+            assert_eq!(*start, first + i as u64 * refcount::BLOCK);
+            assert_eq!(le32(v, 0x14), refcount::COUNTS, "block {i}");
+            assert_eq!(refcount::count_of(v, start + 5), Some(0), "block {i}");
+            assert_eq!(refcount::count_of(v, start + 6), Some(1), "block {i}");
+        }
+        assert!(took < std::time::Duration::from_secs(30), "{took:?}");
+    }
+
+    /// Reference count rows at the ends of their numbers: a row of one
+    /// count reaching past cluster 2^64 is an error when a block of it is
+    /// counted, and a row of counts whose total is 2^32 - 1 keeps that
+    /// total (1.2.2 and 1.3 until its fuzz round panicked adding either;
+    /// found reading the code of the finding above).
+    #[test]
+    fn reference_count_rows_at_their_ends_do_not_panic() {
+        let vol = small();
+        let tree = Tree::Root(6);
+        let mut tx = Transaction::begin(&vol).unwrap();
+        let v = refcount::uniform_value(0x30_0000, u64::MAX - 0x3ff, 1, REFCOUNT_STAMP);
+        tx.insert_sorted(tree, &row_keyed_by_value(&v, 16), &u64_key_order)
+            .unwrap();
+        let e = tx.add_references(&[(0x30_0400, 1)]).unwrap_err();
+        assert!(e.to_string().contains("past the last cluster"), "{e}");
+        let mut tx = Transaction::begin(&vol).unwrap();
+        let mut v = refcount::counts_value(0x40_0000, 0, REFCOUNT_STAMP);
+        v[0x18..0x1c].copy_from_slice(&u32::MAX.to_le_bytes());
+        tx.insert_sorted(tree, &row_keyed_by_value(&v, 16), &u64_key_order)
+            .unwrap();
+        tx.add_references(&[(0x40_0001, 1)]).unwrap();
+        let rows = tx.refcount_rows().unwrap();
+        let at = refcount_row(&rows, 0x40_0001).unwrap();
+        let v = &tx.pages[at.page].data[at.value..at.value + at.len];
+        assert_eq!(le32(v, 0x18), u32::MAX);
+        assert_eq!(refcount::count_of(v, 0x40_0001), Some(1));
     }
 }

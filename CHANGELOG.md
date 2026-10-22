@@ -333,10 +333,13 @@
   needed dpkg 1.21.18) and a description that says what refs does now (it
   said read-only).
 * `tools/build-static.sh` builds the static binaries the releases ship:
-  without the build machine's paths, symbols stripped (the release
-  profile); two builds of one tree in different directories give
-  identical binaries (`tools/repro-check.sh`). `SHA256SUMS` stays unsigned,
-  and the user guide says so.
+  without the build machine's paths (the source tree, the crates, the
+  target directory and the toolchain's own sources, which the standard
+  library's code names; 1.2.2's binaries named the crates and the
+  toolchain's sources in the home directory), symbols stripped (the release
+  profile); two builds of one tree in different directories give identical
+  binaries, and none names the machine (`tools/repro-check.sh`).
+  `SHA256SUMS` stays unsigned, and the user guide says so.
 * CI: read-only permissions, actions pinned by commit, `cargo install`
   pinned and cached, pushes of `main` and tags only, shellcheck over
   `tools/` and `contrib/`, the tests of the feature `test-hooks`, a smoke

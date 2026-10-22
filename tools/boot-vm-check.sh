@@ -175,8 +175,10 @@ unit=$(cat /var/tmp/boot-check.unit)
 # server began to stop (monotonic seconds).
 pj() { sudo journalctl -b -1 --no-pager -o short-monotonic "$@"; }
 at() { sed -n 's/^\[ *\([0-9.]*\)\].*/\1/p' | head -1; }
-unmounted=$(pj | grep -E 'Unmounted (mnt-sstest\\x2dboot\.mount|/mnt/sstest-boot)' | at)
-stopping=$(pj | grep -E "(Stopping|Stopped) $unit" | at)
+# Either line may be missing (the cases below say what that means): grep
+# finding nothing is no failure of the harness.
+unmounted=$(pj | { grep -E 'Unmounted (mnt-sstest\\x2dboot\.mount|/mnt/sstest-boot)' || true; } | at)
+stopping=$(pj | { grep -E "(Stopping|Stopped) $unit" || true; } | at)
 # A server that stops after local-fs-pre.target stops after journald too:
 # its stop is then not in the journal.
 if [[ -z $unit ]]; then

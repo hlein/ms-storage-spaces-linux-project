@@ -1,6 +1,27 @@
 # Changelog
 
-## Unreleased
+## 1.3.0 (2026-10-22)
+
+The rest of the code audit of 2026-10-16: the spaces of a pool attached at
+once; verdicts that called damaged spaces healthy (a lost first copy of the
+partition table, rows without extents, mirror copies the dirty region log
+lists that differ, a deep check that could not run); parity spaces written
+on recycled slabs; attach and detach that survive being cut off and refuse
+what is in use, upgrades and shutdowns that keep spaces and their volumes in
+order; the ReFS writer's changes of several steps in one commit each, its
+data and structure as Windows has them, and `refs mount --rw` holding the
+volume alone; ReFS at scale; the writes of the management commands; a child
+process per pool for the checks of `spaces attach` and `spaces check`, with
+a memory limit and a deadline; the licence notices of what ships, in static
+binaries that name nothing of the machine they were built on. Every fuzz
+target ran 24 hours and the oracles over every corpus pool (docs/security.md
+says what ran; the fuzzing found two faults of the ReFS writer, fixed here).
+Checked on Ubuntu 26.10 and 22.04 (`tools/guard-check.sh`,
+`tools/mount-vm-check.sh`, `tools/package-vm-check.sh` with an upgrade from
+1.2.2 on 26.10, `tools/multi-vm-check.sh`, `tools/attach-crash-check.sh`,
+`tools/server-check.sh`, `tools/refs-mount-check.sh --rw`, the management
+scripts `tools/mgmt-*.sh`), and across two restarts on 26.10
+(`tools/boot-vm-check.sh`).
 
 ### Fixes
 

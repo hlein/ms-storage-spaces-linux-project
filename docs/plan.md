@@ -737,6 +737,37 @@ rows of thin spaces not allocated yet (M7).
   found; the two inputs it reported as slow (11 s and 14 s) rewrite or clone,
   several times over, files patched to claim 1.9 and 8 million clusters, and
   take time in proportion to them.
+* Release `v1.3.0` (2026-10-22): the rest of the code audit of 2026-10-16 (plan
+  of 2026-10-17, items 2.0-2.18): the spaces of a pool attached at once
+  (read-only servers share the disks); false verdicts (a lost primary GPT, a
+  protective MBR without a GPT, rows without extents, the dirty region log's
+  runs, deep checks that could not run, NTFS volumes smaller than their
+  partition); parity spaces on recycled slabs writable again; attach that
+  survives being killed at any step, device-mapper UUIDs and names of the
+  project; detach that refuses what is in use before removing anything, upgrades
+  that attach hand-attached spaces again, shutdowns that unmount volumes before
+  their servers stop; the ReFS writer's changes of several steps in one commit
+  each, stale tails, sparse files, Windows' room in extent maps, the upcase
+  order and names Windows can open, `refs check` of keys across leaves and of
+  descriptor and reference counts; `refs mount --rw` holding the volume alone;
+  ReFS at scale; the Storage Spaces writers and planners; ReFS 3.1's log
+  checked; `mount.ReFS` keeping its sandbox; a child process per pool with a
+  memory limit and a deadline; licence notices, a DEP-5 copyright, static builds
+  that name nothing of the build machine, CI hardening and harnesses that fail
+  where something fails; new corpus pools made by Windows. Verified as recorded
+  above. The release preparation found two more problems, fixed before the
+  release: the static binaries still named the toolchain's sources in the build
+  machine's home directory (`tools/repro-check.sh` now fails on that), and the
+  boot check's harness ended when the server's stop was rightly missing from the
+  journal. VM checks on the final binaries: on Ubuntu 26.10 (.143) `guard-check`
+  29 passed, `mount-vm-check` 11, `package-vm-check` 17 (with an upgrade from
+  1.2.2), `multi-vm-check` 5, `attach-crash-check` 26, `server-check` 5,
+  `refs-mount-check --rw` 5, the management scripts (lifecycle, crash, replace,
+  tiers, corpus) all, and `boot-vm-check` twice, 6 each; on Ubuntu 22.04 (.142)
+  the same with 18, 11, 12, 5, 26, 5 and 5 passed (7 cases skipped where
+  linuxreflect's `install.sh` installation shadows the package), the management
+  scripts too (the corpus one alone: in one run after the others it ran out of
+  room on the VM's scratch disk), no boot check (that VM is shared).
 
 ### Track B (from 2026-10-02)
 

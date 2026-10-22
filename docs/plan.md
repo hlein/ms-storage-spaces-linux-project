@@ -689,6 +689,54 @@ rows of thin spaces not allocated yet (M7).
   no skipped check of a structure the database lists (1,971 other skips, as
   before), 669 missing-disk cases none healthy, and no mutant over 3 s, not
   even once.
+* 1.3 verification (item 2.17 of the plan of 2026-10-17, 2026-10-18 to
+  2026-10-22). MSRV (`cargo +1.89 check --locked --workspace --all-targets`,
+  also `spaces-cli` with its test hooks), `cargo deny check` and `cargo audit`
+  (the two accepted `bitmaps` warnings) pass on ae5583f and again on bcad775.
+  Oracles of `crates/refs/tests/oracle.rs` over the 84 corpus pools (the 81 and
+  the three of item 2.11), 30,000 mutants per pool and mode, 12 processes at
+  nice 19 in the idle I/O class: a first run (2026-10-18 from 19:10, on 6ad924c)
+  was cut short by a restart of the host after 132 of 168 pool-modes (nothing
+  found in them; its logs went with the restart) and does not count. The run
+  that counts (2026-10-19 05:45 to 09:40, on ae5583f; the commits after it
+  change the ReFS writer and `refs check` only, which neither the guard nor the
+  oracles use): 5.04 million mutants, no panic, no unreadable read, no mutant
+  over 3 s when timed again (seven were once, under the load of the run); no
+  wrong data under a healthy verdict on the 48 pools with three or more database
+  copies, and 972 such cases on 5 pools with fewer (`thin2c` 860, whose
+  write-back cache a simple space keeps once; `au1g_26100` 63, `wc4k` 25, `au1g`
+  23 and `simple1c_26100` 1, single-disk pools whose database is kept once); no
+  skipped check of a structure the database lists, 1,578 other skips in the
+  damage mode and none in the user mode (1.2.2's 85 on the NTFS pools went with
+  item 2.2's backup GPT); 718 missing-disk cases, none healthy (degraded 368,
+  failed 314, suspect 44, pool not opened 34), every readable space read as
+  whole. The hidden-header oracle passed in the test suite. Fuzzing: every
+  target 24 hours at nice 19, one worker each with at most 2 GiB
+  (`tools/fuzz-long.sh 86400`), from the corpus of the earlier runs, from the
+  evening of 2026-10-19 on CPUs 52-63 only. Round 1 (2026-10-19 09:43 to
+  2026-10-20 09:43, on ae5583f): `cache_index` 6,506,281 runs, `create`
+  1,061,961, `database` 1,243,868,933, `manage` 6,222,489, `pool_open`
+  2,280,659, `pool_write` 1,560,433, `record_decode` 1,358,399,962, `records`
+  4,155,600,267, `refs_parsers` 298,802,148, `refs_volume` 1,266,779: nothing
+  found. `guard_userdata` stopped after 12 hours when its 10-second watchdog
+  fired during a stall of the whole host (every target logged a slow input in
+  the same second; the input takes 71 ms alone), and again when the host went
+  down for an update; resumed from its corpus each time for the time left, it
+  ran 86,400 s and at least 1,993,547 runs and found nothing. `refs_write` found
+  a panic after 22 hours (1,314,939 runs), fixed in 8a7b283. The 39 inputs
+  libFuzzer reported as slow (28 during another project's build, 10 in the
+  stall, 1 besides) took at most 1.8 s alone. Round 2 (2026-10-20 17:45 to
+  2026-10-21 17:45, on 8a7b283; a first start ended after 3.5 minutes when the
+  host went down): `parity_journal` 3,253,349, `partitions` 194,853,080,
+  `dirty_regions` 1,244,996,984, `policy_fields` 3,256,028, `report_json`
+  1,120,375,788, and `refs_volume` again, as `refs check` had changed,
+  2,935,448: nothing found. `refs_write` ran past libFuzzer's 5-minute limit
+  after 18 hours (1,389,544 runs) cloning a file patched to claim 15 GB, which
+  took time with the square of the file; fixed in bcad775. Round 3 (2026-10-21
+  18:41 to 2026-10-22 18:42, on bcad775): `refs_write` 1,113,212 runs, nothing
+  found; the two inputs it reported as slow (11 s and 14 s) rewrite or clone,
+  several times over, files patched to claim 1.9 and 8 million clusters, and
+  take time in proportion to them.
 
 ### Track B (from 2026-10-02)
 

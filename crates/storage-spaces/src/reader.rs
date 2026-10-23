@@ -686,7 +686,7 @@ impl<D: ReadAt> Mapped<'_, D> {
 /// space reads zeros there). Its own slab map, or that of each of its
 /// storage tiers over the tier's range; layouts that do not parse are
 /// reported where they are built.
-pub(crate) fn unmapped<D: ReadAt>(pool: &Pool<D>, space: &Space) -> Option<String> {
+pub(crate) fn unmapped(space: &Space, children: &[&Space]) -> Option<String> {
     if space.info.provisioning != Provisioning::Fixed {
         return None;
     }
@@ -707,9 +707,10 @@ pub(crate) fn unmapped<D: ReadAt>(pool: &Pool<D>, space: &Space) -> Option<Strin
             }
         ))
     };
-    let tiers: Vec<&Space> = pool
-        .children(space.id())
+    let tiers: Vec<&Space> = children
+        .iter()
         .filter(|c| c.info.is_child && !c.extents.is_empty())
+        .copied()
         .collect();
     if tiers.is_empty() {
         gap(space, space.info.size?)
@@ -842,6 +843,19 @@ impl<'p, D: ReadAt> SpaceReader<'p, D> {
     /// Opens a space as [`Pool::open_space_with`] does; an error names the
     /// part of the space that could not be opened.
     pub fn open_parts(pool: &'p Pool<D>, id: u64, options: OpenOptions) -> std::result::Result<Self, (Part, Error)> {
+        Self::open_parts_among(pool, id, options, pool.children(id).collect())
+    }
+
+    /// [`SpaceReader::open_parts`], with the hidden spaces directly under
+    /// the space at hand (from [`Pool::parents`], when many spaces are
+    /// opened: a pool can have tens of thousands, and looking them up
+    /// for each space goes over all of them).
+    pub(crate) fn open_parts_among(
+        pool: &'p Pool<D>,
+        id: u64,
+        options: OpenOptions,
+        children: Vec<&'p Space>,
+    ) -> std::result::Result<Self, (Part, Error)> {
         let space = pool
             .spaces
             .get(&id)
@@ -851,9 +865,6 @@ impl<'p, D: ReadAt> SpaceReader<'p, D> {
             Some(size) => size,
             None => base.layout.mapped_size(),
         };
-        // The hidden spaces under it, looked up once (a pool can have
-        // tens of thousands).
-        let children: Vec<&'p Space> = pool.children(space.id()).collect();
         let mut notes = Vec::new();
         let cache = Self::open_cache(pool, space, &children, &mut notes).map_err(|e| (Part::Cache, e))?;
         let mut tiers = children
@@ -862,7 +873,7 @@ impl<'p, D: ReadAt> SpaceReader<'p, D> {
             .map(|c| Mapped::new(pool, c))
             .collect::<Result<Vec<_>>>()
             .map_err(|e| (Part::Tiers, e))?;
-        if let Some(why) = unmapped(pool, space) {
+        if let Some(why) = unmapped(space, &children) {
             return Err((Part::Layout, Error::Pool(why)));
         }
         let journal = Self::open_journal(pool, space, &children, &mut notes)

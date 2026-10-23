@@ -539,10 +539,26 @@ pub fn space_report_with<D: ReadAt>(
     options: &Options,
     fs: &mut FsHook<'_, D>,
 ) -> Report {
+    space_report_among(pool, space, health, names, options, fs, None)
+}
+
+/// [`space_report_with`], with the hidden spaces directly under `space` at
+/// hand when they are (from [`Pool::parents`]).
+fn space_report_among<D: ReadAt>(
+    pool: &Pool<D>,
+    space: &Space,
+    health: &Result<Health, String>,
+    names: &[String],
+    options: &Options,
+    fs: &mut FsHook<'_, D>,
+    children: Option<&[&Space]>,
+) -> Report {
     let mut report = empty_report(pool, space);
     report.checks = pool_checks(pool, names);
     report.checks.push(state_check(pool, space, health));
-    report.checks.extend(space_checks(pool, space, names, options, fs));
+    report
+        .checks
+        .extend(space_checks(pool, space, names, options, fs, children));
     report
 }
 
@@ -554,8 +570,14 @@ pub fn pool_reports<D: ReadAt>(
     fs: &mut FsHook<'_, D>,
 ) -> Vec<Report> {
     let health = pool_health(pool);
+    // The spaces by parent, once: each space's hidden spaces are looked up
+    // there, not among all the pool's spaces for every space.
+    let parents = pool.parents();
     pool.user_spaces()
-        .map(|s| space_report_with(pool, s, &health, names, options, fs))
+        .map(|s| {
+            let children = parents.get(&s.id()).map_or(&[][..], Vec::as_slice);
+            space_report_among(pool, s, &health, names, options, fs, Some(children))
+        })
         .collect()
 }
 
@@ -566,8 +588,13 @@ fn space_checks<D: ReadAt>(
     names: &[String],
     options: &Options,
     fs: &mut FsHook<'_, D>,
+    children: Option<&[&Space]>,
 ) -> Vec<Check> {
-    let reader = match SpaceReader::open_parts(pool, space.id(), OpenOptions::default()) {
+    let opened = match children {
+        Some(c) => SpaceReader::open_parts_among(pool, space.id(), OpenOptions::default(), c.to_vec()),
+        None => SpaceReader::open_parts(pool, space.id(), OpenOptions::default()),
+    };
+    let reader = match opened {
         Ok(r) => r,
         Err((part, e)) => {
             let (id, what) = match part {

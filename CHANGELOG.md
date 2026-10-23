@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+### Fixes
+
+* The checks of a pool of many spaces (`spaces attach`, `spaces check`)
+  took about three times as long as in 1.2.2: 1.3.0's check for unmapped
+  fixed spaces looked up each space's hidden spaces among all the pool's
+  spaces again, for the space and for the pool's health (the reports of
+  10 000 spaces with 40 000 hidden ones: 34 s, 1.2.2 13 s). It takes them
+  from what its caller looked up; the library's `guard::pool_reports` looks
+  them up once for the whole pool (0.5 s).
+
 ## 1.3.0 (2026-10-22)
 
 The rest of the code audit of 2026-10-16: the spaces of a pool attached at

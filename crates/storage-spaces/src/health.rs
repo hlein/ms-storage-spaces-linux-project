@@ -158,7 +158,8 @@ pub fn health<D: ReadAt>(pool: &Pool<D>) -> Result<Health> {
                 continue;
             }
         };
-        if let Some(why) = crate::reader::unmapped(pool, space) {
+        let children = parents.get(&space.id()).map_or(&[][..], Vec::as_slice);
+        if let Some(why) = crate::reader::unmapped(space, children) {
             unknown.push((space.id(), why));
             continue;
         }

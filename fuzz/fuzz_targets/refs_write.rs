@@ -33,8 +33,15 @@ static BASES: LazyLock<[SparseImage; 2]> = LazyLock::new(|| {
 });
 const OFFSET: u64 = 16 << 20;
 /// The clusters each fixture leaks as Windows left it.
-static LEAKED: LazyLock<[u64; 2]> =
-    LazyLock::new(|| [0, 1].map(|i| Volume::open(&BASES[i], OFFSET).unwrap().check(&[]).unwrap().leaked_clusters));
+static LEAKED: LazyLock<[u64; 2]> = LazyLock::new(|| {
+    [0, 1].map(|i| {
+        Volume::open(&BASES[i], OFFSET)
+            .unwrap()
+            .check(&[])
+            .unwrap()
+            .leaked_clusters
+    })
+});
 const PATHS: [&str; 14] = [
     "/small.txt",
     "/mid.bin",

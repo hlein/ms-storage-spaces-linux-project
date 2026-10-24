@@ -448,7 +448,12 @@ pub fn remove_disk_updates(db: &Database, disk_id: u64, timestamp: u64) -> Resul
     // Second: the metadata space, the pool record, the renumbered extents.
     let s2 = s1 + 1;
     metadata.sequence = s2;
-    metadata.copies -= 1;
+    // A copy count of 0 is no metadata space a disk can leave (1.3.0
+    // underflowed: audit 2026-10-21, SPW-01).
+    metadata.copies = metadata
+        .copies
+        .checked_sub(1)
+        .ok_or_else(|| format_err!("the metadata space records no copies"))?;
     metadata.redundancy = metadata.redundancy.saturating_sub(1);
     if metadata.copies == 1 {
         metadata.resiliency = 1;

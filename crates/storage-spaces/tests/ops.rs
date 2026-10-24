@@ -712,7 +712,8 @@ fn a_torn_database_copy_never_passes_for_the_newest() {
 /// partitions: a partition table that makes the first member's pool
 /// partition 8 KiB long (its database takes 12 KiB) gets no write past
 /// it. 1.2.2 planned a rename that wrote the copy across the partition's
-/// end (audit 2026-10-16, M20).
+/// end (audit 2026-10-16, M20); since 1.3.1 the pool is refused first, its
+/// disk record claiming more data than the partition holds.
 #[test]
 fn database_copies_stay_inside_their_partitions() {
     use storage_spaces::ops::{plan_delete_space, plan_rename_pool};
@@ -747,7 +748,10 @@ fn database_copies_stay_inside_their_partitions() {
     assert_eq!(m.partition.length, 8192);
     let end = m.partition.offset + m.partition.length;
     match plan_rename_pool(&pool, "renamed") {
-        Err(e) => assert!(e.to_string().contains("does not fit"), "{e}"),
+        Err(e) => assert!(
+            e.to_string().contains("does not fit") || e.to_string().contains("beyond its partition"),
+            "{e}"
+        ),
         Ok(plan) => {
             for a in plan.steps.iter().flat_map(|s| &s.actions) {
                 if let Action::Write {

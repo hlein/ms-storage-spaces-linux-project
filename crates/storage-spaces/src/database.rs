@@ -115,10 +115,14 @@ impl Database {
         // The slots past those the header counts are free, whatever a write
         // a crash cut short left in them (readers never read them; an update
         // would count them again, and a record no one wrote whole with them).
+        // A free slot as formatted: its signature and number too (1.3.0 kept
+        // a wrong number, and the database an update counted it in no
+        // longer read: the auditor's spa_07).
         for i in counted.max(HEADER_SLOTS)..db.slots() {
-            if !db.is_free(i) {
-                db.free(i);
-            }
+            let e = db.slot_mut(i);
+            e[..4].copy_from_slice(SDBB_SIGNATURE);
+            e[4..8].copy_from_slice(&(i as u32).to_be_bytes());
+            e[8..].fill(0);
         }
         Ok(db)
     }
@@ -323,6 +327,31 @@ impl Database {
             free = free.max(end);
         }
         Ok(free)
+    }
+
+    /// Slabs of disk `disk_id` below `capacity` that no extent uses.
+    pub fn free_slabs(&self, disk_id: u64, capacity: u64) -> Result<u64> {
+        let mut used: Vec<(u64, u64)> = self
+            .extents()?
+            .into_iter()
+            .filter(|(_, e)| e.disk_id == disk_id)
+            .map(|(_, e)| {
+                (
+                    e.physical_slab.min(capacity),
+                    e.physical_slab.saturating_add(e.slab_count).min(capacity),
+                )
+            })
+            .collect();
+        used.sort();
+        let (mut taken, mut end) = (0, 0);
+        for (start, stop) in used {
+            let start = start.max(end);
+            if stop > start {
+                taken += stop - start;
+                end = stop;
+            }
+        }
+        Ok(capacity - taken)
     }
 
     pub fn sequence(&self) -> u64 {

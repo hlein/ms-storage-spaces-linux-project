@@ -87,6 +87,24 @@
   does not fit its slot is an error, such a space is refused for writing,
   such checkpoint areas count as none, and run words of no stripes, which
   Windows does not write, are refused.
+* Management plans trusted numbers of the pool database they compute
+  writes from (audit 2026-10-21, SPW-01, SPW-02, and the auditor's spa_03
+  and spa_07): a space numbered beyond the 64 the metadata space holds
+  overflowed adding or retiring a disk (a panic), or put its database past
+  the slab; a disk claiming more data than its partition holds got new
+  slabs there, past the partition; a resize of a space whose allocation
+  unit is half a slab wrote extents of no slabs, one whose size is short of
+  the groups its extents map wrote over them, and the pool database no
+  longer opened; a tier template of an unknown resiliency, or a tiered
+  space of one tier, was a panic, and tiers larger than a space together
+  were accepted; removing a disk from a metadata space of no copies
+  underflowed. Such pools and requests are refused now, a resize follows
+  the groups the extents map, and a free slot of the database that a cut
+  write left a wrong number in is formatted again. The writer stops after
+  any failure once it has written (a write cut short by a full pool let
+  the next ones on), and a thin space's new row goes to the disk with the
+  most free slabs, counted whole (1.3.0 ranked disks by their first free
+  slab).
 * The checks of a pool of many spaces (`spaces attach`, `spaces check`)
   took about three times as long as in 1.2.2: 1.3.0's check for unmapped
   fixed spaces looked up each space's hidden spaces among all the pool's

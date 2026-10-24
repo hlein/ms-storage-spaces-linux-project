@@ -41,6 +41,7 @@ pub fn check_pool<D: ReadAt>(pool: &Pool<D>) -> Result<Database> {
         };
         understood.map_err(|e| Error::Pool(format!("record {} is not understood: {e}", r.id)))?;
     }
+    check_places(pool, &db)?;
     for space in pool.user_spaces() {
         let reader = pool.open_space(space.id())?;
         if reader.condition() != crate::Condition::Healthy {
@@ -52,6 +53,52 @@ pub fn check_pool<D: ReadAt>(pool: &Pool<D>) -> Result<Database> {
         }
     }
     Ok(db)
+}
+
+/// Refuses the numbers plans compute where they write from (audit
+/// 2026-10-21, SPW-01 and SPW-02): a space's number puts its database in
+/// the metadata space, 4 MiB apart from the others (the corpus: numbers 5
+/// at most), and must leave it there; and a disk's data area, which new
+/// slabs are placed in, must lie in its partition (the corpus: exactly the
+/// partition after the first 512 MiB).
+fn check_places<D: ReadAt>(pool: &Pool<D>, db: &Database) -> Result<()> {
+    use crate::create::SPACE_DATABASE_STRIDE;
+    use crate::format::DATA_AREA_OFFSET;
+    let records = assemble_records(db.bytes(), 0x40)?;
+    for r in &records {
+        match r.kind {
+            2 => {
+                let d = DiskBody::decode(&r.body)?;
+                let member = pool.disks.get(&d.id).and_then(|p| p.member).map(|m| &pool.members[m]);
+                if let Some(m) = member
+                    && DATA_AREA_OFFSET
+                        .checked_add(d.data_size)
+                        .is_none_or(|end| end > m.partition.length)
+                {
+                    return Err(Error::Pool(format!(
+                        "disk {} claims {:#x} bytes of data, beyond its partition of {:#x} bytes",
+                        d.id, d.data_size, m.partition.length
+                    )));
+                }
+            }
+            3 => {
+                let s = SpaceBody::decode(false, &r.body)?;
+                // Tier templates (role 1) have no database (number all ones).
+                let end = s
+                    .number
+                    .checked_add(1)
+                    .and_then(|n| n.checked_mul(SPACE_DATABASE_STRIDE));
+                if s.role != 1 && end.is_none_or(|end| end > SLAB_SIZE) {
+                    return Err(Error::Pool(format!(
+                        "space {} has the number {}: its database would lie beyond the metadata space",
+                        s.id, s.number
+                    )));
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
 /// The FILETIME of now.
@@ -680,9 +727,27 @@ pub fn plan_resize_space<D: ReadAt>(pool: &Pool<D>, space: &str, size: u64) -> R
     }
     let mut extents = Vec::new();
     if s.info.provisioning == crate::format::Provisioning::Fixed {
+        // New groups of extents follow those the space has: allocation
+        // units of whole slabs, after the groups its extents map (a size
+        // short of its last group still maps that group whole). 1.3.0
+        // counted from the size, its groups too from units of half a slab,
+        // and wrote extents of no slabs, or over the last group (audit
+        // 2026-10-21, SPW-01 and the auditor's spa_03).
+        if unit == 0 || !unit.is_multiple_of(SLAB_SIZE) {
+            return Err(Error::Pool(format!(
+                "the space's allocation unit of {unit} bytes is not whole slabs; it is not resized"
+            )));
+        }
+        let mapped = crate::layout::Layout::new(&policy, &s.extents)?.mapped_size();
+        if !mapped.is_multiple_of(group) || mapped < old {
+            return Err(Error::Pool(format!(
+                "the space's extents map {mapped} bytes, not whole groups of {group} covering its {old}; it is \
+                 not resized"
+            )));
+        }
         let mut slabs = Slabs::of(&db)?;
         let per_extent = unit / SLAB_SIZE;
-        for g in old / group..size / group {
+        for g in mapped / group..size / group {
             let mut used = Vec::new();
             for column in 0..policy.columns {
                 for copy in 0..policy.copies {
@@ -1022,6 +1087,7 @@ fn check_pool_missing_disks<D: ReadAt>(pool: &Pool<D>) -> Result<Database> {
         };
         understood.map_err(|e| Error::Pool(format!("record {} is not understood: {e}", r.id)))?;
     }
+    check_places(pool, &db)?;
     for space in pool.user_spaces() {
         if pool.open_space(space.id())?.condition() == crate::Condition::Failed {
             return Err(Error::Pool(format!(
@@ -1736,6 +1802,14 @@ pub fn plan_create_tiered_space<D: ReadAt>(
             .iter()
             .find(|t| &t.name == template_name)
             .ok_or_else(|| Error::Pool(format!("no tier named \"{template_name}\" (spaces tier create)")))?;
+        // 1.3.0 indexed the resiliency's name by it: a template of another
+        // was a panic (audit 2026-10-21, SPW-01).
+        if !(1..=3).contains(&t.resiliency) {
+            return Err(Error::Pool(format!(
+                "tier \"{template_name}\" has the resiliency {}, not simple, mirror or parity",
+                t.resiliency
+            )));
+        }
         let ssd = t.tiering == 2;
         let disks = disks_of(ssd);
         let n = disks.len() as u64;
@@ -1772,6 +1846,11 @@ pub fn plan_create_tiered_space<D: ReadAt>(
             size: *size,
         });
     }
+    if wanted.len() != 2 {
+        return Err(Error::Pool(
+            "a tiered space has two tiers: an SSD tier, then an HDD tier".into(),
+        ));
+    }
     // The HDD tier's units are slabs; the SSD tier's a row of the HDD tier
     // (Windows: 512 MiB over two and over three-column parity, 1 GiB over
     // four columns). Sizes go up to whole rows.
@@ -1779,6 +1858,17 @@ pub fn plan_create_tiered_space<D: ReadAt>(
     wanted[0].unit = SLAB_SIZE * data_columns(&wanted[1]);
     for w in wanted.iter_mut() {
         w.size = whole_rows(w.size, w.unit, data_columns(w))?;
+    }
+    // The space holds both (1.3.0 bounded each tier alone).
+    let total = wanted[0]
+        .size
+        .checked_add(wanted[1].size)
+        .filter(|&t| t <= MAX_SPACE_SIZE);
+    if total.is_none() {
+        return Err(Error::Pool(format!(
+            "tiers of {} and {} bytes: spaces hold at most {MAX_SPACE_SIZE} bytes",
+            wanted[0].size, wanted[1].size
+        )));
     }
     let ssd_disks = disks_of(true);
     if ssd_disks.len() < 2 {

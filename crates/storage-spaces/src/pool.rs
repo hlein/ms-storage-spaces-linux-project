@@ -266,6 +266,9 @@ pub struct Pool<D> {
     pub warnings: Vec<String>,
     /// The same problems, for programs.
     pub issues: Vec<Issue>,
+    /// Writes to the members begun so far ([`Pool::write_slab`] and the
+    /// pool database's), which writers tell their failures apart by.
+    pub(crate) writes: std::sync::atomic::AtomicU64,
 }
 
 impl<D: ReadAt> Pool<D> {
@@ -552,6 +555,7 @@ impl<D: ReadAt> Pool<D> {
             spaces,
             warnings: issues.iter().map(Issue::to_string).collect(),
             issues,
+            writes: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
@@ -825,6 +829,7 @@ impl<D: ReadAt> Pool<D> {
         let Some((device, start)) = self.slab_location(disk_id, slab)? else {
             return Ok(false);
         };
+        self.writes.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         self.devices[device].write_all_at(buf, start + offset)?;
         Ok(true)
     }
@@ -853,6 +858,7 @@ impl<D: ReadAt> Pool<D> {
         D: WriteAt,
     {
         let dev = &self.devices[m.device];
+        self.writes.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         for (offset, bytes) in database_copy(&m.partition, &[], db.bytes())? {
             dev.write_all_at(&bytes, offset)?;
             dev.flush()?;

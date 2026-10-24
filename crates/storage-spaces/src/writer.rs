@@ -543,8 +543,16 @@ impl<'p, D: WriteAt> SpaceWriter<'p, D> {
                 "a write or flush of the space failed before; nothing more is written until it is opened again".into(),
             ));
         }
+        let pool = self.reader.pool();
+        let before = pool.writes.load(Ordering::Acquire);
         let result = work();
-        if let Err(Error::Io(_)) = &result {
+        // Any failure once something was written stops the later ones: what
+        // reached the disks then is not known either (1.3.0 stopped on
+        // I/O errors only, and a write the pool's being full cut short let
+        // the next ones on: audit 2026-10-21, SPW-02).
+        if let Err(e) = &result
+            && (matches!(e, Error::Io(_)) || pool.writes.load(Ordering::Acquire) != before)
+        {
             self.failed.store(true, Ordering::Release);
         }
         result
@@ -1067,8 +1075,11 @@ fn pick_disk<D: ReadAt>(pool: &Pool<D>, db: &Database, row: u64, used: &BTreeSet
         else {
             return Ok(0);
         };
+        // Every free slab counts, not those after the first used one (1.3.0
+        // took the disk whose first free slab came first: audit 2026-10-21,
+        // SPW-02).
         let capacity = m.partition.length.saturating_sub(DATA_AREA_OFFSET) / SLAB_SIZE;
-        Ok(capacity.saturating_sub(db.first_free_slab(disk_id)?))
+        db.free_slabs(disk_id, capacity)
     };
     let candidates = pool
         .disks

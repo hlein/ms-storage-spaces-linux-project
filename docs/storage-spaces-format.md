@@ -233,7 +233,9 @@ page, and nothing else is written):
   slot's old database, `c9opts2`). Numbers go to the
   space first, then the cache container, then the journal container,
   although the journal's records come first in the update.
-* A database per type 3 space in the metadata space, 4 MiB apart by number:
+* A database per type 3 space in the metadata space, 4 MiB apart by number
+  (numbers 0 to 63 fit the slab; the corpus has 5 at most, and `spaces`
+  plans nothing on a pool with a larger one: audit 2026-10-21, SPW-01):
   a page of 64 slots (0x20 = 0x10000), sequence 1, one record of type 7
   (version 1): `vint 0, vint 1, vint n, n disk GUIDs`, the disks whose
   copy of the metadata space holds the database, in the order of their
@@ -496,6 +498,10 @@ u8 usage, manufacturer, model, string, string, u8 0x0f, u8 media,
 32 zero bytes, vint disk size, vint data area size (the partition less the
 512 MiB before physical slab 0), vint 0xffffffffffffffff
 ```
+The data area size is exactly that on the 679 disks of the corpus
+(**verified**); `spaces` plans nothing on a pool whose disk claims more
+than its partition holds (1.3.0 placed new slabs there, past the
+partition: audit 2026-10-21, SPW-02).
 `sequence` is the database sequence at which the record was last written
 (disks whose media type was set one after the other carry consecutive
 numbers). `usage` counts differently from `Get-PhysicalDisk`: 1

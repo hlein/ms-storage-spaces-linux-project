@@ -20,7 +20,7 @@
 use std::collections::BTreeSet;
 
 use crate::crc::crc32_excluding;
-use crate::error::Result;
+use crate::error::{Result, format_err};
 
 pub const SPACEDRT_SIGNATURE: &[u8; 8] = b"SPACEDRT";
 const HEADER: usize = 0x1000;
@@ -58,6 +58,14 @@ impl DirtyRegions {
     /// Reads both header copies of a tracking space of `size` bytes; `None`
     /// when neither is valid.
     pub fn load(size: u64, mut read: impl FnMut(u64, &mut [u8]) -> Result<()>) -> Result<Option<Self>> {
+        // Room for both pages, apart (Windows: a slab of 256 MiB). In a
+        // smaller one the second would be read at 0, and the newer page
+        // where Windows keeps it never (audit 2026-10-21, SPB-05).
+        if size < SECOND_COPY_FROM_END + HEADER as u64 {
+            return Err(format_err!(
+                "the dirty region log of {size:#x} bytes has no room for its two header pages"
+            ));
+        }
         let mut copies = Vec::new();
         for offset in [0, size.saturating_sub(SECOND_COPY_FROM_END)] {
             let mut h = vec![0u8; HEADER];

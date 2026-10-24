@@ -23,7 +23,7 @@
   such a thin row by allocating it again, its pool database then holding two
   extents for one column on every disk, and the pool no longer opened.
 * A space whose hidden structures or tiers do not hold what the records
-  name was called healthy (audit 2026-10-21, SPB-02, SPG-02): a write-back
+  name was called healthy (audit 2026-10-21, SPB-02): a write-back
   cache whose header puts its chunks where the cache space has no extent
   (1.3.0 read the data the cache held as zeros), beyond that space or over
   its slot area, a parity journal whose areas lie so, and a fixed tiered
@@ -32,8 +32,23 @@
   not read or written, and `health()` does not know the state of the tiered
   ones. `health()` also laid every tier out from the start of the space
   rather than its own, so that a tier starting off a whole row of its own
-  layout made the space's state unknown (SPA-05); it is laid out as it is
-  read.
+  layout made the space's state unknown (the auditor's spa_05); it is laid
+  out as it is read.
+* The dirty region log's runs were not compared where they could have been,
+  or were said to be compared where they were not (audit 2026-10-21, SPG-01,
+  SPB-05): the listed runs of a tiered space's mirror tier were never
+  compared (healthy, their reads failing where the copies differed); runs
+  with one copy at hand were counted as compared ("compared, the copies
+  agree"), and unallocated runs of a thin space used up the read budget
+  before the runs that hold data; the copies of a header page of the log
+  that list different runs in the same generation (which Windows does not
+  write) were a note, one copy's runs read and the space healthy; and a log
+  whose range had no room for its two header pages was read from its first
+  page only. The mirror tier's runs are compared, runs with one copy at hand
+  counted apart and unallocated ones passed over, such copies of a page
+  make the space suspect, and such a log fails it. `spaces pool scrub` and
+  `spaces check --deep` compare the tiers of a tiered space, which they
+  skipped.
 * The checks of a pool of many spaces (`spaces attach`, `spaces check`)
   took about three times as long as in 1.2.2: 1.3.0's check for unmapped
   fixed spaces looked up each space's hidden spaces among all the pool's

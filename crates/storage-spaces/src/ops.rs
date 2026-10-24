@@ -1430,7 +1430,8 @@ pub struct Scrub {
 }
 
 /// `spaces pool scrub`: reads every copy of every mirror row and every
-/// stripe of the single parity spaces and reports what disagrees. Neither
+/// stripe of the single parity spaces, and of such tiers of the tiered
+/// ones, and reports what disagrees. Neither
 /// side of a difference is known to be the right one; the repair plan
 /// keeps the first mirror copy and the parity spaces' data.
 pub fn scrub<D: ReadAt>(pool: &Pool<D>) -> Result<Scrub> {
@@ -1457,131 +1458,142 @@ pub fn scrub_spaces<D: ReadAt>(pool: &Pool<D>, only: Option<u64>) -> Result<Scru
     };
     for space in pool.user_spaces().filter(|s| only.is_none_or(|id| s.id() == id)) {
         let reader = pool.open_space(space.id())?;
-        let l = reader.layout().clone();
-        let skipped = match l.resiliency {
-            _ if reader.is_tiered() => Some("tiered"),
-            Resiliency::Simple => Some("simple, nothing to compare"),
-            Resiliency::Parity if l.parity_units != 1 => Some("dual parity"),
-            _ => None,
-        };
-        if let Some(why) = skipped {
-            out.lines.push(format!("{}: {why}, not scrubbed", space.name()));
-            continue;
-        }
-        let rows = reader.size().div_ceil(SLAB_SIZE * l.data_columns);
-        let (mut mismatches, mut unsettled) = (0u64, 0u64);
-        let mut repairs = Vec::new();
-        let (mut first, mut other) = (vec![0u8; CHUNK as usize], vec![0u8; CHUNK as usize]);
-        if l.resiliency == Resiliency::Mirror {
-            let drt = reader.dirty_regions();
-            for row in 0..rows {
-                let listed = drt.is_some_and(|d| d.is_dirty(l.run_start_offset(row) / SLAB_SIZE));
-                for column in 0..l.columns {
-                    let copies: Vec<(u64, u64)> = l
-                        .copies_of(column)
-                        .iter()
-                        .filter_map(|&c| l.physical(column, c, row))
-                        .collect();
-                    let Some((&(disk0, slab0), rest)) = copies.split_first() else {
-                        continue;
-                    };
+        // A tiered space is scrubbed tier by tier (1.3.0 skipped it).
+        let tiered = reader.is_tiered();
+        for l in reader.data_layouts() {
+            let (name, label) = match tiered {
+                true => (
+                    format!("{} (tier at {} MiB)", space.name(), l.base >> 20),
+                    format!("the tier at {} MiB of space \"{}\"", l.base >> 20, space.name()),
+                ),
+                false => (space.name().to_string(), format!("space \"{}\"", space.name())),
+            };
+            let skipped = match l.resiliency {
+                Resiliency::Simple => Some("simple, nothing to compare"),
+                Resiliency::Parity if l.parity_units != 1 => Some("dual parity"),
+                _ => None,
+            };
+            if let Some(why) = skipped {
+                out.lines.push(format!("{name}: {why}, not scrubbed"));
+                continue;
+            }
+            let rows = match tiered {
+                true => l.mapped_size().div_ceil(SLAB_SIZE * l.data_columns),
+                false => reader.size().div_ceil(SLAB_SIZE * l.data_columns),
+            };
+            let (mut mismatches, mut unsettled) = (0u64, 0u64);
+            let mut repairs = Vec::new();
+            let (mut first, mut other) = (vec![0u8; CHUNK as usize], vec![0u8; CHUNK as usize]);
+            if l.resiliency == Resiliency::Mirror {
+                let drt = reader.dirty_regions();
+                for row in 0..rows {
+                    let listed = drt.is_some_and(|d| d.is_dirty(l.run_start_offset(row) / SLAB_SIZE));
+                    for column in 0..l.columns {
+                        let copies: Vec<(u64, u64)> = l
+                            .copies_of(column)
+                            .iter()
+                            .filter_map(|&c| l.physical(column, c, row))
+                            .collect();
+                        let Some((&(disk0, slab0), rest)) = copies.split_first() else {
+                            continue;
+                        };
+                        for offset in (0..SLAB_SIZE).step_by(CHUNK as usize) {
+                            pool.read_slab(disk0, slab0, offset, &mut first)?;
+                            for &(disk, slab) in rest {
+                                pool.read_slab(disk, slab, offset, &mut other)?;
+                                if first == other {
+                                    continue;
+                                }
+                                *if listed { &mut unsettled } else { &mut mismatches } += 1;
+                                let (from, from_offset) = location(disk0, slab0, offset)?;
+                                let (to, to_offset) = location(disk, slab, offset)?;
+                                repairs.push(Action::Copy {
+                                    from,
+                                    from_offset,
+                                    to,
+                                    to_offset,
+                                    len: CHUNK,
+                                });
+                            }
+                        }
+                    }
+                }
+            } else {
+                let journal = reader.journal();
+                // A unit of more than a read (interleaves are powers of two) is
+                // compared a read at a time; its stripe counts once, and the
+                // repair stays inside the parts that differ (1.2.2 recomputed
+                // a whole unit from each, across units and the slab's end).
+                let piece = l.interleave.min(CHUNK);
+                let mut last = None;
+                for row in (0..rows).filter(|&r| l.current(0, r).is_some()) {
+                    let columns: Vec<(u64, u64)> = (0..l.columns)
+                        .map(|c| l.current(c, row))
+                        .collect::<Option<_>>()
+                        .ok_or_else(|| Error::Pool(format!("space \"{}\" row {row} lacks a column", space.name())))?;
                     for offset in (0..SLAB_SIZE).step_by(CHUNK as usize) {
-                        pool.read_slab(disk0, slab0, offset, &mut first)?;
-                        for &(disk, slab) in rest {
+                        first.fill(0);
+                        for &(disk, slab) in &columns {
                             pool.read_slab(disk, slab, offset, &mut other)?;
-                            if first == other {
+                            first.iter_mut().zip(&other).for_each(|(a, u)| *a ^= u);
+                        }
+                        for (k, unit) in first.chunks(piece as usize).enumerate() {
+                            if unit.iter().all(|&b| b == 0) {
                                 continue;
                             }
-                            *if listed { &mut unsettled } else { &mut mismatches } += 1;
-                            let (from, from_offset) = location(disk0, slab0, offset)?;
-                            let (to, to_offset) = location(disk, slab, offset)?;
-                            repairs.push(Action::Copy {
+                            let at = offset + k as u64 * piece;
+                            let loc = crate::layout::Location {
+                                column: 0,
+                                row,
+                                offset_in_slab: at,
+                                contiguous: l.interleave - at % l.interleave,
+                            };
+                            let stripe = l.stripe_of(&loc);
+                            let parity = l.parity_column(stripe) as usize;
+                            let (to, to_offset) = location(columns[parity].0, columns[parity].1, at)?;
+                            if last == Some((row, stripe)) {
+                                // The part right after the last one repaired.
+                                if let Some(Action::Xor {
+                                    to_offset: start, len, ..
+                                }) = repairs.last_mut()
+                                    && *start + *len == to_offset
+                                {
+                                    *len += piece;
+                                    continue;
+                                }
+                            } else {
+                                let listed = journal.is_some_and(|j| j.is_dirty(l.run_start_offset(row), stripe));
+                                *if listed { &mut unsettled } else { &mut mismatches } += 1;
+                                last = Some((row, stripe));
+                            }
+                            let from = columns
+                                .iter()
+                                .enumerate()
+                                .filter(|&(c, _)| c != parity)
+                                .map(|(_, &(disk, slab))| location(disk, slab, at))
+                                .collect::<Result<Vec<_>>>()?;
+                            repairs.push(Action::Xor {
                                 from,
-                                from_offset,
                                 to,
                                 to_offset,
-                                len: CHUNK,
+                                len: piece,
                             });
                         }
                     }
                 }
             }
-        } else {
-            let journal = reader.journal();
-            // A unit of more than a read (interleaves are powers of two) is
-            // compared a read at a time; its stripe counts once, and the
-            // repair stays inside the parts that differ (1.2.2 recomputed
-            // a whole unit from each, across units and the slab's end).
-            let piece = l.interleave.min(CHUNK);
-            let mut last = None;
-            for row in (0..rows).filter(|&r| l.current(0, r).is_some()) {
-                let columns: Vec<(u64, u64)> = (0..l.columns)
-                    .map(|c| l.current(c, row))
-                    .collect::<Option<_>>()
-                    .ok_or_else(|| Error::Pool(format!("space \"{}\" row {row} lacks a column", space.name())))?;
-                for offset in (0..SLAB_SIZE).step_by(CHUNK as usize) {
-                    first.fill(0);
-                    for &(disk, slab) in &columns {
-                        pool.read_slab(disk, slab, offset, &mut other)?;
-                        first.iter_mut().zip(&other).for_each(|(a, u)| *a ^= u);
-                    }
-                    for (k, unit) in first.chunks(piece as usize).enumerate() {
-                        if unit.iter().all(|&b| b == 0) {
-                            continue;
-                        }
-                        let at = offset + k as u64 * piece;
-                        let loc = crate::layout::Location {
-                            column: 0,
-                            row,
-                            offset_in_slab: at,
-                            contiguous: l.interleave - at % l.interleave,
-                        };
-                        let stripe = l.stripe_of(&loc);
-                        let parity = l.parity_column(stripe) as usize;
-                        let (to, to_offset) = location(columns[parity].0, columns[parity].1, at)?;
-                        if last == Some((row, stripe)) {
-                            // The part right after the last one repaired.
-                            if let Some(Action::Xor {
-                                to_offset: start, len, ..
-                            }) = repairs.last_mut()
-                                && *start + *len == to_offset
-                            {
-                                *len += piece;
-                                continue;
-                            }
-                        } else {
-                            let listed = journal.is_some_and(|j| j.is_dirty(l.run_start_offset(row), stripe));
-                            *if listed { &mut unsettled } else { &mut mismatches } += 1;
-                            last = Some((row, stripe));
-                        }
-                        let from = columns
-                            .iter()
-                            .enumerate()
-                            .filter(|&(c, _)| c != parity)
-                            .map(|(_, &(disk, slab))| location(disk, slab, at))
-                            .collect::<Result<Vec<_>>>()?;
-                        repairs.push(Action::Xor {
-                            from,
-                            to,
-                            to_offset,
-                            len: piece,
-                        });
-                    }
-                }
-            }
+            let what = if l.resiliency == Resiliency::Mirror {
+                "1 MiB chunks whose copies differ"
+            } else {
+                "stripes whose parity does not match"
+            };
+            out.lines.push(format!(
+                "{name}: {mismatches} {what}, {unsettled} more where writes were under way"
+            ));
+            out.mismatches += mismatches;
+            out.unsettled += unsettled;
+            out.plan.step(format!("make {label} agree"), repairs);
         }
-        let what = if l.resiliency == Resiliency::Mirror {
-            "1 MiB chunks whose copies differ"
-        } else {
-            "stripes whose parity does not match"
-        };
-        out.lines.push(format!(
-            "{}: {mismatches} {what}, {unsettled} more where writes were under way",
-            space.name()
-        ));
-        out.mismatches += mismatches;
-        out.unsettled += unsettled;
-        out.plan.step(format!("make space \"{}\" agree", space.name()), repairs);
     }
     Ok(out)
 }

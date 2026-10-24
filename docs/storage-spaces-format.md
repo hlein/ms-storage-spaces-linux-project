@@ -587,7 +587,7 @@ of a tier count from the tier's start. The tiers follow one another from 0
 to the size of the space (**verified**: `tiered`, `mapar`, `ntfstier`,
 `ntfsmapar`, `tierodd`); a fixed tiered space whose tiers leave a gap,
 overlap or end before it does, or one of whose tiers has no extent, is not
-read: what they leave would read as zeros (audit 2026-10-21, SPG-02). Tier
+read: what they leave would read as zeros (audit 2026-10-21, SPB-02). Tier
 templates created with
 `New-StorageTier` are separate type 6 records without extents (see
 "Storage tiers" under creating a space).
@@ -1000,7 +1000,11 @@ that was shut down normally list every run written in their last sessions.
 The copies of a mirror can only differ inside a listed run, where a crash
 may have left a write on some copies only (`crashmirrorwc`, whose disks
 were pulled during small writes, lists both of its extent runs, 0 and 4, in
-generation 2 and run 0 in generation 1).
+generation 2 and run 0 in generation 1). The log of a tiered space lists
+virtual slabs of the space; `spaces` compares the copies of the listed runs
+of its mirror tier (since 1.3.1; 1.3.0 compared none, the reads of such a
+run failing where they differed), and passes over listed runs that nothing
+maps (a thin space's unallocated rows), which hold nothing to compare.
 
 How Windows writes the log (**verified** byte for byte, stale entries
 included, by the test `mirror_dirty_region_log_follows_the_writes`, which
@@ -1213,7 +1217,12 @@ scenario state of the corpus.
   log), but the slot area of a cache or journal (at 0x2000) holding a slot
   then means the header is lost (failed), and with a copy on a missing disk
   it is not known (suspect). Of the two header pages of a dirty region log,
-  one lost on every copy is degraded; both, failed.
+  one lost on every copy is degraded; both, failed. Copies of a page that
+  differ are read from the newest generation (a crash between the writes
+  of the mirror), but copies of one generation listing different runs are
+  suspect: Windows writes each change in the next generation, and a log
+  too small for both pages apart (12 KiB; Windows: a slab) fails (since
+  1.3.1; audit 2026-10-21, SPB-05).
 * Partitions that become device-mapper devices lie inside the space and
   do not overlap; they are the ones the guard checks: the GPT, from its
   backup header at the last LBA when the primary is lost (suspect), or the

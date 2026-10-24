@@ -84,6 +84,9 @@ pub struct MirrorCheck {
     pub listed: u64,
     /// Bytes of them whose copies were read and compared.
     pub compared: u64,
+    /// Bytes of them with fewer than two copies at hand: nothing to compare
+    /// them with (the one copy is read, within the budget).
+    pub unreadable: u64,
     /// Space offsets where the copies differ (the first few).
     pub differ: Vec<u64>,
     /// The budget ran out before every listed run was compared.
@@ -287,6 +290,17 @@ impl<D: ReadAt> Mapped<'_, D> {
             )));
         }
         Ok(true)
+    }
+
+    /// Whether some copy of the unit holding `offset` has an extent.
+    fn allocated(&self, offset: u64) -> bool {
+        let l = &self.layout;
+        offset >= l.base && {
+            let loc = l.locate(offset);
+            l.copies_of(loc.column)
+                .iter()
+                .any(|&copy| l.physical(loc.column, copy, loc.row).is_some())
+        }
     }
 
     /// Whether the present copies of `len` bytes at mirror offset `offset`
@@ -1117,24 +1131,43 @@ impl<'p, D: ReadAt> SpaceReader<'p, D> {
             let alike = |a: &[u8], b: &[u8]| a == b;
             match mapped.header(Part::DirtyRegions, base + at, PAGE, drt_page_state, alike) {
                 Ok((page, mut note)) => {
-                    if let Some(n) = note.as_mut().filter(|n| n.status == Status::Suspect && page.is_some()) {
-                        n.status = Status::Info;
-                        n.summary =
-                            "the copies of a header page of the dirty region log differ; the newest is read".into();
-                    }
-                    let page = page.map(|first| {
-                        mapped
+                    let valid: Vec<Vec<u8>> = match &page {
+                        Some(_) => mapped
                             .copies_at(base + at, PAGE)
-                            .ok()
-                            .and_then(|copies| {
+                            .map(|copies| {
                                 copies
                                     .into_iter()
                                     .map(|(_, b)| b)
                                     .filter(|b| drt_page_state(b) == HeaderCopy::Valid)
-                                    .max_by_key(|b| generation(b))
+                                    .collect()
                             })
-                            .unwrap_or(first)
+                            .unwrap_or_default(),
+                        None => Vec::new(),
+                    };
+                    let newest = valid.iter().max_by_key(|b| generation(b)).cloned();
+                    // Windows writes each change in the next generation:
+                    // copies of one generation listing different runs are
+                    // not its doing, and which runs were written is not
+                    // known (audit 2026-10-21, SPB-05).
+                    let runs = |b: &[u8]| DirtyRegions::parse(b).map(|h| h.runs);
+                    let split = newest.as_ref().is_some_and(|n| {
+                        valid
+                            .iter()
+                            .any(|b| generation(b) == generation(n) && runs(b) != runs(n))
                     });
+                    if let Some(n) = note.as_mut().filter(|n| n.status == Status::Suspect && page.is_some()) {
+                        if split {
+                            n.summary = "the copies of a header page of the dirty region log list different runs \
+                                         in the same generation"
+                                .into();
+                        } else {
+                            n.status = Status::Info;
+                            n.summary = "the copies of a header page of the dirty region log differ; the newest is \
+                                         read"
+                                .into();
+                        }
+                    }
+                    let page = page.map(|first| newest.unwrap_or(first));
                     if page.is_none() {
                         // Zero on every copy: said once below, for both.
                         failed.push((at, None));
@@ -1239,14 +1272,20 @@ impl<'p, D: ReadAt> SpaceReader<'p, D> {
     /// bytes of each copy (`None`: no limit), the runs in the log's order;
     /// what the write-back cache holds is read from the cache and not
     /// compared. Where they differ, reads fail (see [`UncleanParity`]).
-    /// `None` for a space without a dirty region log, or a tiered one (its
-    /// listed runs are compared when read).
+    /// The runs of a tiered space are those of its mirror tiers; runs that
+    /// nothing maps are passed over. `None` for a space without a dirty
+    /// region log or anything that mirrors.
     pub fn check_dirty_regions(&self, budget: Option<u64>) -> Result<Option<MirrorCheck>> {
         let Some(drt) = self.base.drt.as_deref() else {
             return Ok(None);
         };
-        let l = &self.base.layout;
-        if self.is_tiered() || l.resiliency != Resiliency::Mirror {
+        // The space's own layout, or its tiers' (audit 2026-10-21: 1.3.0
+        // compared nothing in a tiered space): those that mirror.
+        let mirrors: Vec<&Mapped<'p, D>> = std::iter::once(&self.base)
+            .chain(&self.tiers)
+            .filter(|m| m.layout.resiliency == Resiliency::Mirror)
+            .collect();
+        if mirrors.is_empty() {
             return Ok(None);
         }
         let mut out = MirrorCheck {
@@ -1256,9 +1295,15 @@ impl<'p, D: ReadAt> SpaceReader<'p, D> {
         let mut left = budget.unwrap_or(u64::MAX);
         const CHUNK: u64 = 1 << 20;
         for slab in drt.runs() {
-            let Some(start) = slab.checked_mul(SLAB_SIZE).filter(|&s| s >= l.base && s < self.size) else {
+            let Some(start) = slab.checked_mul(SLAB_SIZE).filter(|&s| s < self.size) else {
                 continue;
             };
+            // A run nothing maps (a thin space's unallocated rows) holds
+            // nothing to compare, and costs nothing of the budget.
+            let Some(m) = mirrors.iter().find(|m| m.allocated(start)) else {
+                continue;
+            };
+            let l = &m.layout;
             let end = l.run_end_offset(l.locate(start).row).min(self.size);
             let mut at = start;
             while at < end {
@@ -1278,10 +1323,15 @@ impl<'p, D: ReadAt> SpaceReader<'p, D> {
                         Lookup::Miss { len } => n = n.min(len.max(1)),
                     }
                 }
-                if self.base.copies_differ(at, n as usize)? == Some(true) && out.differ.len() < 5 {
-                    out.differ.push(at);
+                match m.copies_differ(at, n as usize)? {
+                    Some(differ) => {
+                        if differ && out.differ.len() < 5 {
+                            out.differ.push(at);
+                        }
+                        out.compared += n;
+                    }
+                    None => out.unreadable += n,
                 }
-                out.compared += n;
                 left -= n;
                 at += n;
             }
@@ -1456,6 +1506,14 @@ impl<'p, D: ReadAt> SpaceReader<'p, D> {
     /// journal, dirty region log) whose copies are not all valid and alike.
     pub fn header_notes(&self) -> &[HeaderNote] {
         &self.notes
+    }
+
+    /// The layouts that hold the space's data: its tiers', or its own.
+    pub(crate) fn data_layouts(&self) -> Vec<&Layout> {
+        match self.tiers.is_empty() {
+            true => vec![&self.base.layout],
+            false => self.tiers.iter().map(|t| &t.layout).collect(),
+        }
     }
 
     /// Whether the space stores its data in storage tiers.

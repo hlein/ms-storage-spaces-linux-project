@@ -971,15 +971,27 @@ fn listed_runs_check<D: ReadAt>(
         }
         return check;
     }
-    let compared = c.compared >> 20;
-    let summary = match options.journal_budget {
-        Some(b) if c.incomplete => format!(
-            "{written}: {compared} MiB compared, the copies agree; the rest left to the read budget of {} MiB \
-             (compared when read; spaces check --deep compares more)",
-            b >> 20
-        ),
-        _ => format!("{written}: compared, the copies agree"),
+    let mut summary = match (c.compared, c.unreadable, c.incomplete) {
+        (_, 0, false) => format!("{written}: compared, the copies agree"),
+        (0, _, _) => format!("{written}: nothing compared"),
+        (n, _, _) => format!("{written}: {} MiB compared, the copies agree", n >> 20),
     };
+    // What has one copy at hand is not called compared (audit 2026-10-21:
+    // 1.3.0 did).
+    if c.unreadable > 0 {
+        summary += &format!(
+            "; {} MiB with fewer than two copies at hand, nothing to compare",
+            c.unreadable.div_ceil(1 << 20)
+        );
+    }
+    if let Some(b) = options.journal_budget
+        && c.incomplete
+    {
+        summary += &format!(
+            "; the rest left to the read budget of {} MiB (compared when read; spaces check --deep compares more)",
+            b >> 20
+        );
+    }
     Check::new(ID, Status::Info, summary).truth(Truth::CrossCheck)
 }
 

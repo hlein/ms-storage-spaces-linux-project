@@ -453,8 +453,8 @@ These are the states Windows showed for the same pools, created on Linux
 and by Windows, after disks were detached while in use.
 
 `spaces pool scrub DISKS...` reads every copy of every mirror space and
-every stripe of every single parity space and reports what disagrees
-(read-only). Differences where writes were under way (extent runs the
+every stripe of every single parity space, and of such tiers of a tiered
+space, and reports what disagrees (read-only). Differences where writes were under way (extent runs the
 dirty region log lists, stripes the parity journal does not list as
 consistent) are what a crash leaves and are counted apart; Windows settles
 them when it takes the pool. `--repair --yes` makes everything agree,

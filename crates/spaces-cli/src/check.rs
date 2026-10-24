@@ -332,7 +332,8 @@ fn deep_refs<D: ReadAt>(reader: &SpaceReader<'_, D>, offset: u64, label: &str) -
 }
 
 /// `deep.scrub`: every copy of the space's mirror rows and every stripe of
-/// a single parity space compared (`spaces pool scrub`, read-only).
+/// a single parity space compared, a tiered space's tier by tier (`spaces
+/// pool scrub`, read-only).
 fn deep_scrub<D: ReadAt>(pool: &Pool<D>, space: &Space) -> Check {
     const ID: &str = "deep.scrub";
     let scrub = match storage_spaces::ops::scrub_spaces(pool, Some(space.id())) {
@@ -352,10 +353,17 @@ fn deep_scrub<D: ReadAt>(pool: &Pool<D>, space: &Space) -> Check {
                 );
         }
     };
-    let line = scrub.lines.first().cloned().unwrap_or_default();
-    if line.ends_with("not scrubbed") {
-        return Check::skipped(ID, line);
+    // A line per tier of a tiered space: skipped when none was scrubbed.
+    let scrubbed: Vec<&str> = scrub
+        .lines
+        .iter()
+        .map(String::as_str)
+        .filter(|l| !l.ends_with("not scrubbed"))
+        .collect();
+    if scrubbed.is_empty() {
+        return Check::skipped(ID, scrub.lines.join("; "));
     }
+    let line = scrubbed.join("; ");
     if scrub.mismatches > 0 {
         return Check::new(ID, Status::Suspect, line).truth(Truth::CrossCheck).advice(
             "Copies of the space differ where nothing was being written: one is wrong, and which is not \
@@ -1010,6 +1018,46 @@ mod tests {
         let scrub = deep.checks.iter().find(|c| c.id == "deep.scrub").unwrap();
         assert_ne!(scrub.status, Status::Skipped, "{}", deep.to_text());
         assert_eq!(deep.verdict(), Verdict::Suspect, "{}", deep.to_text());
+    }
+
+    /// The deep check of a tiered space scrubs its tiers: copies of its
+    /// mirror tier that differ, or a parity tier's unit, make it suspect
+    /// (1.3.0 skipped it: "tiered, not scrubbed").
+    #[test]
+    fn a_deep_check_scrubs_the_tiers_of_a_tiered_space() {
+        use storage_spaces::io::SparseImage;
+        for (name, tier_start) in [("tiered", 0), ("mapar", 1 << 30)] {
+            let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../storage-spaces/tests/fixtures")
+                .join(name);
+            let mut disks: Vec<SparseImage> = (0..)
+                .map_while(|i| File::open(dir.join(format!("disk{i}.fixture"))).ok())
+                .map(|f| SparseImage::read_from(f).unwrap())
+                .collect();
+            let (device, at) = {
+                let pool = Pool::open(disks.iter().collect::<Vec<_>>()).unwrap();
+                let id = pool.user_spaces().next().unwrap().id();
+                let tier = pool
+                    .children(id)
+                    .find(|c| c.info.is_child && c.info.range.is_some_and(|(start, _)| start == tier_start))
+                    .unwrap();
+                let first = tier.extents.iter().map(|e| e.virtual_slab).min().unwrap();
+                let e = tier
+                    .extents
+                    .iter()
+                    .find(|e| e.virtual_slab == first && e.column == 0 && e.copy == 0)
+                    .unwrap();
+                let (device, at) = pool.slab_location(e.disk_id, e.physical_slab).unwrap().unwrap();
+                (device, at + (64 << 20))
+            };
+            disks[device].insert(at, &[0xab; 4096]);
+            let pool = Arc::new(Pool::open(disks).unwrap());
+            let space = pool.user_spaces().next().unwrap();
+            let health = pool_health(&pool, None);
+            let deep = report(&pool, &health, &[], space, true, None, |_, _, _, _| Vec::new());
+            let scrub = deep.checks.iter().find(|c| c.id == "deep.scrub").unwrap();
+            assert_eq!(scrub.status, Status::Suspect, "{name}: {}", deep.to_text());
+        }
     }
 
     /// Checks that panic fail their space, checks that hang past the limit

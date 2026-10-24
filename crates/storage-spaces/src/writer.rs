@@ -2051,7 +2051,8 @@ mod tests {
     /// written, not trusted (audit 2026-10-16, writers): a write-back cache
     /// whose chunks are half a stripe (destaging asserted whole stripes: a
     /// panic) and a dirty region log of 4 KiB (its second header, 8 KiB
-    /// before its end, came before its start) are refused.
+    /// before its end, came before its start) are refused; since 1.3.1 the
+    /// reader refuses such a log already, when the space is opened.
     #[test]
     fn hidden_structures_of_other_shapes_are_refused_for_writing() {
         use crate::cache::SPCACHE_SIGNATURE;
@@ -2098,7 +2099,7 @@ mod tests {
         let info = &mut pool.spaces.get_mut(&child).unwrap().info;
         info.range = Some((info.range.map_or(0, |r| r.0), 0x1000));
         let err = pool.open_space_rw(id).err().unwrap().to_string();
-        assert!(err.contains("dirty region log has 4096 bytes"), "{err}");
+        assert!(err.contains("dirty region log of 0x1000 bytes has no room"), "{err}");
     }
 
     /// A page after the slots the header counts (readers ignore it) holds a

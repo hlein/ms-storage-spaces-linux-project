@@ -330,7 +330,9 @@ devices or image files) and:
 * opens the disks exclusively: a disk that is mounted, attached (also by
   `spaces attach`) or used by another program fails with "in use by" and
   what holds it (a device-mapper device, a `spaces` server and its unit, or
-  the kernel); detach the pool first;
+  the kernel); a disk and its pool partition exclude each other, whichever
+  path names the pool (1.3.0 let a write through the disk go ahead while a
+  server held the partition); detach the pool first;
 * works on clean pools only: every disk present, no copy out of date,
   every record understood. Attach a pool that is not clean to Windows
   first, or see [Replacing a failed disk](#replacing-a-failed-disk);

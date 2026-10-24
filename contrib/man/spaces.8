@@ -344,7 +344,8 @@ in steps that each end with a flush, so that a crash leaves a pool that
 opens in the state before or after a step. The disks are opened
 exclusively (O_EXCL on block devices and a lock that every
 .B spaces
-process serving or writing them takes): detach the pool first; the
+process serving or writing them takes, for a partition on its whole disk
+too): detach the pool first; the
 refusal names what holds them. Only
 clean pools are changed (every disk present, no out-of-date copy, every
 record understood), except that

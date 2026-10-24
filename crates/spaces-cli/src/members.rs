@@ -40,8 +40,31 @@ pub(crate) fn open_member(p: &Path, write: bool, hold: Hold) -> Result<File> {
         }
         Err(e) => return Err(anyhow::Error::new(e).context(format!("cannot open {}", p.display()))),
     };
+    if hold == Hold::Read {
+        return Ok(file);
+    }
+    lock(&file, p, hold)?;
+    // A partition's whole disk is locked too, as its own path takes it: the
+    // two paths of one pool exclude each other (1.3.0 locked the path given
+    // alone: a writer through /dev/sdb went ahead while a server held
+    // /dev/sdb2, and the other way round; audit 2026-10-21, SCA-03). The
+    // disk is not opened with O_EXCL, which the partition's claim refuses.
+    // A whole disk this process may not open (a user given the partition
+    // alone) is passed over: the partition's own lock stands.
+    if let Some((disk, whole)) = whole_disk(p).and_then(|d| Some((d.clone(), File::open(d).ok()?))) {
+        lock(&whole, &disk, hold)?;
+        HELD.lock().unwrap_or_else(|e| e.into_inner()).push(whole);
+    }
+    Ok(file)
+}
+
+/// The whole disks locked for the partitions opened, held to the end.
+static HELD: std::sync::Mutex<Vec<File>> = std::sync::Mutex::new(Vec::new());
+
+/// Locks `file` (of path `p`), shared or exclusive as `hold` says.
+fn lock(file: &File, p: &Path, hold: Hold) -> Result<()> {
     let locked = match hold {
-        Hold::Read => return Ok(file),
+        Hold::Read => return Ok(()),
         Hold::Shared => file.try_lock_shared(),
         Hold::Exclusive => file.try_lock(),
     };
@@ -49,24 +72,50 @@ pub(crate) fn open_member(p: &Path, write: bool, hold: Hold) -> Result<File> {
         std::fs::TryLockError::WouldBlock => anyhow::anyhow!(
             "{} is in use by {}",
             p.display(),
-            storage_spaces::holders::of_lock(&file)
+            storage_spaces::holders::of_lock(file)
         ),
         std::fs::TryLockError::Error(e) => anyhow::Error::new(e).context(format!("cannot lock {}", p.display())),
-    })?;
-    Ok(file)
+    })
+}
+
+/// The whole disk of block device `p` when it is a partition (from /sys:
+/// a partition's directory is in its disk's).
+fn whole_disk(p: &Path) -> Option<std::path::PathBuf> {
+    let real = std::fs::canonicalize(p).ok()?;
+    let name = real.file_name()?.to_str()?;
+    let sys = std::fs::canonicalize(Path::new("/sys/class/block").join(name)).ok()?;
+    if !sys.join("partition").exists() {
+        return None;
+    }
+    let disk = sys.parent()?.file_name()?.to_str()?;
+    Some(Path::new("/dev").join(disk))
 }
 
 /// What holds block device `p` in the kernel (device-mapper tables, from
-/// /sys), as people read it.
+/// /sys), as people read it: of a disk, what holds its partitions too
+/// (1.3.0 looked at the disk's own holders, and a disk whose partition a
+/// device-mapper table held was "in use by the kernel"; audit 2026-10-21,
+/// SCA-03).
 fn kernel_holders(p: &Path) -> String {
-    let held: Vec<String> = std::fs::canonicalize(p)
+    let sys = std::fs::canonicalize(p)
         .ok()
         .and_then(|real| Some(real.file_name()?.to_str()?.to_string()))
-        .and_then(|name| {
-            let dir = Path::new("/sys/class/block").join(&name).join("holders");
-            std::fs::read_dir(dir).ok()
-        })
-        .into_iter()
+        .and_then(|name| std::fs::canonicalize(Path::new("/sys/class/block").join(name)).ok());
+    // Its own holders, and its partitions' (directories with a `partition`
+    // file in its own).
+    let mut dirs: Vec<std::path::PathBuf> = sys.iter().map(|s| s.join("holders")).collect();
+    if let Some(entries) = sys.as_ref().and_then(|s| std::fs::read_dir(s).ok()) {
+        dirs.extend(
+            entries
+                .flatten()
+                .map(|e| e.path())
+                .filter(|d| d.join("partition").exists())
+                .map(|d| d.join("holders")),
+        );
+    }
+    let held: Vec<String> = dirs
+        .iter()
+        .filter_map(|dir| std::fs::read_dir(dir).ok())
         .flatten()
         .filter_map(|e| {
             let holder = e.ok()?.file_name().to_string_lossy().into_owned();

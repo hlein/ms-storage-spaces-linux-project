@@ -192,6 +192,13 @@
   attached). The state keeps the space's name, names already taken are
   passed over, paths are made absolute (links stay links), and such a
   state is not completed.
+* The locks on a pool's disks (audit 2026-10-21, SCA-03): a disk and its
+  pool partition, two paths to one pool, did not exclude each other: a
+  management command writing through `/dev/sdb` went ahead while a server
+  held `/dev/sdb2` (or the other way round), and a disk whose partition a
+  device-mapper table held was "in use by the kernel". A partition's lock
+  is taken on its whole disk too, and the refusal names what holds the
+  disk's partitions.
 * The checks of a pool of many spaces (`spaces attach`, `spaces check`)
   took about three times as long as in 1.2.2: 1.3.0's check for unmapped
   fixed spaces looked up each space's hidden spaces among all the pool's

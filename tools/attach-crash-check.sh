@@ -47,6 +47,14 @@
 #   relative  attach of wc4k (served by ublk) through the image's path
 #             relative to the directory it runs in: attached (1.3.0's server,
 #             a unit started in /, found no such file)
+#   wholedisk a pool on an image set up with its partitions (loop -P): served
+#             read-only through its partition, a management write through the
+#             whole disk is refused, and served through the whole disk, one
+#             through the partition (1.3.0 locked the path given alone: both
+#             went ahead, the database written under the server)
+#   holders   the space attached (device-mapper) through the partition: a
+#             management write through the whole disk names the device-mapper
+#             device that holds the partition (1.3.0: "the kernel")
 #   promote   a state of a cut-off attach that lists no devices and whose
 #             device is held open (as a teardown that removed the devices and
 #             failed later leaves it): the next attach does not take it for
@@ -61,7 +69,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 binary=${1:?usage: tools/attach-crash-check.sh SPACES [CASE...]}
 shift
-cases=${*:-steps kill names leftovers busy children budget onepool detachname relative promote}
+cases=${*:-steps kill names leftovers busy children budget onepool detachname relative promote wholedisk holders}
 host=${LINUX_VM_HOST:-claude@192.168.189.143}
 [[ $host == *@* ]] || host=codex@$host
 ssh_opts=(-o BatchMode=yes -o ConnectTimeout=10 -o IdentitiesOnly=yes -i "$HOME/.ssh/rustadmin_vm_ed25519")
@@ -123,7 +131,7 @@ cleanup() {
     sudo rm -f "/run/storage-spaces/$g.state"
   done
   # Devices without a UUID (1.2.2's) by the names of these pools.
-  for d in $(ls /dev/mapper | grep -E '^ss-ss_(wc4k|crash|names|names2|hog|part)-' | sort -r); do
+  for d in $(ls /dev/mapper | grep -E '^ss-ss_(wc4k|crash|names|names2|hog|part|whole)-' | sort -r); do
     sudo dmsetup remove --retry "$d" >/dev/null 2>&1 || true
   done
   sudo dmsetup remove "$leftover" >/dev/null 2>&1 || true
@@ -472,6 +480,64 @@ for c in $CASES; do
       result ok promote "$(one "$out" | cut -c1-140)"
     else
       result fail promote "status ${st:-none} after: $(one "$out")"
+    fi ;;
+  wholedisk | holders)
+    # A partitioned loop device shows the pool partition to udev: where the
+    # package's rule is installed (the 22.04 VM's, linuxreflect's install),
+    # that starts the machine's attach unit, which attaches every pool there
+    # is, not only these (seen 2026-10-24). Not there.
+    rule=$(grep -l -r storage-spaces-attach /etc/udev/rules.d /lib/udev/rules.d /usr/lib/udev/rules.d 2>/dev/null | head -1) || true
+    if [[ -n $rule ]]; then
+      result skip "$c" "udev attaches pools here ($rule): a partitioned loop device would attach the machine's pools"
+      continue
+    fi
+    if [[ -z ${whole_loop:-} ]]; then
+      truncate -s 4G "$scratch/whole.img"
+      if ! "$spaces" pool create --name ss_whole --yes "$scratch/whole.img" >/dev/null 2>&1 ||
+        ! "$spaces" space create --name whole --resiliency simple --size 1G --yes "$scratch/whole.img" >/dev/null 2>&1; then
+        result fail "$c" "cannot make the pool ss_whole"
+        continue
+      fi
+      newloop "$scratch/whole.img" -P
+      whole_loop=$LOOP
+      sudo udevadm settle
+      # The pool partition (Storage Spaces' type).
+      whole_part=/dev/$(lsblk -nro NAME,PARTTYPE "$whole_loop" | awk 'tolower($2) ~ /e75caf8f/ {print $1; exit}')
+      whole=$(guid whole "$whole_part")
+      guids+=("$whole")
+    fi
+    if [[ $whole_part == /dev/ || -z $whole ]]; then
+      result fail "$c" "no pool partition on $whole_loop"
+      continue
+    fi
+    if [[ $c == wholedisk ]]; then
+      for pair in "$whole_part $whole_loop" "$whole_loop $whole_part"; do
+        read -r served written <<<"$pair"
+        sudo bash -c 'exec "$1" serve-nbd --space "$2" --socket "$3" "$4" > /dev/null 2>&1 & echo $! > "$5"' _ \
+          "$spaces" "$whole" "$scratch/whole.sock" "$served" "$scratch/server.pid"
+        for _ in $(seq 50); do [[ -S $scratch/whole.sock ]] && break; sleep 0.1; done
+        rc=0
+        out=$(sudo "$spaces" space create --name more --resiliency simple --size 64M --yes "$written" 2>&1) || rc=$?
+        sudo kill "$(cat "$scratch/server.pid")" 2>/dev/null || true
+        for _ in $(seq 50); do [[ -S $scratch/whole.sock ]] || break; sleep 0.1; done
+        sudo rm -f -- "$scratch/whole.sock"
+        if [[ $rc != 0 && $out == *"in use by"* ]]; then
+          result ok "wholedisk ${served#/dev/} served" "$(one "$out" | cut -c1-120)"
+        else
+          result fail "wholedisk ${served#/dev/} served" "exit $rc: $(one "$out")"
+          sudo "$spaces" space delete --space more --yes "$whole_part" >/dev/null 2>&1 || true
+        fi
+      done
+    else
+      sudo "$spaces" attach --space "$whole" "$whole_part" >/dev/null 2>&1 || true
+      rc=0
+      out=$(sudo "$spaces" space create --name more --resiliency simple --size 64M --yes "$whole_loop" 2>&1) || rc=$?
+      sudo "$spaces" detach "$whole" >/dev/null 2>&1 || true
+      if [[ $rc != 0 && $out == *"device-mapper ss-ss_whole-whole"* ]]; then
+        result ok holders "$(one "$out" | cut -c1-140)"
+      else
+        result fail holders "exit $rc: $(one "$out")"
+      fi
     fi ;;
   *) result fail "$c" "unknown case" ;;
   esac

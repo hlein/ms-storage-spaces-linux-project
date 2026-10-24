@@ -116,7 +116,9 @@ fn segments_match_pattern() {
         for (name, pattern) in pattern_spaces(&m) {
             let name = name.as_str();
             let reader = pool.open_space(pool.find_space(name).unwrap().id()).unwrap();
-            let Ok(segments) = reader.segments() else {
+            // The mapping alone: segments() compares the copies of listed
+            // mirror runs first (tests/dirty_regions.rs), 1 GiB of each.
+            let Ok(segments) = reader.mapping() else {
                 continue; // parity, or data in the cache
             };
             let files: Vec<File> = (0..m["disks"].as_array().unwrap().len())

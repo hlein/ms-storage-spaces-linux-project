@@ -49,6 +49,19 @@
   make the space suspect, and such a log fails it. `spaces pool scrub` and
   `spaces check --deep` compare the tiers of a tiered space, which they
   skipped.
+* One copy of the header of a write-back cache or parity journal that did
+  not check out by itself, the other copy sound, failed the space: the
+  cache header of another space, a journal header of a slot geometry no
+  journal has, and (since the checks above) one naming areas its space does
+  not hold. Such a copy now gives way to the other, as a damaged one does:
+  the space is degraded and reads as before (the auditor's spb_06).
+* The device-mapper mapping (`spaces attach --backend dm`, `spaces
+  dm-table`) mapped a row whose only copy is out of date as zeros, though
+  reads of it fail, and a run the dirty region log of a mirror lists to its
+  first copy where the copies differed, though reads of it fail (audit
+  2026-10-21, SPB-06). It refuses the first; it compares the copies of the
+  listed runs first, as `spaces check` does, and refuses the mirror where
+  they differ or there are more than 1 GiB of them.
 * The checks of a pool of many spaces (`spaces attach`, `spaces check`)
   took about three times as long as in 1.2.2: 1.3.0's check for unmapped
   fixed spaces looked up each space's hidden spaces among all the pool's

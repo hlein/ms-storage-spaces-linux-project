@@ -859,19 +859,35 @@ impl Part {
 }
 
 /// What a copy of a write-back cache's header holds.
-fn cache_header_state(b: &[u8]) -> HeaderCopy {
+fn cache_header_state<D: ReadAt>(owner: crate::Guid, mapped: &Mapped<'_, D>, size: u64, b: &[u8]) -> HeaderCopy {
     if b.iter().all(|&x| x == 0) {
         return HeaderCopy::Zero;
     }
+    // A copy that does not check out by itself gives way to another (the
+    // auditor's spb_06: 1.3.0 failed the space on it).
     match CacheHeader::parse(b) {
-        Ok(Some(_)) => HeaderCopy::Valid,
+        Ok(Some(h)) if h.owner_guid != owner => {
+            HeaderCopy::Damaged(format!("the header of the cache of {}", h.owner_guid))
+        }
+        Ok(Some(h)) => {
+            let regions = log_regions(
+                (h.slot_offset, h.slot_size, h.slot_count),
+                (h.checkpoint_offset, h.checkpoint_size, h.checkpoint_count),
+                (h.data_offset, u64::from(h.chunk_size) * u64::from(h.chunk_count)),
+            );
+            match mapped.check_regions(Part::Cache, size, &regions) {
+                Ok(()) => HeaderCopy::Valid,
+                Err(e) => HeaderCopy::Damaged(e.to_string()),
+            }
+        }
         Ok(None) => HeaderCopy::Damaged(format!("{} where {:?} belongs", signature(&b[..8]), "SPCACHE")),
         Err(e) => HeaderCopy::Damaged(e.to_string()),
     }
 }
 
-/// What a copy of the header of the parity journal of space `owner` holds.
-fn journal_header_state(owner: crate::Guid, b: &[u8]) -> HeaderCopy {
+/// What a copy of the header of the parity journal of space `owner` holds,
+/// read from `mapped`, a journal space of `size` bytes.
+fn journal_header_state<D: ReadAt>(owner: crate::Guid, mapped: &Mapped<'_, D>, size: u64, b: &[u8]) -> HeaderCopy {
     if b.iter().all(|&x| x == 0) {
         return HeaderCopy::Zero;
     }
@@ -885,7 +901,13 @@ fn journal_header_state(owner: crate::Guid, b: &[u8]) -> HeaderCopy {
     if of != owner {
         return HeaderCopy::Damaged(format!("the header of the journal of {of}"));
     }
-    HeaderCopy::Valid
+    let Some((slots, checkpoints)) = crate::journal::header_geometry(b) else {
+        return HeaderCopy::Damaged("implausible parity journal geometry".into());
+    };
+    match mapped.check_regions(Part::Journal, size, &log_regions(slots, checkpoints, (0, 0))) {
+        Ok(()) => HeaderCopy::Valid,
+        Err(e) => HeaderCopy::Damaged(e.to_string()),
+    }
 }
 
 /// What a copy of a header page of a dirty region log holds.
@@ -1034,27 +1056,15 @@ impl<'p, D: ReadAt> SpaceReader<'p, D> {
         let mapped = Mapped::new(pool, child)?;
         // The header from a valid copy (a damaged one made the cache
         // vanish, and data only it held with it).
-        let (head, note) = mapped.header(Part::Cache, 0, CacheHeader::SIZE, cache_header_state, same_log_header)?;
+        let size = hidden_size(child, &mapped);
+        let state = |b: &[u8]| cache_header_state(space.info.guid, &mapped, size, b);
+        let (head, note) = mapped.header(Part::Cache, 0, CacheHeader::SIZE, state, same_log_header)?;
         notes.extend(note);
         let Some(head) = head else {
             mapped.no_slots_without_header(Part::Cache)?;
             return Ok(None);
         };
         let header = CacheHeader::parse(&head)?.ok_or_else(|| format_err!("cache header vanished"))?;
-        if header.owner_guid != space.info.guid {
-            return Err(format_err!(
-                "cache of space {} belongs to {}",
-                space.id(),
-                header.owner_guid
-            ));
-        }
-        let h = &header;
-        let regions = log_regions(
-            (h.slot_offset, h.slot_size, h.slot_count),
-            (h.checkpoint_offset, h.checkpoint_size, h.checkpoint_count),
-            (h.data_offset, u64::from(h.chunk_size) * u64::from(h.chunk_count)),
-        );
-        mapped.check_regions(Part::Cache, hidden_size(child, &mapped), &regions)?;
         let index = CacheIndex::load(header, pool.logical_sector_size, Slots(&mapped, head))?;
         Ok(Some((mapped, index)))
     }
@@ -1074,19 +1084,15 @@ impl<'p, D: ReadAt> SpaceReader<'p, D> {
             if let Some(child) = pool.children(container.id()).find(|c| !c.extents.is_empty()) {
                 let mapped = Mapped::new(pool, child)?;
                 let owner = space.info.guid;
-                let state = |b: &[u8]| journal_header_state(owner, b);
+                let size = hidden_size(child, &mapped);
+                let state = |b: &[u8]| journal_header_state(owner, &mapped, size, b);
                 let (head, note) = mapped.header(Part::Journal, 0, 0x60, state, same_log_header)?;
                 notes.extend(note);
                 let Some(head) = head else {
                     mapped.no_slots_without_header(Part::Journal)?;
                     return Ok(None);
                 };
-                let journal = ParityJournal::load(owner, Slots(&mapped, head))?;
-                if let Some(j) = &journal {
-                    let regions = log_regions(j.geometry(), j.checkpoint_geometry(), (0, 0));
-                    mapped.check_regions(Part::Journal, hidden_size(child, &mapped), &regions)?;
-                }
-                return Ok(journal);
+                return ParityJournal::load(owner, Slots(&mapped, head));
             }
         }
         Ok(None)

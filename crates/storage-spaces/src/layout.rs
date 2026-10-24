@@ -521,7 +521,7 @@ impl Layout {
 
     /// The rows where what the extents map changes, in order: the state of
     /// the space is the same from one to the next.
-    fn bounds(&self) -> Vec<u64> {
+    pub(crate) fn bounds(&self) -> Vec<u64> {
         let mut bounds: Vec<u64> = self
             .runs
             .values()

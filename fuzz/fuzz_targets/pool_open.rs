@@ -49,7 +49,9 @@ fuzz_target!(|data: &[u8]| {
             let _ = reader.read_exact_at(&mut buf[..4096], offset);
         }
         let _ = reader.read_exact_at(&mut buf, size / 2);
-        let _ = reader.segments();
+        // The guard below compares the listed mirror runs, within 1 MiB
+        // (segments() compares 1 GiB: a second for a fixture's zeros).
+        let _ = reader.mapping();
     }
     // The guard's checks of every space (the partition table and NTFS
     // included), reading at most 1 MiB of listed parity stripes.

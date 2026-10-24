@@ -211,7 +211,11 @@ For `/etc/fstab`, use the partition device and `nofail`:
 `--backend auto` (default) picks device-mapper for simple spaces whose
 logical sector size matches the disks, and ublk otherwise. ublk keeps
 mirror and parity spaces readable when a disk fails while mounted; the
-device-mapper mapping reads one copy only.
+device-mapper mapping reads one copy only. Since 1.3.1 `--backend dm`
+first compares the copies of the extent runs a mirror's dirty region log
+lists (up to 1 GiB of each, as `spaces check` does) and refuses the mirror
+where they differ or there are more, and refuses a space with a row whose
+only copy is out of date.
 
 Every space of a pool can be attached at once, through device-mapper and
 servers side by side: a space served read-only by a process (ublk, nbd,

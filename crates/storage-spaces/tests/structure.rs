@@ -10,12 +10,12 @@ use storage_spaces::database::Database;
 use storage_spaces::format::{ExtentRecord, POOL_DB_OFFSET, Policy, Resiliency, SLAB_SIZE, SpaceRole};
 use storage_spaces::guard::{self, Options};
 use storage_spaces::health::{HealthStatus, health};
-use storage_spaces::io::{Overlay, SparseImage, WriteAt};
+use storage_spaces::io::{Overlay, ReadAt, SparseImage, WriteAt};
 use storage_spaces::journal::SPVDT_SIGNATURE;
 use storage_spaces::layout::{Condition, Layout};
 use storage_spaces::ops::{BlankDisk, SpaceSpec, check_pool, plan_create_pool, plan_create_space};
-use storage_spaces::report::Verdict;
-use storage_spaces::{Guid, Pool};
+use storage_spaces::report::{Status, Verdict};
+use storage_spaces::{Guid, Part, Pool, Space};
 
 fn guids(seed: u8) -> impl FnMut() -> Guid {
     let mut n = 0u64;
@@ -177,6 +177,47 @@ fn images(name: &str) -> Vec<SparseImage> {
         .collect()
 }
 
+/// The hidden space of role `role` (with extents) under user space `id`.
+fn hidden<D: ReadAt>(pool: &Pool<D>, id: u64, role: SpaceRole) -> &Space {
+    let container = pool.children(id).find(|c| c.info.role == role).unwrap();
+    pool.children(container.id()).find(|c| !c.extents.is_empty()).unwrap()
+}
+
+/// The header of a write-back cache or parity journal, from its first copy.
+fn log_header<D: ReadAt>(pool: &Pool<D>, child: &Space) -> CacheHeader {
+    let mut b = [0u8; CacheHeader::SIZE];
+    pool.open_space(child.id()).unwrap().read_exact_at(&mut b, 0).unwrap();
+    let (u64_at, u32_at) = (
+        |at: usize| u64::from_le_bytes(b[at..at + 8].try_into().unwrap()),
+        |at: usize| u32::from_le_bytes(b[at..at + 4].try_into().unwrap()),
+    );
+    CacheHeader {
+        owner_guid: Guid::from_mixed_endian(b[8..24].try_into().unwrap()),
+        sequence: u64_at(0x28),
+        slot_offset: u64_at(0x30),
+        slot_size: u32_at(0x38),
+        slot_count: u32_at(0x3c),
+        checkpoint_offset: u64_at(0x40),
+        checkpoint_size: u32_at(0x48),
+        checkpoint_count: u32_at(0x4c),
+        data_offset: u64_at(0x50),
+        chunk_size: u32_at(0x58),
+        chunk_count: u32_at(0x5c),
+    }
+}
+
+/// Writes `bytes` at the start of the first copy of `child`, or of every
+/// copy.
+fn write_header<D: ReadAt, W: WriteAt>(pool: &Pool<D>, disks: &[W], child: &Space, bytes: &[u8], every: bool) {
+    let l = Layout::new(child.info.policy.as_ref().unwrap(), &child.extents).unwrap();
+    let copies = l.copies_of(0);
+    for &copy in &copies[..if every { copies.len() } else { 1 }] {
+        let (disk, slab) = l.physical(0, copy, 0).unwrap();
+        let (device, at) = pool.slab_location(disk, slab).unwrap().unwrap();
+        disks[device].write_all_at(bytes, at).unwrap();
+    }
+}
+
 /// A write-back cache whose header names its chunks where its space has no
 /// extent (at 512 GiB in a cache of 1 GiB) or over its own slot area: the
 /// space is not read or written, and the guard fails it. 1.3.0 called the
@@ -196,15 +237,8 @@ fn a_cache_header_naming_regions_its_space_does_not_hold_fails() {
             drop(w);
             let mut header = pool.open_space(id).unwrap().cache().unwrap().header.clone();
             header.data_offset = data_offset;
-            let bytes = header.encode(SPCACHE_SIGNATURE);
-            let container = pool.children(id).find(|c| c.info.role == SpaceRole::Cache).unwrap();
-            let child = pool.children(container.id()).next().unwrap();
-            let l = Layout::new(child.info.policy.as_ref().unwrap(), &child.extents).unwrap();
-            for copy in l.copies_of(0) {
-                let (disk, slab) = l.physical(0, copy, 0).unwrap();
-                let (device, at) = pool.slab_location(disk, slab).unwrap().unwrap();
-                disks[device].write_all_at(&bytes, at).unwrap();
-            }
+            let child = hidden(&pool, id, SpaceRole::Cache);
+            write_header(&pool, &disks, child, &header.encode(SPCACHE_SIGNATURE), true);
         }
         let pool = Pool::open(disks.iter().collect::<Vec<_>>()).unwrap();
         let space = pool.find_space("parity3_26100").unwrap();
@@ -230,41 +264,13 @@ fn a_journal_header_naming_regions_its_space_does_not_hold_fails() {
         {
             let pool = Pool::open(disks.iter().collect::<Vec<_>>()).unwrap();
             let id = pool.find_space("parity3_26100").unwrap().id();
-            let container = pool
-                .children(id)
-                .find(|c| c.info.role == SpaceRole::Other(0x0a))
-                .unwrap();
-            let child = pool.children(container.id()).next().unwrap();
-            let mut b = [0u8; CacheHeader::SIZE];
-            pool.open_space(child.id()).unwrap().read_exact_at(&mut b, 0).unwrap();
-            let (u64_at, u32_at) = (
-                |at: usize| u64::from_le_bytes(b[at..at + 8].try_into().unwrap()),
-                |at: usize| u32::from_le_bytes(b[at..at + 4].try_into().unwrap()),
-            );
-            let mut header = CacheHeader {
-                owner_guid: Guid::from_mixed_endian(b[8..24].try_into().unwrap()),
-                sequence: u64_at(0x28),
-                slot_offset: u64_at(0x30),
-                slot_size: u32_at(0x38),
-                slot_count: u32_at(0x3c),
-                checkpoint_offset: u64_at(0x40),
-                checkpoint_size: u32_at(0x48),
-                checkpoint_count: u32_at(0x4c),
-                data_offset: u64_at(0x50),
-                chunk_size: u32_at(0x58),
-                chunk_count: u32_at(0x5c),
-            };
+            let child = hidden(&pool, id, SpaceRole::Other(0x0a));
+            let mut header = log_header(&pool, child);
             match what {
                 "slots beyond" => header.slot_offset = 512 << 30,
                 _ => header.checkpoint_offset = 0x3000,
             }
-            let bytes = header.encode(SPVDT_SIGNATURE);
-            let l = Layout::new(child.info.policy.as_ref().unwrap(), &child.extents).unwrap();
-            for copy in l.copies_of(0) {
-                let (disk, slab) = l.physical(0, copy, 0).unwrap();
-                let (device, at) = pool.slab_location(disk, slab).unwrap().unwrap();
-                disks[device].write_all_at(&bytes, at).unwrap();
-            }
+            write_header(&pool, &disks, child, &header.encode(SPVDT_SIGNATURE), true);
         }
         let pool = Pool::open(disks.iter().collect::<Vec<_>>()).unwrap();
         let space = pool.find_space("parity3_26100").unwrap();
@@ -275,6 +281,112 @@ fn a_journal_header_naming_regions_its_space_does_not_hold_fails() {
         let report = guard::space_report(&pool, space, &[], &Options::default(), &mut |_, _, _| Vec::new());
         assert_eq!(report.verdict(), Verdict::Failed, "{what}: {}", report.to_text());
     }
+}
+
+/// One copy of the header of a write-back cache or parity journal that does
+/// not check out by itself while the other does: the cache header of
+/// another space, a journal header without a slot size, a cache header
+/// naming chunks where its space has no extent. That copy gives way to the
+/// other: the space is degraded and reads as before. 1.3.0 took the first
+/// two for valid and failed the space (the auditor's spb_06), and since the
+/// checks of 3.2b the third failed it too.
+#[test]
+fn a_header_copy_that_does_not_check_out_gives_way_to_the_other() {
+    let images = images("parity3_26100");
+    for what in ["another owner", "no slot size", "unmapped chunks"] {
+        let disks: Vec<Overlay<&SparseImage>> = images.iter().map(Overlay::new).collect();
+        let pool = Pool::open(disks.iter().collect::<Vec<_>>()).unwrap();
+        let id = pool.find_space("parity3_26100").unwrap().id();
+        let mut before = vec![0u8; 1 << 20];
+        pool.open_space(id).unwrap().read_exact_at(&mut before, 0).unwrap();
+        let (role, part) = match what {
+            "no slot size" => (SpaceRole::Other(0x0a), Part::Journal),
+            _ => (SpaceRole::Cache, Part::Cache),
+        };
+        let child = hidden(&pool, id, role);
+        let mut header = log_header(&pool, child);
+        let bytes = match what {
+            "another owner" => {
+                header.owner_guid = Guid([0x99; 16]);
+                header.encode(SPCACHE_SIGNATURE)
+            }
+            "no slot size" => {
+                header.slot_size = 0;
+                header.encode(SPVDT_SIGNATURE)
+            }
+            _ => {
+                header.data_offset = 512 << 30;
+                header.encode(SPCACHE_SIGNATURE)
+            }
+        };
+        write_header(&pool, &disks, child, &bytes, false);
+        let reader = pool.open_space(id).unwrap_or_else(|e| panic!("{what}: {e}"));
+        let notes = reader.header_notes();
+        assert!(
+            notes.iter().any(|n| n.part == part && n.status == Status::Degraded),
+            "{what}: {notes:?}"
+        );
+        let mut after = vec![0u8; 1 << 20];
+        reader.read_exact_at(&mut after, 0).unwrap();
+        assert!(after == before, "{what}: reads differ");
+        let space = &pool.spaces[&id];
+        let report = guard::space_report(&pool, space, &[], &Options::default(), &mut |_, _, _| Vec::new());
+        assert_eq!(report.verdict(), Verdict::Degraded, "{what}: {}", report.to_text());
+    }
+}
+
+/// A thin space whose only extent is out of date (its disk missed writes):
+/// its rows are not mapped as zeros for device-mapper, as reads of them
+/// fail. 1.3.0's segments() mapped them as unallocated (the auditor's
+/// spa_04).
+#[test]
+fn a_row_with_only_an_out_of_date_copy_has_no_segments() {
+    let disks = new_pool(1, 4 << 30);
+    let pool = Pool::open(disks.iter().collect::<Vec<_>>()).unwrap();
+    let spec = SpaceSpec {
+        name: "thin1".into(),
+        resiliency: 1,
+        size: SLAB_SIZE,
+        thin: true,
+        copies: Some(1),
+        columns: Some(1),
+        interleave: None,
+        write_cache: None,
+    };
+    let (plan, _) = plan_create_space(&pool, &spec, &mut guids(0x50)).unwrap();
+    let none: [Overlay<SparseImage>; 0] = [];
+    plan.apply(&disks, &none).unwrap();
+    {
+        let pool = Pool::open(disks.iter().collect::<Vec<_>>()).unwrap();
+        let w = pool.open_space_rw(pool.find_space("thin1").unwrap().id()).unwrap();
+        w.write_all_at(&[0x5a; 4096], 0).unwrap();
+        w.flush().unwrap();
+    }
+    {
+        let pool = Pool::open(disks.iter().collect::<Vec<_>>()).unwrap();
+        let id = pool.find_space("thin1").unwrap().id();
+        let db = check_pool(&pool).unwrap();
+        let (record, mut extent) = db
+            .extents()
+            .unwrap()
+            .into_iter()
+            .find(|(_, e)| e.space_id == id)
+            .unwrap();
+        extent.stale_marker = 1;
+        let sequence = db.sequence() + 1;
+        let body = extent.encode(sequence);
+        let (mut next, _) = db.updated(&[(4, 6, &body)], &[record]).unwrap();
+        next.commit(sequence, db.timestamp() + 1);
+        store_database(&disks, &next);
+    }
+    let pool = Pool::open(disks.iter().collect::<Vec<_>>()).unwrap();
+    let reader = pool.open_space(pool.find_space("thin1").unwrap().id()).unwrap();
+    let mut buf = [0u8; 512];
+    assert!(reader.read_exact_at(&mut buf, 0).is_err());
+    let Err(e) = reader.segments() else {
+        panic!("mapped: {:?}", reader.segments())
+    };
+    assert!(e.to_string().contains("out-of-date"), "{e}");
 }
 
 /// A fixed tiered space one of whose tiers lost all its extent records, or

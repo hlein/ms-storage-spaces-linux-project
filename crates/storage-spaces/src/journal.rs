@@ -84,6 +84,29 @@ pub fn new_journal_header(owner: Guid, run_size: u64, stripe: u32, runs: u32) ->
 /// Newest entry per run: consistency and the entry's bytes.
 type Entries = HashMap<u64, (Consistency, Vec<u8>)>;
 
+/// Where areas of a log are: offset, size of each, count.
+pub(crate) type Areas = (u64, u32, u32);
+
+/// The slot area and checkpoint areas a journal header names; `None` for a
+/// slot geometry no journal has. As for the cache, checkpoint areas no real
+/// journal has (Windows: two of 125 MiB at 6 MiB) count as none.
+pub(crate) fn header_geometry(head: &[u8]) -> Option<(Areas, Areas)> {
+    let slots = (le_u64(&head[0x30..]), le_u32(&head[0x38..]), le_u32(&head[0x3c..]));
+    let (slot_offset, slot_size, slot_count) = (slots.0, slots.1 as usize, slots.2 as usize);
+    if !(0x40..=0x10000).contains(&slot_size)
+        || slot_count > 1 << 16
+        || slot_size * slot_count > 64 << 20
+        || slot_offset > MAX_LOG_OFFSET
+    {
+        return None;
+    }
+    let mut checkpoints = (le_u64(&head[0x40..]), le_u32(&head[0x48..]), le_u32(&head[0x4c..]));
+    if checkpoints.0 > MAX_LOG_OFFSET || checkpoints.2 > 4 {
+        checkpoints.2 = 0;
+    }
+    Some((slots, checkpoints))
+}
+
 impl ParityJournal {
     /// Parses the journal. `read` reads from the journal space.
     pub fn load(owner: Guid, mut read: impl SlotSource) -> Result<Option<Self>> {
@@ -98,28 +121,16 @@ impl ParityJournal {
         if Guid::from_mixed_endian(head[8..24].try_into().unwrap()) != owner {
             return Err(format_err!("parity journal belongs to another space"));
         }
-        let slot_offset = le_u64(&head[0x30..]);
-        let slot_size = le_u32(&head[0x38..]) as usize;
-        let slot_count = le_u32(&head[0x3c..]) as usize;
-        if !(0x40..=0x10000).contains(&slot_size)
-            || slot_count > 1 << 16
-            || slot_size * slot_count > 64 << 20
-            || slot_offset > MAX_LOG_OFFSET
-        {
+        let Some(((slot_offset, slot_size, slot_count), checkpoint_geometry)) = header_geometry(&head) else {
             return Err(format_err!("implausible parity journal geometry"));
-        }
+        };
+        let (slot_size, slot_count) = (slot_size as usize, slot_count as usize);
         // Stripes per extent run: the run's size over the stripe's (both
         // from the header; unknown when they do not divide).
         let (run_size, stripe) = (le_u64(&head[0x50..]), u64::from(le_u32(&head[0x58..])));
         let stripes = (stripe > 0 && run_size > 0 && run_size.is_multiple_of(stripe)).then(|| run_size / stripe);
         let copies = read.read_slot_copies(slot_offset, slot_size * slot_count)?;
         let merged = merge_slot_copies(&copies, slot_size);
-        let mut checkpoint_geometry = (le_u64(&head[0x40..]), le_u32(&head[0x48..]), le_u32(&head[0x4c..]));
-        // As for the cache: a geometry no real journal has (Windows: two
-        // areas of 125 MiB at 6 MiB) describes no usable checkpoints.
-        if checkpoint_geometry.0 > MAX_LOG_OFFSET || checkpoint_geometry.2 > 4 {
-            checkpoint_geometry.2 = 0;
-        }
         let (cp_offset, cp_size, cp_count) = checkpoint_geometry;
         let checkpoints = load_checkpoints(&mut read, owner, cp_offset, cp_size, cp_count)?;
         let checkpoint = checkpoints.iter().flatten().max_by_key(|c| c.sequence).cloned();

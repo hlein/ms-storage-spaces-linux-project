@@ -246,3 +246,29 @@ fn a_log_too_small_for_its_two_pages_fails() {
         assert_eq!(r.verdict(), Verdict::Failed, "{len:#x}: {}", r.to_text());
     }
 }
+
+/// A mirror whose dirty region log lists a run whose copies differ (a crash
+/// with writes in flight) has no device-mapper segments: they map one copy,
+/// where reads compare the copies and fail. Listed runs whose copies agree
+/// are mapped. 1.3.0 mapped the first copy of a listed run whose copies
+/// differed (the auditor's spb_07).
+#[test]
+fn a_mirror_whose_listed_run_differs_has_no_segments() {
+    let images = images("drtdisc");
+    let disks: Vec<Overlay<&SparseImage>> = images.iter().map(Overlay::new).collect();
+    let pool = Pool::open(disks.iter().collect::<Vec<_>>()).unwrap();
+    let id = pool.find_space("drtdisc").unwrap().id();
+    list(&pool, &disks, id, &[0]);
+    assert!(pool.open_space(id).unwrap().segments().is_ok());
+    differ(&pool, &disks, id, 0);
+    let reader = pool.open_space(id).unwrap();
+    assert!(!reader.check_dirty_regions(None).unwrap().unwrap().differ.is_empty());
+    let Err(e) = reader.segments() else {
+        panic!("mapped: {:?}", reader.segments())
+    };
+    assert!(
+        e.to_string()
+            .contains("copies of an extent run the dirty region log lists differ"),
+        "{e}"
+    );
+}

@@ -177,7 +177,7 @@ fuzz_target!(|data: &[u8]| {
             continue;
         };
         let _ = reader.check_unclean_parity(Some(1 << 20));
-        let _ = reader.segments();
+        let _ = reader.mapping();
         let _ = reader.read_exact_at(&mut sector, reader.size() / 2 & !4095);
     }
     let options = Options {

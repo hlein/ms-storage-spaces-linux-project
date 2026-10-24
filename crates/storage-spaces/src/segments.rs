@@ -10,6 +10,10 @@ use crate::format::{Resiliency, SLAB_SIZE};
 use crate::io::ReadAt;
 use crate::reader::SpaceReader;
 
+/// Bytes of each copy of the listed mirror runs [`SpaceReader::segments`]
+/// compares before mapping them: the guard's read budget.
+const LISTED_BUDGET: u64 = 1 << 30;
+
 /// One column of a striped segment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Stripe {
@@ -38,6 +42,35 @@ pub struct Segment {
 impl<D: ReadAt> SpaceReader<'_, D> {
     /// Describes the space as segments, or explains why it cannot be.
     pub fn segments(&self) -> Result<Vec<Segment>> {
+        let segments = self.mapping()?;
+        // A segment maps one copy, where reads compare the copies of the
+        // runs the dirty region log lists: those are compared first, as the
+        // guard does, and a difference, or more than the read budget, is
+        // refused (audit 2026-10-21, SPB-06: 1.3.0 mapped one copy of runs
+        // whose copies differed). Windows lists the runs written since the
+        // space was last disconnected, so most of its mirrors list some.
+        if let Some(c) = self.check_dirty_regions(Some(LISTED_BUDGET))? {
+            if let Some(at) = c.differ.first() {
+                return Err(Error::Pool(format!(
+                    "the copies of an extent run the dirty region log lists differ at {at:#x}: one copy cannot be \
+                     mapped"
+                )));
+            }
+            if c.incomplete {
+                return Err(Error::Unsupported(format!(
+                    "the extent runs the dirty region log lists exceed {} MiB: their copies were not all compared \
+                     (the other backends compare them when read)",
+                    LISTED_BUDGET >> 20
+                )));
+            }
+        }
+        Ok(segments)
+    }
+
+    /// The segments [`SpaceReader::segments`] maps, without comparing the
+    /// copies of the runs a mirror's dirty region log lists first: for
+    /// callers that compared them (the guard does, within its budget).
+    pub fn mapping(&self) -> Result<Vec<Segment>> {
         let l = self.layout();
         if self.is_tiered() {
             return Err(Error::Unsupported("tiered spaces have no linear mapping yet".into()));
@@ -59,17 +92,11 @@ impl<D: ReadAt> SpaceReader<'_, D> {
             ));
         }
         let rows = self.size().div_ceil(row_size);
-        // Where what maps a column changes: between these rows every row is
-        // mapped as the first, a slab further on, and makes one segment (a
-        // space of 1 EiB has 2^32 rows, its runs are what count).
-        let mut bounds: Vec<u64> = l
-            .runs()
-            .values()
-            .flatten()
-            .flat_map(|r| [r.first_row, r.first_row + r.rows])
-            .filter(|&b| b < rows)
-            .chain([0, rows])
-            .collect();
+        // Where what maps a column changes, out-of-date copies included:
+        // between these rows every row is mapped as the first, a slab
+        // further on, and makes one segment (a space of 1 EiB has 2^32 rows,
+        // its runs are what count).
+        let mut bounds: Vec<u64> = l.bounds().into_iter().filter(|&b| b < rows).chain([0, rows]).collect();
         bounds.sort_unstable();
         bounds.dedup();
         let mut out: Vec<Segment> = Vec::new();
@@ -92,6 +119,12 @@ impl<D: ReadAt> SpaceReader<'_, D> {
                 }
                 if let Some((device, offset)) = found {
                     stripes.push(Stripe { device, offset });
+                } else if l.has_stale_copy(column, row) {
+                    // Reads of it fail; mapped as zeros it would not
+                    // (audit 2026-10-21, SPB-06).
+                    return Err(Error::Pool(format!(
+                        "column {column} row {row} has only an out-of-date copy (its disk missed writes)"
+                    )));
                 }
             }
             let kind = if allocated == 0 {

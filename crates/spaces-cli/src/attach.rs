@@ -707,12 +707,15 @@ fn choose(
     // other copies when served by a process.
     let sectors_match = paths.iter().all(|p| logical_block_size(p) == Some(sector));
     let simple = reader.layout().resiliency == storage_spaces::format::Resiliency::Simple;
-    let dm_ok = if rw {
-        dm_write_refusal(reader).is_none()
-    } else {
-        reader.segments().is_ok()
-    };
-    if simple && dm_ok && sectors_match && available(Backend::Dm) {
+    // Only simple spaces are mapped by dm unasked: a mirror's segments
+    // read its listed runs first.
+    let dm_ok = simple
+        && if rw {
+            dm_write_refusal(reader).is_none()
+        } else {
+            reader.segments().is_ok()
+        };
+    if dm_ok && sectors_match && available(Backend::Dm) {
         return Ok(Backend::Dm);
     }
     let fallbacks: &[Backend] = if rw {

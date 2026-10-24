@@ -1216,7 +1216,11 @@ scenario state of the corpus.
   their headers (snapshots `m5ids` s2 and s3: a second space's dirty region
   log), but the slot area of a cache or journal (at 0x2000) holding a slot
   then means the header is lost (failed), and with a copy on a missing disk
-  it is not known (suspect). Of the two header pages of a dirty region log,
+  it is not known (suspect). A copy counts as valid only if it checks out
+  by itself: a cache header of the space, a journal header of a slot
+  geometry `spaces` reads, the areas either names inside the space and
+  apart (since 1.3.1; 1.3.0 took the first copy whatever it named, and
+  failed the space on it). Of the two header pages of a dirty region log,
   one lost on every copy is degraded; both, failed. Copies of a page that
   differ are read from the newest generation (a crash between the writes
   of the mirror), but copies of one generation listing different runs are

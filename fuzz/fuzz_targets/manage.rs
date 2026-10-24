@@ -90,9 +90,11 @@ fuzz_target!(|data: &[u8]| {
         6 => disk_id.map_or(Ok(Default::default()), |d| ops::plan_remove_disk(&pool, d)),
         7 => ops::plan_repair(&pool),
         8 => ops::plan_rebalance(&pool),
-        // Scrubbing reads every slab: only on pools of up to four.
+        // Scrubbing reads every slab, a tiered space's tiers' too (since
+        // 1.3.1): only on pools of up to four.
         9 if pool
             .user_spaces()
+            .flat_map(|s| std::iter::once(s).chain(pool.children(s.id()).filter(|c| c.info.range.is_some())))
             .flat_map(|s| &s.extents)
             .map(|e| e.slab_count)
             .sum::<u64>()

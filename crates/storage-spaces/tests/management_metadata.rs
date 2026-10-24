@@ -200,9 +200,15 @@ fn tiered_pool() -> Vec<Overlay<SparseImage>> {
             .apply(&disks, &none)
             .unwrap();
     }
+    // GUIDs of their own, as Windows gives them (those of `guids` from its
+    // start are the pool's and its metadata space's).
+    let mut new_guid = guids();
+    for _ in 0..100 {
+        new_guid();
+    }
     for (name, ssd, resiliency) in [("SSD", true, 2), ("HDD", false, 1)] {
         let pool = Pool::open(disks.iter().collect::<Vec<_>>()).unwrap();
-        plan_create_tier(&pool, name, ssd, resiliency, None, &mut guids())
+        plan_create_tier(&pool, name, ssd, resiliency, None, &mut new_guid)
             .unwrap()
             .apply(&disks, &none)
             .unwrap();

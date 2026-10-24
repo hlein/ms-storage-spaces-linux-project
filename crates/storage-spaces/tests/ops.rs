@@ -738,11 +738,39 @@ fn database_copies_stay_inside_their_partitions() {
         plan.apply::<_, &Overlay<&SparseImage>>(&members(), &[]).unwrap();
     }
     // The pool partition's last sector (the second entry of the table at
-    // LBA 2), 16 sectors after its first.
+    // LBA 2), 16 sectors after its first; the table's CRC32s sealed again,
+    // as a table that says so (a primary that does not check out gives
+    // way to the backup).
     let first = 32768u64;
     base[0]
         .write_all_at(&(first + 15).to_le_bytes(), 1024 + 128 + 40)
         .unwrap();
+    {
+        use storage_spaces::io::ReadAt;
+        let crc32 = |data: &[u8]| {
+            let mut c = !0u32;
+            for &b in data {
+                c ^= u32::from(b);
+                for _ in 0..8 {
+                    c = if c & 1 != 0 { (c >> 1) ^ 0xedb8_8320 } else { c >> 1 };
+                }
+            }
+            !c
+        };
+        let mut h = [0u8; 92];
+        base[0].read_exact_at(&mut h, 512).unwrap();
+        let (count, size) = (
+            u32::from_le_bytes(h[80..84].try_into().unwrap()) as usize,
+            u32::from_le_bytes(h[84..88].try_into().unwrap()) as usize,
+        );
+        let mut entries = vec![0u8; count * size];
+        base[0].read_exact_at(&mut entries, 1024).unwrap();
+        h[88..92].copy_from_slice(&crc32(&entries).to_le_bytes());
+        h[16..20].fill(0);
+        let crc = crc32(&h);
+        h[16..20].copy_from_slice(&crc.to_le_bytes());
+        base[0].write_all_at(&h, 512).unwrap();
+    }
     let pool = Pool::open(members()).unwrap();
     let m = &pool.members[0];
     assert_eq!(m.partition.length, 8192);

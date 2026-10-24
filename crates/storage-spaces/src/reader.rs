@@ -1519,8 +1519,13 @@ impl<'p, D: ReadAt> SpaceReader<'p, D> {
     }
 
     /// Reads the space's own extents only, ignoring the write-back cache
-    /// (diagnostics and recovery; this is not the current content).
+    /// (diagnostics and recovery; this is not the current content). Within
+    /// the space, as [`SpaceReader::read_exact_at`] (1.3.0 read zeros past
+    /// its end and overflowed near 2^64: the auditor's spb_08).
     pub fn read_uncached_at(&self, mut buf: &mut [u8], mut offset: u64) -> Result<()> {
+        if offset.checked_add(buf.len() as u64).is_none_or(|end| end > self.size) {
+            return Err(Error::Io(io::ErrorKind::UnexpectedEof.into()));
+        }
         while !buf.is_empty() {
             let n = self.read_space(offset, buf)?;
             offset += n as u64;

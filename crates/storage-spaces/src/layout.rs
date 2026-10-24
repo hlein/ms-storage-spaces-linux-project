@@ -389,7 +389,12 @@ impl Layout {
                 global.extend((1..=len).map(|c| c as u8));
                 start += len;
             }
-            code.push(Some(global));
+            // GF(16) has 15 coefficients besides 0: a group of more data
+            // units has no global row known, as dual parity of more columns
+            // (1.3.0 used 16, which multiplies by 0: reconstruction read
+            // wrong data; audit 2026-10-21, SPB-04).
+            let known = d.div_ceil(g) <= 15;
+            code.push(known.then_some(global));
             return code;
         }
         let mut code = vec![Some(vec![1u8; d])];

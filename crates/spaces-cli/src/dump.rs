@@ -58,15 +58,12 @@ pub fn dump<D: ReadAt>(pool: &Pool<D>) -> Vec<String> {
     }
 
     // The records of the version the pool uses, then how the others differ.
-    // The version the pool uses: of those with its sequence, the one most
-    // members hold, the first member's on a tie (as Pool::open chooses).
-    let chosen = versions.iter().filter(|v| v.0.sequence == pool.database.sequence).fold(
-        None::<&(DbHeader, Vec<RawRecord>, Vec<usize>)>,
-        |best, v| match best {
-            Some(b) if b.2.len() >= v.2.len() => Some(b),
-            _ => Some(v),
-        },
-    );
+    // The version the pool uses: the one of the devices it was assembled
+    // from (1.3.0 took the first of its sequence, which may be a copy
+    // Pool::open passed over for not decoding: the auditor's scb_04).
+    let chosen = versions
+        .iter()
+        .find(|v| v.2.iter().any(|d| pool.database_devices.contains(d)));
     if let Some(chosen) = chosen {
         let records = &chosen.1;
         for r in records {
@@ -262,6 +259,49 @@ mod tests {
         // Both members carry the same copy, so no other version is listed.
         assert!(!has("database sequence"));
         assert!(diff(&lines, &lines).is_empty());
+    }
+
+    /// The copy of the pool database on the first member damaged (a disk
+    /// record whose body no longer decodes, under the same sequence): the
+    /// pool is read from the second member's, and the dump lists that one's
+    /// records as the pool's, the first member's as another version. 1.3.0
+    /// listed the first member's broken records as the pool's (the
+    /// auditor's scb_04).
+    #[test]
+    fn dump_lists_the_copy_the_pool_reads() {
+        use storage_spaces::format::POOL_DB_OFFSET;
+        use storage_spaces::io::ReadAt;
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../storage-spaces/tests/fixtures/mirror2");
+        let mut disks: Vec<SparseImage> = (0..2)
+            .map(|i| SparseImage::read_from(File::open(dir.join(format!("disk{i}.fixture"))).unwrap()).unwrap())
+            .collect();
+        let at = Pool::open(disks.iter().collect::<Vec<_>>()).unwrap().members[0]
+            .partition
+            .offset
+            + POOL_DB_OFFSET;
+        let mut page = vec![0u8; 4096];
+        disks[0].read_exact_at(&mut page, at).unwrap();
+        let entry = (0x200..4000)
+            .step_by(0x40)
+            .find(|&e| &page[e..e + 4] == b"SDBB" && page[e + 16] == 2)
+            .unwrap();
+        page[entry + 24] = 0xff;
+        disks[0].insert(at, &page);
+        let pool = Pool::open(disks).unwrap();
+        assert_eq!(pool.database_devices, [1]);
+        let lines = dump(&pool);
+        assert!(
+            !lines
+                .iter()
+                .any(|l| l.starts_with("record ") && l.contains("undecodable")),
+            "{lines:#?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.starts_with("database sequence 2 on devices [0]")),
+            "{lines:#?}"
+        );
     }
 
     #[test]

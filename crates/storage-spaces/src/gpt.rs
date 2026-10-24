@@ -37,14 +37,43 @@ pub fn read_gpt<D: ReadAt + ?Sized>(dev: &D, sector: u64) -> Result<Option<Vec<P
     if size < sector * 2 {
         return Ok(None);
     }
-    let header = read_vec(dev, sector, 92)?;
+    // The primary table, else the backup at the last LBA where the primary
+    // is lost or does not check out, as Windows and the kernel read them
+    // (1.3.0 read the primary alone: a member whose first header was lost
+    // was no member; audit 2026-10-21, the auditor's spa_06). Neither
+    // checking out: the primary, as before.
+    let primary = table_at(dev, sector, 1, size)?;
+    if let Some((parts, true)) = primary {
+        return Ok(Some(parts));
+    }
+    if let Some((parts, true)) = table_at(dev, sector, size / sector - 1, size)? {
+        return Ok(Some(parts));
+    }
+    Ok(primary.map(|(parts, _)| parts))
+}
+
+/// The partitions of the GPT header at `lba` and whether it and its entries
+/// check out (their CRC32s, the header's own LBA); `None` without a header
+/// there.
+fn table_at<D: ReadAt + ?Sized>(dev: &D, sector: u64, lba: u64, size: u64) -> Result<Option<(Vec<Partition>, bool)>> {
+    let Some(at) = lba.checked_mul(sector).filter(|&at| at + 92 <= size) else {
+        return Ok(None);
+    };
+    let header = read_vec(dev, at, (sector as usize).clamp(92, 4096))?;
     if &header[0..8] != b"EFI PART" {
         return Ok(None);
     }
+    let header_size = u32::from_le_bytes(header[12..16].try_into().unwrap()) as usize;
+    let sound_header = (92..=header.len()).contains(&header_size)
+        && crate::crc::crc32_excluding(&header[..header_size], 16)
+            == u32::from_le_bytes(header[16..20].try_into().unwrap())
+        && u64::from_le_bytes(header[24..32].try_into().unwrap()) == lba;
     let entries_lba = u64::from_le_bytes(header[72..80].try_into().unwrap());
     let count = u32::from_le_bytes(header[80..84].try_into().unwrap()) as usize;
     let entry_size = u32::from_le_bytes(header[84..88].try_into().unwrap()) as usize;
-    if !(128..=4096).contains(&entry_size) || count > 4096 {
+    // Entries of 128 * 2^n bytes, as UEFI has them (1.3.0 took any size
+    // from 128 to 4096: audit 2026-10-21, SPA-02).
+    if !(128..=4096).contains(&entry_size) || !entry_size.is_power_of_two() || count > 4096 {
         return Ok(None);
     }
     let table_start = entries_lba.checked_mul(sector).filter(|&s| {
@@ -55,6 +84,7 @@ pub fn read_gpt<D: ReadAt + ?Sized>(dev: &D, sector: u64) -> Result<Option<Vec<P
         return Ok(None);
     };
     let table = read_vec(dev, table_start, count * entry_size)?;
+    let sound = sound_header && crate::crc::crc32(&table) == u32::from_le_bytes(header[88..92].try_into().unwrap());
     let mut parts = Vec::new();
     for (i, entry) in table.chunks_exact(entry_size).enumerate() {
         let type_guid = Guid::from_mixed_endian(entry[0..16].try_into().unwrap());
@@ -85,7 +115,7 @@ pub fn read_gpt<D: ReadAt + ?Sized>(dev: &D, sector: u64) -> Result<Option<Vec<P
             name: String::from_utf16_lossy(&name).trim_end_matches('\0').to_string(),
         });
     }
-    Ok(Some(parts))
+    Ok(Some((parts, sound)))
 }
 
 /// Fails unless every partition lies inside a device of `size` bytes and

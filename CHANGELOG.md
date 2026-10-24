@@ -105,6 +105,19 @@
   the next ones on), and a thin space's new row goes to the disk with the
   most free slabs, counted whole (1.3.0 ranked disks by their first free
   slab).
+* Smaller findings of the audit of 2026-10-21 (SPB-04, SPB-06, SPA-02 and
+  the auditor's spa_06, spa_08, spg05, spg06, scb_04, scb_06): local
+  reconstruction groups of more than 15 data units were rebuilt with a
+  coefficient GF(16) does not have (wrong data); a member disk whose
+  primary GPT header was lost was no member, and the guard took the
+  entries of a primary that does not check out (none at all) over a sound
+  backup; MBR partitions were numbered by order, not slot; an NTFS volume
+  of no sectors was called sound; two spaces of one GUID, or a name holding
+  a NUL (which then failed `nbd-client` at attach), passed as healthy;
+  `read_uncached_at` read past the space's end; `spaces dump` listed as
+  the pool's the first copy of the newest sequence, not the one the pool
+  reads; GPT entries of sizes UEFI does not have were read. Each now does
+  what Windows does or refuses.
 * The checks of a pool of many spaces (`spaces attach`, `spaces check`)
   took about three times as long as in 1.2.2: 1.3.0's check for unmapped
   fixed spaces looked up each space's hidden spaces among all the pool's

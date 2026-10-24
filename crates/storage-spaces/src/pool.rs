@@ -63,6 +63,10 @@ pub enum Issue {
     /// Records of one kind with one id (or disks with one GUID): the last
     /// is kept.
     DuplicateRecord { kind: &'static str, id: String },
+    /// A name holding a NUL character, which Windows does not write and no
+    /// command line takes (1.3.0 passed a space's to nbd-client, which then
+    /// failed to start: the auditor's scb_06).
+    NulInName { kind: &'static str, id: u64 },
 }
 
 impl std::fmt::Display for Issue {
@@ -100,6 +104,7 @@ impl std::fmt::Display for Issue {
             Issue::UnknownDiskExtent { space, disk } => write!(f, "space {space} has an extent on unknown disk {disk}"),
             Issue::DuplicateMember { devices, guid } => write!(f, "devices {devices:?} are the same disk {guid}"),
             Issue::DuplicateRecord { kind, id } => write!(f, "two {kind} records with {id}"),
+            Issue::NulInName { kind, id } => write!(f, "the name of {kind} {id} holds a NUL character"),
         }
     }
 }
@@ -259,6 +264,8 @@ pub struct Pool<D> {
     pub physical_sector_size: u32,
     pub members: Vec<Member>,
     pub database: DbHeader,
+    /// The devices whose copy of the pool database it was assembled from.
+    pub database_devices: Vec<usize>,
     pub disks: BTreeMap<u64, PhysicalDisk>,
     pub spaces: BTreeMap<u64, Space>,
     /// Non-fatal problems found while assembling the pool, as text (one
@@ -488,6 +495,9 @@ impl<D: ReadAt> Pool<D> {
                     id: format!("GUID {}", d.guid),
                 });
             }
+            if d.name.contains('\0') {
+                issues.push(Issue::NulInName { kind: "disk", id: d.id });
+            }
             disks.insert(
                 d.id,
                 PhysicalDisk {
@@ -502,11 +512,27 @@ impl<D: ReadAt> Pool<D> {
             );
         }
         let mut spaces = BTreeMap::new();
+        // Devices, units and `--space` name a space by its GUID: two spaces
+        // of one are not Windows' (none in the corpus; 1.3.0 let them pass:
+        // audit 2026-10-21, the auditor's spa_08).
+        let mut space_guids = std::collections::BTreeSet::new();
         for s in space_records {
             if spaces.contains_key(&s.id) {
                 issues.push(Issue::DuplicateRecord {
                     kind: "space",
                     id: format!("id {}", s.id),
+                });
+            }
+            if !space_guids.insert(s.guid) {
+                issues.push(Issue::DuplicateRecord {
+                    kind: "space",
+                    id: format!("GUID {}", s.guid),
+                });
+            }
+            if s.name.contains('\0') {
+                issues.push(Issue::NulInName {
+                    kind: "space",
+                    id: s.id,
                 });
             }
             spaces.insert(
@@ -551,6 +577,7 @@ impl<D: ReadAt> Pool<D> {
             physical_sector_size: pool_record.physical_sector_size,
             members,
             database,
+            database_devices: used,
             disks,
             spaces,
             warnings: issues.iter().map(Issue::to_string).collect(),

@@ -777,6 +777,9 @@ Column offset `o` is in row `o / 256 MiB` of the column.
   `i < g` is the XOR of group `i` (local parity); the last one is a global
   GF(16) parity in the bit-matrix form above with the coefficients
   `1, 2, 3, ...` restarting in every group (12 columns: `1 2 3 4 5 1 2 3 4`).
+  GF(16) has 15 of them besides 0: for groups of more data units the
+  global parity is not known, and `spaces` does not rebuild from it (1.3.0
+  used 16, which multiplies by 0; audit 2026-10-21, SPB-04).
   (**verified**: the unit map and all three parity units of the first 8
   stripes of pattern pool `lrc12`, the global code solved bit by bit over
   GF(2) and matching GF(16) multiplication; any two failed disks of `lrc11`
@@ -1251,8 +1254,14 @@ scenario state of the corpus.
   1.3.1; audit 2026-10-21, SPB-05).
 * Partitions that become device-mapper devices lie inside the space and
   do not overlap; they are the ones the guard checks: the GPT, from its
-  backup header at the last LBA when the primary is lost (suspect), or the
-  MBR's (a protective MBR without a GPT is suspect).
+  backup header at the last LBA when the primary is lost or it or its
+  entries do not check out (their CRC32s; suspect), or the MBR's, numbered
+  by their slot (a protective MBR without a GPT is suspect). The same
+  fallback finds the pool partition of a member disk (since 1.3.1; 1.3.0
+  read the primary alone). GPT entries are 128 * 2^n bytes (UEFI; Linux
+  reads 128 only); a table of other entries is none.
+* No two spaces of a pool share a GUID, and no name holds a NUL: either is
+  a pool issue (since 1.3.1; none in the corpus).
 * A fixed space maps every row of its size, its own or its tiers' (Windows
   allocates them at creation, an extension adds rows): a row without an
   extent means extent records went missing, and the space is refused

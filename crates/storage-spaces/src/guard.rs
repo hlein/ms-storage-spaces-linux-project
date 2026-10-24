@@ -364,6 +364,11 @@ fn clean_check<D>(pool: &Pool<D>, names: &[String]) -> Check {
                     .expected("one per id")
                     .found(format!("two with {id} (the last is read)")),
             ),
+            Issue::NulInName { kind, id } => suspect.push(
+                Evidence::new(format!("the name of {kind} {id}"))
+                    .expected("no NUL character (Windows writes none)")
+                    .found("one"),
+            ),
             Issue::UnlistedDevice { device } => warn.push(
                 Evidence::new(format!(
                     "{}, which carries this pool's metadata",
@@ -1047,8 +1052,10 @@ impl GptHeader {
 
     /// Whether the entry array is plausible (and small enough to read).
     fn table_ok(&self, lbas: u64) -> bool {
+        // 128 * 2^n bytes, as UEFI has it (1.3.0 took any multiple of 8,
+        // tables Windows and Linux do not read: audit 2026-10-21, SPA-02).
         (128..=4096).contains(&self.entry_size)
-            && self.entry_size.is_multiple_of(8)
+            && self.entry_size.is_power_of_two()
             && self.count <= 4096
             && self.entries_lba < lbas
     }
@@ -1165,22 +1172,25 @@ fn partition_check(
         Ok(b) => b,
         Err(e) => return (unreadable(e), Some(Vec::new())),
     };
-    let mbr_entries: Vec<(u8, u64, u64)> = if mbr[510..512] == [0x55, 0xaa] {
+    // (slot, kind, first LBA, sectors): a partition is numbered by its slot,
+    // as the kernel numbers it (1.3.0 counted the used slots).
+    let mbr_entries: Vec<(usize, u8, u64, u64)> = if mbr[510..512] == [0x55, 0xaa] {
         (0..4)
-            .map(|i| &mbr[446 + i * 16..462 + i * 16])
-            .map(|e| {
+            .map(|i| (i, &mbr[446 + i * 16..462 + i * 16]))
+            .map(|(i, e)| {
                 (
+                    i,
                     e[4],
                     u64::from(u32::from_le_bytes(e[8..12].try_into().unwrap())),
                     u64::from(u32::from_le_bytes(e[12..16].try_into().unwrap())),
                 )
             })
-            .filter(|&(kind, _, count)| kind != 0 && count != 0)
+            .filter(|&(_, kind, _, count)| kind != 0 && count != 0)
             .collect()
     } else {
         Vec::new()
     };
-    let protective = mbr_entries.iter().any(|&(kind, ..)| kind == 0xee);
+    let protective = mbr_entries.iter().any(|&(_, kind, ..)| kind == 0xee);
     let lba1 = match read(1, sector as usize) {
         Ok(b) => b,
         Err(e) => return (unreadable(e), Some(Vec::new())),
@@ -1287,9 +1297,8 @@ fn partition_check(
         }
         let parts: Vec<Partition> = mbr_entries
             .iter()
-            .enumerate()
-            .map(|(i, &(kind, start, count))| Partition {
-                number: i as u32 + 1,
+            .map(|&(slot, kind, start, count)| Partition {
+                number: slot as u32 + 1,
                 offset: start * sector,
                 length: count * sector,
                 kind: format!("mbr:{kind:#04x}"),
@@ -1479,9 +1488,35 @@ fn partition_check(
             _ => {}
         }
     }
-    let parts = primary_entries.as_ref().map_or(Vec::new(), |table| {
-        gpt_partitions(&primary, table, lbas, sector, at, &mut problems)
-    });
+    // A primary header or entries that do not check out give way to a
+    // backup at the last LBA that does, as for a primary lost (1.3.0 took
+    // the primary's entries: none at all where it counted none; audit
+    // 2026-10-21, the auditor's spa_06 and spg06).
+    let sound =
+        |h: &GptHeader, t: &Option<Vec<u8>>| h.crc_ok() && t.as_ref().is_some_and(|t| crc32(t) == h.entries_crc);
+    let fallback = (!sound(&primary, &primary_entries) || primary.my_lba != 1)
+        .then(|| {
+            let b = read(last, sector as usize)
+                .ok()
+                .and_then(|raw| GptHeader::parse(raw, last))
+                .filter(|b| b.my_lba == last)?;
+            let t = entries_of(&b).ok();
+            sound(&b, &t).then(|| (b, t.unwrap_or_default()))
+        })
+        .flatten();
+    let parts = match (&fallback, &primary_entries) {
+        (Some((b, t)), _) => {
+            problems.push(
+                Evidence::new("the partitions")
+                    .at(at(last))
+                    .expected("read from the primary GPT")
+                    .found(format!("read from the backup at LBA {last}, which checks out")),
+            );
+            gpt_partitions(b, t, lbas, sector, at, &mut problems)
+        }
+        (None, Some(table)) => gpt_partitions(&primary, table, lbas, sector, at, &mut problems),
+        (None, None) => Vec::new(),
+    };
     let mbr_note = if protective {
         ""
     } else {
@@ -1627,6 +1662,15 @@ pub fn ntfs_check<R: ReadAt + ?Sized>(
         })
     {
         match read_vec(dev, copy_at, 512) {
+            // A volume of no sectors has its boot sector's copy where the
+            // boot sector is: 1.3.0 compared it with itself and called it
+            // sound (audit 2026-10-21, the auditor's spg05).
+            _ if total == 0 => problems.push(
+                Evidence::new("the size of the NTFS volume")
+                    .at(locate(offset))
+                    .expected("a sector at least")
+                    .found(format!("0 sectors of {bps} bytes")),
+            ),
             Ok(copy) if copy == boot => {}
             Ok(copy) => {
                 let first = copy.iter().zip(&boot).position(|(a, b)| a != b).unwrap_or(0);

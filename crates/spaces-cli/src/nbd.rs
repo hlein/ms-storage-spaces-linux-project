@@ -56,6 +56,34 @@ const EINVAL: u32 = 22;
 /// Largest read request served (the kernel sends at most max_sectors).
 const MAX_REQUEST: u32 = 32 << 20;
 
+/// Set once a request panicked (in this process): the server's shutdown
+/// does not flush a writer a panic may have left half way.
+pub static PANICKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Held (shared) while a request is carried out: the server's shutdown
+/// takes it whole, so that the requests under way end first and no new one
+/// starts.
+pub static GATE: std::sync::RwLock<()> = std::sync::RwLock::new(());
+
+/// `f`, a panic in it an error: the request is answered with EIO, and
+/// every later one of the connection (1.3.0's connection ended with the
+/// panic, the kernel's request unanswered; audit 2026-10-21, SCB-01).
+fn caught<T>(broken: &mut bool, f: impl FnOnce() -> io::Result<T>) -> io::Result<T> {
+    if *broken {
+        return Err(io::Error::other("a request before panicked"));
+    }
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).unwrap_or_else(|p| {
+        *broken = true;
+        PANICKED.store(true, std::sync::atomic::Ordering::SeqCst);
+        let what = p
+            .downcast_ref::<&str>()
+            .map(|s| (*s).to_string())
+            .or_else(|| p.downcast_ref::<String>().cloned())
+            .unwrap_or_default();
+        Err(io::Error::other(format!("a panic: {what}")))
+    })
+}
+
 /// Where the writes to a writable export go.
 pub trait Sink: Sync {
     fn write_all_at(&self, buf: &[u8], offset: u64) -> io::Result<()>;
@@ -179,12 +207,14 @@ fn option_reply<W: Write>(w: &mut W, option: u32, reply: u32, data: &[u8]) -> io
 
 fn transmission<R: ReadAt + ?Sized, S: Read + Write>(export: &Export<'_, R>, mut conn: S) -> io::Result<()> {
     let mut data = Vec::new();
+    let mut broken = false;
     loop {
         let mut req = [0u8; 28];
         match conn.read_exact(&mut req) {
             Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(()),
             other => other?,
         }
+        let _carried = GATE.read().unwrap_or_else(|e| e.into_inner());
         if u32::from_be_bytes(req[0..4].try_into().unwrap()) != REQUEST_MAGIC {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "bad request magic"));
         }
@@ -209,7 +239,7 @@ fn transmission<R: ReadAt + ?Sized, S: Read + Write>(export: &Export<'_, R>, mut
                     continue;
                 }
                 data.resize(length as usize, 0);
-                match export.source.read_exact_at(&mut data, offset) {
+                match caught(&mut broken, || export.source.read_exact_at(&mut data, offset)) {
                     Ok(()) => reply(&mut conn, 0, &data)?,
                     Err(e) => {
                         eprintln!("read of {length} bytes at {offset:#x} failed: {e}");
@@ -217,7 +247,7 @@ fn transmission<R: ReadAt + ?Sized, S: Read + Write>(export: &Export<'_, R>, mut
                     }
                 }
             }
-            CMD_FLUSH => match export.sink.map_or(Ok(()), |s| s.flush()) {
+            CMD_FLUSH => match caught(&mut broken, || export.sink.map_or(Ok(()), |s| s.flush())) {
                 Ok(()) => reply(&mut conn, 0, &[])?,
                 Err(e) => {
                     eprintln!("flush failed: {e}");
@@ -227,17 +257,21 @@ fn transmission<R: ReadAt + ?Sized, S: Read + Write>(export: &Export<'_, R>, mut
             CMD_TRIM => {
                 let in_range = offset.checked_add(length as u64).is_some_and(|end| end <= export.size);
                 let result = match export.sink.filter(|_| in_range) {
-                    Some(sink) => sink.discard(offset, length as u64).map(|()| 0).unwrap_or_else(|e| {
-                        eprintln!("discard of {length} bytes at {offset:#x} failed: {e}");
-                        EIO
-                    }),
+                    Some(sink) => caught(&mut broken, || sink.discard(offset, length as u64))
+                        .map(|()| 0)
+                        .unwrap_or_else(|e| {
+                            eprintln!("discard of {length} bytes at {offset:#x} failed: {e}");
+                            EIO
+                        }),
                     None if export.sink.is_some() => EINVAL,
                     None => EPERM,
                 };
                 reply(&mut conn, result, &[])?;
             }
-            // What the client wrote becomes durable when it disconnects.
-            CMD_DISC => return export.sink.map_or(Ok(()), |s| s.flush()),
+            // What the client wrote becomes durable when it disconnects (not
+            // after a panic, which may have left the writer half way).
+            CMD_DISC if broken => return Ok(()),
+            CMD_DISC => return caught(&mut broken, || export.sink.map_or(Ok(()), |s| s.flush())),
             // Writes carry a payload that must be consumed before replying.
             CMD_WRITE => {
                 let in_range = offset.checked_add(length as u64).is_some_and(|end| end <= export.size);
@@ -249,12 +283,14 @@ fn transmission<R: ReadAt + ?Sized, S: Read + Write>(export: &Export<'_, R>, mut
                 };
                 data.resize(length as usize, 0);
                 conn.read_exact(&mut data)?;
-                let written = sink.write_all_at(&data, offset).and_then(|()| {
-                    if flags & CMD_FLAG_FUA != 0 {
-                        sink.flush()
-                    } else {
-                        Ok(())
-                    }
+                let written = caught(&mut broken, || {
+                    sink.write_all_at(&data, offset).and_then(|()| {
+                        if flags & CMD_FLAG_FUA != 0 {
+                            sink.flush()
+                        } else {
+                            Ok(())
+                        }
+                    })
                 });
                 match written {
                     Ok(()) => reply(&mut conn, 0, &[])?,
@@ -424,6 +460,59 @@ mod tests {
             self.0.lock().unwrap()[offset as usize..(offset + len) as usize].fill(0);
             Ok(())
         }
+    }
+
+    /// A device whose reads and writes panic (a defect in the reader under
+    /// it).
+    struct Panics;
+
+    impl ReadAt for Panics {
+        fn read_exact_at(&self, _buf: &mut [u8], _offset: u64) -> io::Result<()> {
+            panic!("a defect in the reader");
+        }
+        fn size(&self) -> io::Result<u64> {
+            Ok(8192)
+        }
+    }
+
+    impl Sink for Panics {
+        fn write_all_at(&self, _buf: &[u8], _offset: u64) -> io::Result<()> {
+            panic!("a defect in the writer");
+        }
+        fn flush(&self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A read or write that panics is answered with EIO, and the
+    /// connection serves on (1.3.0's connection ended with the panic, the
+    /// kernel's request unanswered: the auditor's repro_scb_01; audit
+    /// 2026-10-21, SCB-01).
+    #[test]
+    fn a_panic_in_a_request_is_answered_with_eio() {
+        let (mut client, server) = UnixStream::pair().unwrap();
+        let handle = std::thread::spawn(move || {
+            let export = Export {
+                name: "space",
+                source: &Panics,
+                sink: Some(&Panics),
+                size: 8192,
+                block_size: 4096,
+            };
+            serve(&export, server)
+        });
+        client_go(&mut client, "space");
+        assert_eq!(request(&mut client, CMD_READ, 0, 512).0, EIO);
+        assert_eq!(request(&mut client, CMD_WRITE, 0, 512).0, EIO);
+        assert_eq!(request(&mut client, CMD_READ, 4096, 512).0, EIO);
+        // Nothing after it is carried out: a flush of what a panic may have
+        // left half way neither.
+        assert_eq!(request(&mut client, CMD_FLUSH, 0, 0).0, EIO);
+        let mut disc = REQUEST_MAGIC.to_be_bytes().to_vec();
+        disc.extend_from_slice(&[0, 0, 0, 2]);
+        disc.extend_from_slice(&[0u8; 20]);
+        client.write_all(&disc).unwrap();
+        handle.join().unwrap().unwrap();
     }
 
     #[test]

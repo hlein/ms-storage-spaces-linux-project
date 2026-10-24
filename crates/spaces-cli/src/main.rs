@@ -445,10 +445,10 @@ fn main() -> Result<()> {
             };
             ublk::serve(pool, source, writer, move |dev| {
                 println!("{dev}");
-                if let Some(path) = &ready_file
-                    && let Err(e) = write_ready(path, dev)
-                {
-                    eprintln!("cannot write {}: {e}", path.display());
+                match &ready_file {
+                    Some(path) => write_ready(path, dev)
+                        .map_err(|e| std::io::Error::other(format!("cannot write {}: {e}", path.display()))),
+                    None => Ok(()),
                 }
             })
         }
@@ -1102,20 +1102,44 @@ fn serve_nbd(
     if let Some(path) = ready_file {
         write_ready(path, &socket.display().to_string())?;
     }
-    // SIGINT/SIGTERM: what was written becomes durable before the process
-    // ends (the log slots of cached writes wait for a flush).
+    // SIGINT/SIGTERM: no request starts any more, those under way end (10 s
+    // at most), what was written becomes durable (the log slots of cached
+    // writes wait for a flush) unless a request panicked (the writer may be
+    // half way), and the socket goes. 1.3.0 flushed and exited under the
+    // writes in flight, flushed after a panic, and left its socket (audit
+    // 2026-10-21, SCB-01).
     let mut signals = signal_hook::iterator::Signals::new([signal_hook::consts::SIGINT, signal_hook::consts::SIGTERM])?;
     std::thread::scope(|scope| {
         let writer = writer.as_ref();
         scope.spawn(move || {
             if signals.forever().next().is_some() {
-                let code = match writer.map_or(Ok(()), |w| w.flush()) {
-                    Ok(()) => 0,
-                    Err(e) => {
-                        eprintln!("flush failed: {e}");
-                        1
+                let until = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                let _closed = loop {
+                    match nbd::GATE.try_write() {
+                        Ok(g) => break Some(g),
+                        Err(std::sync::TryLockError::Poisoned(e)) => break Some(e.into_inner()),
+                        Err(std::sync::TryLockError::WouldBlock) if std::time::Instant::now() < until => {
+                            std::thread::sleep(std::time::Duration::from_millis(10))
+                        }
+                        Err(std::sync::TryLockError::WouldBlock) => {
+                            eprintln!("requests still under way after 10 s");
+                            break None;
+                        }
                     }
                 };
+                let code = if nbd::PANICKED.load(std::sync::atomic::Ordering::SeqCst) {
+                    eprintln!("a request panicked: not flushed");
+                    1
+                } else {
+                    match writer.map_or(Ok(()), |w| w.flush()) {
+                        Ok(()) => 0,
+                        Err(e) => {
+                            eprintln!("flush failed: {e}");
+                            1
+                        }
+                    }
+                };
+                let _ = std::fs::remove_file(socket);
                 std::process::exit(code);
             }
         });

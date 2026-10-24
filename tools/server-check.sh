@@ -16,6 +16,9 @@
 #   ublkterm  SIGTERM before the device starts (SPACES_UBLK_DELAY_START, test
 #             builds): the server ends without serving (1.2.2 lost the signal
 #             and served on)
+#   ublkready a ready file that cannot be written (its directory missing):
+#             the server ends with an error and its device goes (1.3.0 served
+#             on unreported, and an attach waited for the report to its end)
 # Build for the test-build cases:
 #   cargo build --release --target x86_64-unknown-linux-musl -p spaces-cli --features test-hooks
 # Usage: [LINUX_VM_HOST=user@address] tools/server-check.sh SPACES [CASE...]
@@ -24,7 +27,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 binary=${1:?usage: tools/server-check.sh SPACES [CASE...]}
 shift
-cases=${*:-nbd fuse ublkkill ublkpanic ublkterm}
+cases=${*:-nbd fuse ublkkill ublkpanic ublkterm ublkready}
 host=${LINUX_VM_HOST:-claude@192.168.189.143}
 [[ $host == *@* ]] || host=codex@$host
 ssh_opts=(-o BatchMode=yes -o ConnectTimeout=10 -o IdentitiesOnly=yes -i "$HOME/.ssh/rustadmin_vm_ed25519")
@@ -213,6 +216,21 @@ PY
       result ok ublkterm "ended without serving"
     else
       result fail ublkterm "SIGTERM before the device started: served: $served, ended: $ended"
+    fi ;;
+  ublkready)
+    before=$(ls /sys/class/ublk-char/ 2>/dev/null | sort)
+    background "$dir/unready.pid" "$spaces" serve-ublk "$img" --space "$wc4k" \
+      --ready-file "$dir/missing/ready"
+    p=${pids[-1]}
+    ended=no
+    gone "$p" && ended=yes
+    said=$(sudo grep -c "cannot report the device ready\|cannot write" "$dir/server.log" || true)
+    after=$(ls /sys/class/ublk-char/ 2>/dev/null | sort)
+    if [[ $ended == yes && $said -ge 1 && $after == "$before" ]]; then
+      result ok ublkready "ended with an error, no device left"
+    else
+      result fail ublkready "ended: $ended, said: $said, devices: $(one "$after") (before: $(one "$before"))"
+      sudo kill "$p" 2>/dev/null || true
     fi
     sudo kill "$p" 2>/dev/null || true ;;
   *) result fail "$c" "unknown case" ;;

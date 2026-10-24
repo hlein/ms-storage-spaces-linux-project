@@ -199,6 +199,16 @@
   device-mapper table held was "in use by the kernel". A partition's lock
   is taken on its whole disk too, and the refusal names what holds the
   disk's partitions.
+* Servers (audit 2026-10-21, SCB-01, SCB-02, the auditor's repro_sca07):
+  a panic in a request to `serve-nbd` ended the connection, the kernel's
+  request unanswered; on SIGTERM it flushed and exited under the writes in
+  flight (a write cut off, its reply lost) and left its socket;
+  `serve-ublk` served on when its ready file could not be written, and an
+  attach waited for the report to its end; the hidden `snapshot-to-raw`
+  (for the test snapshots) overflowed on a run near 2^64. A panic is answered with EIO,
+  a signal waits for the requests under way, flushes once (not after a
+  panic) and removes the socket, the ublk server ends with an error, and
+  such a run is refused.
 * The checks of a pool of many spaces (`spaces attach`, `spaces check`)
   took about three times as long as in 1.2.2: 1.3.0's check for unmapped
   fixed spaces looked up each space's hidden spaces among all the pool's

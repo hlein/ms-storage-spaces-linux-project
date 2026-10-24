@@ -29,6 +29,9 @@ const IO_BUF_BYTES: u32 = 1 << 20;
 static STOPPING: AtomicBool = AtomicBool::new(false);
 /// A queue stopped on a panic: the process ends with an error.
 static PANICKED: AtomicBool = AtomicBool::new(false);
+/// The device could not be reported ready: it goes, and the process ends
+/// with an error.
+static UNREPORTED: AtomicBool = AtomicBool::new(false);
 
 /// Stops the ublk device `dev_id`: its requests fail, its queues end.
 fn kill(dev_id: u32) {
@@ -55,7 +58,7 @@ pub fn serve(
     pool: &'static Pool<File>,
     source: &'static dyn ReadAt,
     writer: Option<&'static SpaceWriter<'static, File>>,
-    on_ready: impl FnOnce(&str) + Send + Sync + 'static,
+    on_ready: impl FnOnce(&str) -> std::io::Result<()> + Send + Sync + 'static,
 ) -> Result<()> {
     let ctrl = libublk::ctrl::UblkCtrlBuilder::default()
         .name("storage-spaces")
@@ -118,7 +121,14 @@ pub fn serve(
             let _ = ctrl.kill_dev();
             return;
         }
-        on_ready(&format!("/dev/ublkb{}", ctrl.dev_info().dev_id));
+        // Not reported, not served: whoever waits for the report (`spaces
+        // attach`) would wait to its end (1.3.0 served on, the report
+        // missing; audit 2026-10-21, SCB-02).
+        if let Err(e) = on_ready(&format!("/dev/ublkb{}", ctrl.dev_info().dev_id)) {
+            eprintln!("cannot report the device ready: {e}");
+            UNREPORTED.store(true, Ordering::SeqCst);
+            let _ = ctrl.kill_dev();
+        }
     };
     ctrl.run_target(tgt_init, queue_fn, ready)
         .context("ublk device failed")?;
@@ -129,6 +139,9 @@ pub fn serve(
     // libublk's run_target only reports a queue thread that panicked.
     if PANICKED.load(Ordering::SeqCst) {
         bail!("a ublk queue stopped on an internal error; the device is removed");
+    }
+    if UNREPORTED.load(Ordering::SeqCst) {
+        bail!("the device could not be reported ready; it is removed");
     }
     Ok(())
 }

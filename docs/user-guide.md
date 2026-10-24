@@ -1065,7 +1065,14 @@ security`, scores 9.5 UNSAFE before, 5.1 MEDIUM after):
   after an internal error (a panic in a queue fails its requests and
   removes the device; 1.2.2 exited 0, or hung with a request in flight),
   `serve-nbd` when its listener fails for good (out of descriptors it
-  goes on once connections close; 1.2.2 stopped accepting and stayed).
+  goes on once connections close; 1.2.2 stopped accepting and stayed),
+  `serve-ublk` when it cannot write its ready file (1.3.0 served on
+  unreported, and the attach waited for the report to its end). A request
+  to `serve-nbd` that panics is answered with EIO, as are the later ones
+  of its connection (1.3.0's connection ended with it). On SIGINT and
+  SIGTERM `serve-nbd` lets the requests under way end (10 s at most),
+  flushes once (not after a panic) and removes its socket (1.3.0 flushed
+  and exited under the writes in flight, and left the socket).
   `serve-fuse` unmounts on SIGINT and SIGTERM (1.2.2 left a dead mount
   that failed the next attach), and a signal that comes before a ublk
   device starts is no longer lost. `spaces detach` deletes the ublk device

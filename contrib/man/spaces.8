@@ -308,7 +308,10 @@ exposes the space read-only as the file
 .B \-\-ready\-file
 .I path
 writes, once it serves, the device, the socket or the image file there,
-whole. SIGINT and SIGTERM make what was written durable and end it.
+whole. SIGINT and SIGTERM make what was written durable and end it
+.RB ( serve\-nbd
+lets the requests under way end first, and removes its socket); a request
+that panics fails with EIO.
 .TP
 .B info\fR, \fBextents\fR, \fBexport\fR, \fBdm\-table
 Inspect a pool given by its member devices or images: pool, disks (usage,

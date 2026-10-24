@@ -42,7 +42,10 @@ fn convert(r: &mut impl Read, out: &File) -> Result<(u64, u64)> {
         r.read_exact(&mut run)?;
         let offset = u64::from_le_bytes(run[..8].try_into().unwrap());
         let pages = u32::from_le_bytes(run[8..].try_into().unwrap()) as u64;
-        if !offset.is_multiple_of(BLOCK as u64) || offset + pages * BLOCK as u64 > size {
+        // Bounded before it is added up (1.3.0 overflowed for a run near
+        // 2^64: the auditor's repro_sca07).
+        let end = offset.checked_add(pages * BLOCK as u64);
+        if !offset.is_multiple_of(BLOCK as u64) || end.is_none_or(|e| e > size) {
             bail!("snapshot run at {offset:#x} outside the disk");
         }
         match kind[0] {
@@ -109,5 +112,27 @@ mod tests {
         fill_block(&mut expected, 0x101000, "tag");
         assert_eq!(disk[0x5000..0x6000], expected[..]);
         assert!(disk[0x6000..].iter().all(|&b| b == 0));
+    }
+
+    /// A run whose offset is near 2^64 (a page from 0xffff_ffff_ffff_f000):
+    /// outside the disk, an error (1.3.0: an overflow, a panic; the
+    /// auditor's repro_sca07).
+    #[test]
+    fn a_run_near_2_64_is_outside_the_disk() {
+        let mut snap = Vec::new();
+        snap.extend_from_slice(MAGIC);
+        snap.extend_from_slice(&4096u64.to_le_bytes());
+        snap.push(1);
+        snap.extend_from_slice(&0xffff_ffff_ffff_f000u64.to_le_bytes());
+        snap.extend_from_slice(&1u32.to_le_bytes());
+        let dir = std::env::temp_dir().join(format!("spaces-snap-far-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("disk.img");
+        let _ = std::fs::remove_file(&path);
+        let out = File::create_new(&path).unwrap();
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| convert(&mut snap.as_slice(), &out)));
+        std::fs::remove_dir_all(&dir).unwrap();
+        let e = r.expect("a panic").unwrap_err().to_string();
+        assert!(e.contains("outside the disk"), "{e}");
     }
 }

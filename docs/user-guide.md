@@ -833,7 +833,14 @@ let `refs write` change a volume mounted for writing, and the mount's next
 change wrote its own view of the volume over that. A file whose last name
 goes while it is open (unlinked, or renamed over) reads and takes writes
 through its open handles until the last is closed, which writes nothing
-back (1.2.2 failed them, and the close, with ENOENT). A directory listed
+back (1.2.2 failed them, and the close, with ENOENT). Names may be given
+in any case, as the volume's lookups take them: a file open for writing
+that is renamed or unlinked through another case of its name keeps its
+writes with it (1.3.0 lost them at its close, or wrote them into the
+file that took its name). Times set on a file open for writing before
+its close (`cp -p`, `tar -x` and `rsync -t` set them so) stay what was
+set: what was written goes to the volume first (1.3.0's close set the
+modification time to its own). A directory listed
 while names go or come lists every name it had when it was opened, each
 once (1.2.2 skipped names when files were deleted during the listing, as
 `rm -r` and `find -delete` do). `st_blocks` (`du`) counts what a file has

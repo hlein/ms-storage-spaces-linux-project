@@ -556,9 +556,10 @@ impl RefsFs {
         }
     }
 
-    /// Moves the paths of `from` (and below it) to `to`.
-    fn moved(&self, from: &str, to: &str) {
-        self.changed(Some(to));
+    /// Moves the paths of `from` (and below it) to `to`; `replaced`, the
+    /// path (as the volume spells it) of what `to` replaced, goes.
+    fn moved(&self, from: &str, to: &str, replaced: Option<&str>) {
+        self.changed(replaced);
         let mut s = self.state.lock_ok();
         let below = format!("{from}/");
         let moved: Vec<(String, u64)> = s
@@ -1012,6 +1013,7 @@ impl RefsFs {
     /// Removes name `path` (unlink, rmdir); the last name of a file that is
     /// open leaves it to its handles (see `orphans`).
     fn unlink_path(&self, path: &str) -> Result<(), Errno> {
+        let path = &self.known_path(path);
         let kept = self.keep_open(path);
         let r = self.change(path, |v| v.delete_file(path, now()));
         self.settle_open(kept, r.is_ok());
@@ -1028,10 +1030,17 @@ impl RefsFs {
         if flags.contains(RenameFlags::RENAME_EXCHANGE) {
             return Err(Errno::EINVAL);
         }
+        let from = &self.known_path(from);
         let exists = match self.resolve(&self.vol.read_ok(), to) {
             Err(Errno::ENOENT) => None,
             r => r?,
         };
+        // What `to` replaces, as the volume spells it (none: only the case
+        // of the name changes).
+        let replaced = exists
+            .as_ref()
+            .map(|e| child(split(to).0, &internal_name(e)))
+            .filter(|r| r.as_str() != from);
         if let Some(target) = exists {
             if flags.contains(RenameFlags::RENAME_NOREPLACE) {
                 return Err(Errno::EEXIST);
@@ -1043,11 +1052,7 @@ impl RefsFs {
                     return Err(if target.is_dir() { Errno::EISDIR } else { Errno::ENOTDIR });
                 }
             }
-            let kept = if from.eq_ignore_ascii_case(to) {
-                None
-            } else {
-                self.keep_open(to)
-            };
+            let kept = replaced.as_deref().and_then(|r| self.keep_open(r));
             let r = self.change(from, |v| v.rename_replacing(from, to, now()));
             self.settle_open(kept, r.is_ok());
             r?;
@@ -1060,7 +1065,7 @@ impl RefsFs {
                 self.change(from, |v| v.move_file(from, to, now()))?;
             }
         }
-        self.moved(from, to);
+        self.moved(from, to, replaced.as_deref().or(Some(to)));
         Ok(())
     }
 
@@ -1121,8 +1126,97 @@ impl RefsFs {
         }
     }
 
+    /// What `setattr` changes of inode `ino`: its size, times and the
+    /// read-only attribute (from the mode's write bits).
+    fn set_attr(
+        &self,
+        ino: u64,
+        mode: Option<u32>,
+        size: Option<u64>,
+        atime: Option<TimeOrNow>,
+        mtime: Option<TimeOrNow>,
+        crtime: Option<SystemTime>,
+    ) -> Result<(), Errno> {
+        {
+            // A file without a name: its buffer's length, nothing else.
+            let mut s = self.state.lock_ok();
+            if s.orphans.contains_key(&ino) {
+                if let (Some(size), Some(p)) = (size, s.pending.get_mut(&ino)) {
+                    p.set_len(size)?;
+                }
+                return Ok(());
+            }
+        }
+        let path = self.path(ino)?;
+        if let Some(size) = size {
+            if size > MAX_WRITTEN {
+                return Err(Errno::EFBIG);
+            }
+            let pending = self.state.lock_ok().pending.contains_key(&ino);
+            if pending {
+                let mut s = self.state.lock_ok();
+                let p = s.pending.get_mut(&ino).unwrap();
+                p.set_len(size)?;
+                p.dirty = true;
+            } else {
+                let mut p = self.content(&self.vol.read_ok(), &path)?;
+                p.set_len(size)?;
+                let ranges = std::mem::take(&mut p.ranges);
+                let source = PendingData(&p.file, p.len);
+                self.change(&path, |v| v.update_file(&path, &source, &ranges, now()))?;
+            }
+        }
+        if atime.is_some() || mtime.is_some() || crtime.is_some() {
+            // What the file's handles wrote goes first, so that its close
+            // has nothing left to write (and no time of its own to give: a
+            // write-back sets the modification time; 1.3.0 overwrote the
+            // times `cp -p` set so; audit 2026-10-21, RFC-01).
+            self.write_back(ino)?;
+            let mut times = self.resolve(&self.vol.read_ok(), &path)?.ok_or(Errno::EPERM)?.times;
+            let pick = |t: TimeOrNow| match t {
+                TimeOrNow::Now => now(),
+                TimeOrNow::SpecificTime(t) => filetime(t),
+            };
+            if let Some(t) = atime {
+                times.accessed = pick(t);
+            }
+            if let Some(t) = mtime {
+                times.modified = pick(t);
+            }
+            if let Some(t) = crtime {
+                times.created = filetime(t);
+            }
+            times.changed = now();
+            self.change(&path, |v| v.set_times(&path, &times))?;
+        }
+        if let Some(mode) = mode {
+            // The write bits: Windows' read-only attribute.
+            let entry = self.resolve(&self.vol.read_ok(), &path)?.ok_or(Errno::EPERM)?;
+            if !entry.is_dir() && !Self::is_link(&entry) {
+                let ro = mode & 0o222 == 0;
+                if ro != (entry.attributes & 1 != 0) {
+                    let a = (entry.attributes & !1) | u32::from(ro);
+                    self.change(&path, |v| v.set_attributes(&path, a))?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn name_path(&self, parent: INodeNo, name: &OsStr) -> Result<String, Errno> {
         Ok(child(&self.path(parent.0)?, &kernel_name(name)?))
+    }
+
+    /// `path` with its last name as the volume spells it, where it names an
+    /// entry: Windows' names ignore case, and the paths the mount keeps
+    /// (from `lookup`) are the volume's. A rename or unlink through another
+    /// case of a name missed them (1.3.0: an open file renamed so lost its
+    /// writes at its close; audit 2026-10-21, RFC-01).
+    fn known_path(&self, path: &str) -> String {
+        match self.resolve(&self.vol.read_ok(), path) {
+            Ok(Some(e)) => child(split(path).0, &internal_name(&e)),
+            _ => path.to_owned(),
+        }
     }
 }
 
@@ -1189,68 +1283,7 @@ impl Filesystem for RefsFs {
         reply: ReplyAttr,
     ) {
         self.guard("setattr", move || {
-            let r = (|| -> Result<(), Errno> {
-                {
-                    // A file without a name: its buffer's length, nothing else.
-                    let mut s = self.state.lock_ok();
-                    if s.orphans.contains_key(&ino.0) {
-                        if let (Some(size), Some(p)) = (size, s.pending.get_mut(&ino.0)) {
-                            p.set_len(size)?;
-                        }
-                        return Ok(());
-                    }
-                }
-                let path = self.path(ino.0)?;
-                if let Some(size) = size {
-                    if size > MAX_WRITTEN {
-                        return Err(Errno::EFBIG);
-                    }
-                    let pending = self.state.lock_ok().pending.contains_key(&ino.0);
-                    if pending {
-                        let mut s = self.state.lock_ok();
-                        let p = s.pending.get_mut(&ino.0).unwrap();
-                        p.set_len(size)?;
-                        p.dirty = true;
-                    } else {
-                        let mut p = self.content(&self.vol.read_ok(), &path)?;
-                        p.set_len(size)?;
-                        let ranges = std::mem::take(&mut p.ranges);
-                        let source = PendingData(&p.file, p.len);
-                        self.change(&path, |v| v.update_file(&path, &source, &ranges, now()))?;
-                    }
-                }
-                if atime.is_some() || mtime.is_some() || crtime.is_some() {
-                    let mut times = self.resolve(&self.vol.read_ok(), &path)?.ok_or(Errno::EPERM)?.times;
-                    let pick = |t: TimeOrNow| match t {
-                        TimeOrNow::Now => now(),
-                        TimeOrNow::SpecificTime(t) => filetime(t),
-                    };
-                    if let Some(t) = atime {
-                        times.accessed = pick(t);
-                    }
-                    if let Some(t) = mtime {
-                        times.modified = pick(t);
-                    }
-                    if let Some(t) = crtime {
-                        times.created = filetime(t);
-                    }
-                    times.changed = now();
-                    self.change(&path, |v| v.set_times(&path, &times))?;
-                }
-                if let Some(mode) = mode {
-                    // The write bits: Windows' read-only attribute.
-                    let entry = self.resolve(&self.vol.read_ok(), &path)?.ok_or(Errno::EPERM)?;
-                    if !entry.is_dir() && !Self::is_link(&entry) {
-                        let ro = mode & 0o222 == 0;
-                        if ro != (entry.attributes & 1 != 0) {
-                            let a = (entry.attributes & !1) | u32::from(ro);
-                            self.change(&path, |v| v.set_attributes(&path, a))?;
-                        }
-                    }
-                }
-                Ok(())
-            })();
-            match r {
+            match self.set_attr(ino.0, mode, size, atime, mtime, crtime) {
                 Ok(()) => self.getattr(_req, ino, None, reply),
                 Err(e) => reply.error(e),
             }
@@ -2590,5 +2623,116 @@ mod tests {
         assert_eq!(*m.lock_ok(), 1);
         assert_eq!(*l.read_ok(), 1);
         *l.write_ok() = 2;
+    }
+
+    /// What `/path` holds now, its first `n` bytes.
+    fn head(fs: &RefsFs, path: &str, n: usize) -> Vec<u8> {
+        let vol = fs.vol.read_ok();
+        let file = vol.open_file(&vol.lookup(path).unwrap()).unwrap();
+        let mut buf = vec![0u8; n];
+        vol.read_stream(file.data.as_ref().unwrap(), 0, &mut buf).unwrap();
+        buf
+    }
+
+    /// A file open for writing, renamed through another case of its name
+    /// (the kernel looks the name up as given first: another path, which
+    /// Windows' names take for the same): its writes land in the renamed
+    /// file (audit 2026-10-21, RFC-01 point 1).
+    #[test]
+    fn a_rename_through_another_case_keeps_an_open_file_on_its_new_name() {
+        let fs = served(true);
+        fs.vol.write_ok().create_file("/Case.bin", &[1; 5000], now()).unwrap();
+        fs.changed(None);
+        let ino = fs.inode("/Case.bin", None);
+        let fh = fs.open_inode(ino, 1).unwrap();
+        assert_eq!(fs.write_inode(ino, 0, b"before"), Ok(6));
+        fs.rename_paths("/case.bin", "/moved.bin", RenameFlags::empty())
+            .unwrap();
+        assert_eq!(fs.write_inode(ino, 6, b" after"), Ok(6));
+        fs.release_inode(ino, fh).unwrap();
+        assert_eq!(head(&fs, "/moved.bin", 12), b"before after");
+        assert!(fs.vol.read_ok().lookup("/Case.bin").is_err());
+    }
+
+    /// A file of two names open for writing, one name unlinked: its writes
+    /// land in the file through the other (audit 2026-10-21, RFC-01 point
+    /// 2).
+    #[test]
+    fn unlinking_one_name_of_an_open_file_keeps_its_writes() {
+        let fs = served(true);
+        {
+            let mut vol = fs.vol.write_ok();
+            vol.create_file("/a.bin", &[1; 5000], now()).unwrap();
+            vol.link_file("/a.bin", "/b.bin", now()).unwrap();
+        }
+        fs.changed(None);
+        let entry = fs.resolve(&fs.vol.read_ok(), "/a.bin").unwrap().unwrap();
+        let ino = fs.inode("/a.bin", Some(&entry));
+        let other = fs.resolve(&fs.vol.read_ok(), "/b.bin").unwrap().unwrap();
+        assert_eq!(fs.inode("/b.bin", Some(&other)), ino);
+        let fh = fs.open_inode(ino, 1).unwrap();
+        assert_eq!(fs.write_inode(ino, 0, b"before"), Ok(6));
+        fs.unlink_path("/a.bin").unwrap();
+        assert_eq!(fs.write_inode(ino, 6, b" after"), Ok(6));
+        fs.release_inode(ino, fh).unwrap();
+        assert_eq!(head(&fs, "/b.bin", 12), b"before after");
+        assert!(fs.vol.read_ok().lookup("/a.bin").is_err());
+    }
+    /// An unlink through another case of a name of a file open for
+    /// writing: its writes go with it, as an unlink as spelt leaves them
+    /// (1.3.0 deleted the file under the open handle, and its close
+    /// failed: RFC-01 point 1).
+    #[test]
+    fn an_unlink_through_another_case_leaves_an_open_file_to_its_handle() {
+        let fs = served(true);
+        fs.vol.write_ok().create_file("/Gone.bin", &[1; 5000], now()).unwrap();
+        fs.changed(None);
+        let ino = fs.inode("/Gone.bin", None);
+        let fh = fs.open_inode(ino, 1).unwrap();
+        assert_eq!(fs.write_inode(ino, 0, b"before"), Ok(6));
+        fs.unlink_path("/GONE.bin").unwrap();
+        assert_eq!(fs.write_inode(ino, 6, b" after"), Ok(6));
+        assert_eq!(&fs.read_inode(ino, 0, 12).unwrap(), b"before after");
+        fs.release_inode(ino, fh).unwrap();
+        assert!(fs.vol.read_ok().lookup("/Gone.bin").is_err());
+    }
+
+    /// A file renamed over another, open for writing, through another case
+    /// of its name: the open file's writes go with it, not into the file
+    /// that took its name (1.3.0 wrote them back into that one).
+    #[test]
+    fn a_file_renamed_over_through_another_case_keeps_its_writes_apart() {
+        let fs = served(true);
+        {
+            let mut vol = fs.vol.write_ok();
+            vol.create_file("/Over.bin", &[1; 5000], now()).unwrap();
+            vol.create_file("/new.bin", &[2; 5000], now()).unwrap();
+        }
+        fs.changed(None);
+        let ino = fs.inode("/Over.bin", None);
+        let fh = fs.open_inode(ino, 1).unwrap();
+        assert_eq!(fs.write_inode(ino, 0, b"before"), Ok(6));
+        fs.rename_paths("/new.bin", "/over.bin", RenameFlags::empty()).unwrap();
+        fs.release_inode(ino, fh).unwrap();
+        assert_eq!(head(&fs, "/over.bin", 6), [2; 6]);
+    }
+
+    /// Times set on a file open for writing before its close (`cp -p`,
+    /// `tar -x`, `rsync -t`: write, futimens, close): they stay what was
+    /// set. 1.3.0 wrote the buffer back at the close with the time then
+    /// (audit 2026-10-21, RFC-01 point 3).
+    #[test]
+    fn times_set_before_the_close_of_a_written_file_stay() {
+        let fs = served(true);
+        let ino = fs.inode("/small.txt", None);
+        let fh = fs.open_inode(ino, 1).unwrap();
+        assert_eq!(fs.write_inode(ino, 0, b"copied"), Ok(6));
+        let set = UNIX_EPOCH + Duration::from_secs(1_000_000_000);
+        fs.set_attr(ino, None, None, None, Some(TimeOrNow::SpecificTime(set)), None)
+            .unwrap();
+        fs.release_inode(ino, fh).unwrap();
+        let entry = fs.vol.read_ok().lookup("/small.txt").unwrap();
+        assert_eq!(entry.times.modified, filetime(set));
+        assert_eq!(head(&fs, "/small.txt", 6), b"copied");
     }
 }

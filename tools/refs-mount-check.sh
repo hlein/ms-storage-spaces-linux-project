@@ -24,6 +24,11 @@
 #             succeed (1.2.2: the close failed with ENOENT)
 #   tmpmode   the buffer of a file open for writing: mode 0600, no name
 #             (1.2.2: 0644 under the usual umask)
+#   casename  a file open for writing renamed through another case of its
+#             name: its writes are in the renamed file (1.3.0 lost them at
+#             the close)
+#   times     a file written, its times set (as cp -p does) and closed: they
+#             stay what was set (1.3.0's close set the modification time)
 # Usage: [REFS=binary] tools/refs-mount-check.sh --rw IMAGE [CASE...]
 # REFS names the refs binary to check (built here otherwise).
 set -uo pipefail
@@ -33,7 +38,7 @@ refs=${REFS:-target/release/refs}
 if [[ ${1:-} == --rw ]]; then
   image=${2:?usage: tools/refs-mount-check.sh --rw IMAGE [CASE...]}
   shift 2
-  cases=${*:-hold readdir openread openwrite tmpmode}
+  cases=${*:-hold readdir openread openwrite tmpmode casename times}
   work=$(mktemp -d)
   unmount() { fusermount3 -uz "$1" 2>/dev/null || fusermount -uz "$1" 2>/dev/null; }
   trap 'unmount "$work/mnt2"; unmount "$work/mnt"; [[ -n ${pid:-} ]] && wait "$pid"; rm -rf "$work"' EXIT
@@ -133,6 +138,37 @@ print(("private: " if modes and all(m == "0o600" and n == 0 for m, n in modes) e
 EOF
       )
       if [[ $out == private:* ]]; then result ok tmpmode "${out#private: }"; else result fail tmpmode "${out#open: }"; fi ;;
+    casename)
+      out=$(python3 - "$work/mnt" <<'EOF' 2>&1
+import os, sys
+d = sys.argv[1]
+f = open(os.path.join(d, "Case.bin"), "w+b")
+f.write(b"before")
+f.flush()
+os.rename(os.path.join(d, "case.bin"), os.path.join(d, "moved.bin"))
+f.write(b" after")
+f.close()
+got = open(os.path.join(d, "moved.bin"), "rb").read()
+print("same" if got == b"before after" else f"read {got!r}")
+EOF
+      )
+      if [[ $out == same ]]; then result ok casename "the writes in the renamed file"; else result fail casename "$(printf '%s' "$out" | tail -1)"; fi ;;
+    times)
+      out=$(python3 - "$work/mnt" <<'EOF' 2>&1
+import os, sys
+p = os.path.join(sys.argv[1], "copied.bin")
+f = open(p, "wb")
+f.write(b"copied")
+f.flush()
+os.utime(f.fileno(), (1_000_000_000, 1_000_000_000))
+f.close()
+# Through another case of the name: a lookup of its own, what the volume
+# holds (the kernel keeps the attributes setattr returned for the name).
+st = os.stat(os.path.join(sys.argv[1], "COPIED.bin"))
+print("kept" if int(st.st_mtime) == 1_000_000_000 else f"mtime {st.st_mtime}")
+EOF
+      )
+      if [[ $out == kept ]]; then result ok times "set before the close, kept"; else result fail times "$(printf '%s' "$out" | tail -1)"; fi ;;
     *) result fail "$c" "unknown case" ;;
     esac
   done

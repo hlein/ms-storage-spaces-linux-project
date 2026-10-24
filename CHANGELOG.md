@@ -168,6 +168,14 @@
   snapshot's level has the cluster, else written where it is once the
   commit is on the disk), and such a checkpoint does not open. Windows
   attached volumes changed so as healthy and read every file as written.
+* `refs mount --rw` (audit 2026-10-21, RFC-01): a file open for writing
+  that was renamed or unlinked through another case of its name (Windows'
+  names ignore case) lost its writes at its close (ENOENT), and one renamed
+  over so had its writes written back into the file that took its name;
+  times set on a file open for writing before its close (`cp -p`, `tar
+  -x`, `rsync -t`) were overwritten by the close. The mount takes such
+  names as the volume spells them, and writes a file's buffer back before
+  setting its times.
 * The checks of a pool of many spaces (`spaces attach`, `spaces check`)
   took about three times as long as in 1.2.2: 1.3.0's check for unmapped
   fixed spaces looked up each space's hidden spaces among all the pool's

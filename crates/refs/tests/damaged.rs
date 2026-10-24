@@ -640,3 +640,301 @@ fn check_finds_rows_named_past_their_area() {
         "{problems:?}"
     );
 }
+
+/// A virtual cluster with the bit between a container's clusters and its id
+/// set (`vlcn | cpc`, as Windows never writes one: none in the corpus) is no
+/// address; 1.3.0 read it as the cluster of `vlcn`, an alias the writer's
+/// reference counts did not know (the auditor's rfw_03).
+#[test]
+fn a_virtual_cluster_with_the_container_bit_set_is_no_address() {
+    let forge = Forge::fixture("r314small");
+    let vol = forge.volume().unwrap();
+    let entry = vol.lookup("/mid.bin").unwrap();
+    let Content::Extents(x) = &vol.open_file(&entry).unwrap().data.unwrap().content else {
+        panic!("resident")
+    };
+    let cpc = vol.clusters_per_container;
+    assert!(vol.translate(x[0].vlcn).is_ok());
+    assert!(vol.translate(x[0].vlcn | cpc).is_err());
+    assert!(!vol.is_compacted(x[0].vlcn | cpc));
+}
+
+/// The last run of a file (mid.bin, 100 KiB) made to reach a cluster past
+/// the end of its container: `refs check` names it and the writer does not
+/// write the file. 1.3.0 bounded runs of compacted containers alone: its
+/// check took the clusters past the container for the next one's (free in
+/// its allocator, counted twice), and its writer wrote the file, its run
+/// going on into the next container on the disk (audit 2026-10-21,
+/// RFW-01).
+#[test]
+fn a_run_past_its_container_is_reported_and_not_written() {
+    let mut forge = Forge::fixture("r314small");
+    let (vlcn, vcn, clusters, cpc) = {
+        let vol = forge.volume().unwrap();
+        let entry = vol.lookup("/mid.bin").unwrap();
+        let Content::Extents(x) = &vol.open_file(&entry).unwrap().data.unwrap().content else {
+            panic!("resident")
+        };
+        let last = x.last().unwrap();
+        (
+            last.vlcn,
+            last.vcn as usize,
+            last.clusters as usize,
+            vol.clusters_per_container,
+        )
+    };
+    let past = (cpc - (vlcn & (cpc - 1)) + 1) as u32;
+    let name: Vec<u8> = "mid.bin".encode_utf16().flat_map(u16::to_le_bytes).collect();
+    let run = move |page: &[u8]| {
+        page.windows(name.len()).any(|w| w == name).then_some(())?;
+        (0..page.len().saturating_sub(0x18))
+            .find(|&p| le64(page, p) == vlcn && le32(page, p + 0x0c) == vcn && le32(page, p + 0x14) == clusters)
+    };
+    forge.patch(
+        Tree::Object(ROOT_DIRECTORY),
+        |page| run(page).is_some(),
+        |page| {
+            // Every place of the page that holds the run (its record, and
+            // what of the record the name row keeps).
+            while let Some(at) = run(page) {
+                page[at + 0x14..at + 0x18].copy_from_slice(&past.to_le_bytes());
+            }
+        },
+    );
+    let problems = forge.volume().unwrap().check(&[]).unwrap().problems;
+    assert!(
+        problems.iter().any(|p| p.contains("past its container")),
+        "{problems:?}"
+    );
+    let disk = Overlay::new(&forge.image);
+    let mut vol = Volume::open(&disk, forge.offset).unwrap();
+    let e = vol.overwrite("/mid.bin", 0, &[0x5a; 4096], 1).unwrap_err();
+    assert!(e.to_string().contains("past its container"), "{e}");
+}
+
+/// A container table naming a container id whose virtual clusters do not
+/// fit 64 bits (the last row's key raised to 2^60): the volume does not
+/// open. 1.3.0 shifted the id into its addresses, losing its high bits:
+/// another container's (audit 2026-10-21, RFW-01).
+#[test]
+fn a_container_id_beyond_any_address_is_refused() {
+    let mut forge = Forge::fixture("r314small");
+    let last_key = |page: &[u8]| {
+        let node = Node::at(page, 0x50).ok()?;
+        if !node.is_leaf() {
+            return None;
+        }
+        node.rows().flatten().last().map(|r| place(page, r.key))
+    };
+    forge.patch(
+        Tree::Root(refs::volume::ROOT_CONTAINERS),
+        |page| last_key(page).is_some(),
+        |page| {
+            let at = last_key(page).unwrap();
+            page[at..at + 8].copy_from_slice(&(1u64 << 60).to_le_bytes());
+        },
+    );
+    let e = forge.volume().err().expect("opened");
+    assert!(e.to_string().contains("container id"), "{e}");
+}
+
+/// A device that says it is `size` bytes long.
+struct Cut<'a>(&'a SparseImage, u64);
+
+impl ReadAt for Cut<'_> {
+    fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> std::io::Result<()> {
+        self.0.read_exact_at(buf, offset)
+    }
+    fn size(&self) -> std::io::Result<u64> {
+        Ok(self.1)
+    }
+}
+
+/// A volume whose boot sector names more sectors than its device holds
+/// past the volume's start: it does not open. 1.3.0 took the size, and
+/// checked containers, runs and writes against it (audit 2026-10-21,
+/// RFW-01).
+#[test]
+fn a_volume_larger_than_its_device_is_refused() {
+    let forge = Forge::fixture("r314small");
+    let size = forge.volume().unwrap().boot.volume_size();
+    assert!(Volume::open(Cut(&forge.image, forge.offset + size), forge.offset).is_ok());
+    let e = Volume::open(Cut(&forge.image, forge.offset + size - 4096), forge.offset)
+        .err()
+        .expect("opened");
+    assert!(e.to_string().contains("on a device of"), "{e}");
+}
+
+/// Where the own row (key 0x10) of a leaf page of a directory's tree
+/// starts.
+fn own_row(page: &[u8]) -> Option<usize> {
+    let node = Node::at(page, 0x50).ok()?;
+    if !node.is_leaf() {
+        return None;
+    }
+    let row = node.rows().flatten().find(|r| r.key == [0x10, 0, 0, 0])?;
+    let key = place(page, row.key);
+    (0x10..=key)
+        .map(|o| key - o)
+        .find(|&s| le16(page, s + 4) as usize == key - s)
+}
+
+/// The own row of a directory (the root's, and dir's) cut to 0x40 bytes,
+/// short of the times at 0x28..0x48 Windows keeps there: files created or
+/// deleted in it are errors. 1.3.0 wrote its new times past the row's end,
+/// a panic (audit 2026-10-21, RFW-02).
+#[test]
+fn a_directory_whose_own_row_is_short_is_not_written() {
+    for (dir, path) in [(None, "/new.txt"), (Some("/dir"), "/dir/new.txt")] {
+        let mut forge = Forge::fixture("r314small");
+        let oid = match dir {
+            None => ROOT_DIRECTORY,
+            Some(d) => match forge.volume().unwrap().lookup(d).unwrap().target {
+                Target::Directory(oid) => oid,
+                _ => panic!("{d} is no directory"),
+            },
+        };
+        forge.patch(
+            Tree::Object(oid),
+            |page| own_row(page).is_some(),
+            |page| {
+                let at = own_row(page).unwrap();
+                page[at + 0x0c..at + 0x0e].copy_from_slice(&0x40u16.to_le_bytes());
+            },
+        );
+        let disk = Overlay::new(&forge.image);
+        let mut vol = Volume::open(&disk, forge.offset).unwrap();
+        let e = vol.create_file(path, b"hello", 1).unwrap_err();
+        assert!(e.to_string().contains("an own row of 64 bytes"), "{e}");
+        if dir.is_some() {
+            let e = vol.delete_file("/dir/inner.txt", 1).unwrap_err();
+            assert!(e.to_string().contains("an own row of 64 bytes"), "{e}");
+        }
+    }
+}
+
+/// The medium allocator's bitmap row of mid.bin's clusters made to count
+/// 0xfff0 free clusters (of 0x4000): deleting the file, whose clusters go
+/// back to it, is an error. 1.3.0 added them to the count, a panic (audit
+/// 2026-10-21, RFW-02).
+#[test]
+fn freeing_into_a_row_counting_more_free_clusters_than_it_has_is_an_error() {
+    let mut forge = Forge::fixture("r314small");
+    let lcn = {
+        let vol = forge.volume().unwrap();
+        let entry = vol.lookup("/mid.bin").unwrap();
+        let Content::Extents(x) = &vol.open_file(&entry).unwrap().data.unwrap().content else {
+            panic!("resident")
+        };
+        vol.translate(x[0].vlcn).unwrap()
+    };
+    let row = move |page: &[u8]| {
+        let node = Node::at(page, 0x50).ok()?;
+        if !node.is_leaf() {
+            return None;
+        }
+        node.rows()
+            .flatten()
+            .find(|r| r.value.len() >= 0x18 && le64(r.value, 0) <= lcn && lcn - le64(r.value, 0) < le64(r.value, 8))
+            .map(|r| place(page, r.value))
+    };
+    // Root 1: the medium allocator.
+    forge.patch(
+        Tree::Root(1),
+        |page| row(page).is_some(),
+        |page| {
+            let at = row(page).unwrap();
+            page[at + 0x10..at + 0x12].copy_from_slice(&0xfff0u16.to_le_bytes());
+        },
+    );
+    let disk = Overlay::new(&forge.image);
+    let mut vol = Volume::open(&disk, forge.offset).unwrap();
+    let e = vol.delete_file("/mid.bin", 1).unwrap_err();
+    assert!(e.to_string().contains("free clusters of"), "{e}");
+}
+
+/// frag/a.bin's second run made to name the cluster of its first (a
+/// cluster at two places of the file, which the block reference count
+/// table does not count: `refs check` reports it), then the file cloned
+/// and deleted: the clone keeps its clusters. 1.3.0 counted the clone's
+/// two references to the cluster as one, and deleting the file freed the
+/// cluster under the clone (audit 2026-10-21, RFW-02, RFW-04).
+#[test]
+fn a_clone_of_a_file_naming_a_cluster_twice_keeps_it() {
+    let mut forge = Forge::fixture("r314basic4k");
+    let (dir, first, second) = {
+        let vol = forge.volume().unwrap();
+        let dir = match vol.lookup("/frag").unwrap().target {
+            Target::Directory(oid) => oid,
+            _ => panic!("/frag is no directory"),
+        };
+        let entry = vol.lookup("/frag/a.bin").unwrap();
+        let Content::Extents(x) = &vol.open_file(&entry).unwrap().data.unwrap().content else {
+            panic!("resident")
+        };
+        (
+            dir,
+            (x[0].vlcn, x[0].vcn, x[0].clusters),
+            (x[1].vlcn, x[1].vcn, x[1].clusters),
+        )
+    };
+    assert_eq!(first.2, 1);
+    let run = move |page: &[u8]| {
+        (0..page.len().saturating_sub(0x18)).find(|&p| {
+            le64(page, p) == second.0
+                && le32(page, p + 0x0c) as u64 == second.1
+                && le32(page, p + 0x14) as u64 == second.2
+        })
+    };
+    forge.patch(
+        Tree::Object(dir),
+        |page| run(page).is_some(),
+        |page| {
+            while let Some(at) = run(page) {
+                page[at..at + 8].copy_from_slice(&first.0.to_le_bytes());
+                page[at + 0x14..at + 0x18].copy_from_slice(&1u32.to_le_bytes());
+            }
+        },
+    );
+    let problems = forge.volume().unwrap().check(&[]).unwrap().problems;
+    assert!(
+        problems.iter().any(|p| p.contains("referenced 2 time(s)")),
+        "{problems:?}"
+    );
+    let disk = Overlay::new(&forge.image);
+    let mut vol = Volume::open(&disk, forge.offset).unwrap();
+    vol.clone_file("/frag/a.bin", "/frag/c.bin", 1).unwrap();
+    vol.delete_file("/frag/a.bin", 1).unwrap();
+    drop(vol);
+    let problems = Volume::open(&disk, forge.offset).unwrap().check(&[]).unwrap().problems;
+    assert!(
+        !problems.iter().any(|p| p.contains("free in the medium allocator")),
+        "{problems:?}"
+    );
+}
+
+/// mid.bin (100 KiB) made to say it holds 2^64 - 101 bytes, in its record
+/// and its entry: a clone of it is an error. 1.3.0 rounded the size up to
+/// whole clusters past 2^64, a panic (audit 2026-10-21, RFW-02).
+#[test]
+fn a_clone_of_a_file_of_a_size_near_2_64_is_an_error() {
+    let mut forge = Forge::fixture("r314small");
+    let name: Vec<u8> = "mid.bin".encode_utf16().flat_map(u16::to_le_bytes).collect();
+    let size = u64::MAX - 100;
+    forge.patch(
+        Tree::Object(ROOT_DIRECTORY),
+        |page| page.windows(name.len()).any(|w| w == name),
+        |page| {
+            for at in 0..page.len() - 8 {
+                if le64(page, at) == 102_400 {
+                    page[at..at + 8].copy_from_slice(&size.to_le_bytes());
+                }
+            }
+        },
+    );
+    let disk = Overlay::new(&forge.image);
+    let mut vol = Volume::open(&disk, forge.offset).unwrap();
+    assert_eq!(vol.lookup("/mid.bin").unwrap().size, size);
+    let e = vol.clone_file("/mid.bin", "/c.bin", 1).unwrap_err();
+    assert!(e.to_string().contains("a size of"), "{e}");
+}

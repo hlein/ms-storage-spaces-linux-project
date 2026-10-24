@@ -134,13 +134,24 @@ container table (key: container id at 0; value: clusters per container at
 `physical = start[vlcn >> bits(cpc)] + (vlcn & (cpc − 1))`, where
 `bits(cpc)` is one more than log2(cpc) (15 on 4 KiB clusters, 11 on 64
 KiB): containers are twice their size apart in virtual numbers, so a run
-never crosses one. (**verified**)
+never crosses one. (**verified**) The bit between the offset and the id
+(`vlcn & cpc`) is clear in every address of the corpus (41 volumes, every
+extent), and no run reaches past its container's last cluster: `refs`
+takes an address with the bit set for none (1.3.0 read it as the address
+without the bit, an alias the reference counts did not know), and refuses
+to write a file one of whose runs goes on past its container (`refs check`
+reports it; 1.3.0 checked runs of compacted containers alone, and wrote the
+others' on into the next container on the disk).
 
 Every container of the corpus is 64 MiB (0x4000 clusters of 4 KiB, 0x400
 of 64 KiB). `refs` refuses a table whose rows give containers of different
 sizes, of more than 2^20 clusters, a container starting at or past the
-volume's end, or two whose clusters overlap: every address is computed
-from these.
+volume's end, two whose clusters overlap, or an id whose virtual clusters
+do not fit 64 bits (`id << bits(cpc)` loses bits; the corpus has ids up to
+the containers' count plus 2): every address is computed from these. A
+volume whose boot sector names more sectors than its device holds past
+the volume's start does not open (1.3.0 checked containers, runs and
+writes against the boot sector's size).
 
 ### Object table
 
@@ -167,7 +178,9 @@ corpus, Windows Server 2016 to Windows 11; ReFS 1.2 has neither object.)
 A directory's tree holds, keyed by a u16 row type at key 0:
 
 * 0x10: the directory's own attributes (its value is an attribute tree
-  like a file record, see below; a junction's reparse point is there);
+  like a file record, see below, its times at 0x28..0x48; a junction's
+  reparse point is there). `refs` writes into no directory whose own row
+  is too short for its times (1.3.0 wrote past it);
 * 0x30: one row per name, the UTF-16LE name at key + 4 (any units, as
   NTFS allows: a lone surrogate, which UTF-8 cannot carry, is kept as the
   name's units beside the text, `Entry::units`, and the mount shows such
@@ -183,6 +196,9 @@ A directory's tree holds, keyed by a u16 row type at key 0:
     0x20 row); 0x98 the link count (u32); 0x9c the last stream set id
     given out (u32, 0xf000 after the first named stream in clusters;
     rewriting a record must keep it); the attribute tree's node at 0xa8.
+    (Every record of the corpus has its node at 0xa8; `refs` writes no
+    record whose node starts before 0xa0, where its fields end: 1.3.0
+    wrote the link count past such a record's end.)
     (**verified**: files `refs create` writes this way are read, changed
     and deleted by Windows, with the inherited permissions of their
     neighbours);
@@ -1015,7 +1031,12 @@ table's rows for a text diff):
   places (a clone within the file) twice, as a clone adds them. 1.2.2 let
   go of each cluster once, and a cluster a file mapped twice kept a count
   of 0 and stayed allocated (test
-  `a_cluster_mapped_twice_is_freed_with_both_references`).
+  `a_cluster_mapped_twice_is_freed_with_both_references`). A clone adds a
+  reference for each place in a block that had no row of counts too
+  (1.3.0 counted a cluster at two places once there, and deleting the
+  original freed the cluster under the clone). A bitmap row of an
+  allocator that would count more free clusters than it has is not freed
+  into (1.3.0 overflowed the u16 at 0x10).
 
 ## The log (MLog)
 

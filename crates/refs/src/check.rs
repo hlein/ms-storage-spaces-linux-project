@@ -755,6 +755,16 @@ impl<D: ReadAt> Volume<D> {
                     for s in group {
                         let Content::Extents(x) = &s.content else { continue };
                         for x in x.iter().filter(|x| x.written) {
+                            // Within its container (1.3.0 checked compacted
+                            // ones alone: audit 2026-10-21, RFW-01).
+                            let cpc = self.clusters_per_container;
+                            if x.clusters > cpc - (x.vlcn & (cpc - 1)) {
+                                report.problem(format!(
+                                    "{name}: a run of {} clusters at {:#x}, past its container",
+                                    x.clusters, x.vlcn
+                                ));
+                                continue;
+                            }
                             // In a compacted container: its compressed
                             // clusters stand for them (checked below).
                             if self.is_compacted(x.vlcn) {

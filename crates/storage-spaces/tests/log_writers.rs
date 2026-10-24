@@ -4,52 +4,55 @@
 //! and an entry is never cut off or misencoded in its slot.
 
 use std::alloc::{GlobalAlloc, Layout, System};
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::cell::Cell;
 use std::time::{Duration, Instant};
 
 use storage_spaces::Guid;
 use storage_spaces::cache::{CacheHeader, CacheIndex, CacheWriter, Checkpoint, LogWrite, Validity};
 use storage_spaces::journal::{JournalWriter, ParityJournal, SPVDT_SIGNATURE};
 
-/// Counts the bytes allocated now and at most.
+/// Counts the bytes each thread allocated now and at most: the tests run
+/// side by side, and what the others take is not the measured one's (the
+/// counters were the process's, and a test allocating 64 MiB beside it
+/// failed it now and then).
 struct Counting;
 
-static NOW: AtomicUsize = AtomicUsize::new(0);
-static PEAK: AtomicUsize = AtomicUsize::new(0);
+thread_local! {
+    static NOW: Cell<usize> = const { Cell::new(0) };
+    static PEAK: Cell<usize> = const { Cell::new(0) };
+}
 
 unsafe impl GlobalAlloc for Counting {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         let p = unsafe { System.alloc(layout) };
         if !p.is_null() {
-            let now = NOW.fetch_add(layout.size(), Ordering::Relaxed) + layout.size();
-            PEAK.fetch_max(now, Ordering::Relaxed);
+            let _ = NOW.try_with(|now| {
+                now.set(now.get() + layout.size());
+                let _ = PEAK.try_with(|peak| peak.set(peak.get().max(now.get())));
+            });
         }
         p
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
         unsafe { System.dealloc(ptr, layout) };
-        NOW.fetch_sub(layout.size(), Ordering::Relaxed);
+        // Freed by another thread than took it: counted where it is freed.
+        let _ = NOW.try_with(|now| now.set(now.get().saturating_sub(layout.size())));
     }
 }
 
 #[global_allocator]
 static ALLOCATOR: Counting = Counting;
 
-/// One measurement at a time: the counters are the process's.
-static MEASURE: Mutex<()> = Mutex::new(());
-
-/// What `f` returns, the bytes it took at most beyond what was allocated
-/// before, and how long it took.
+/// What `f` returns, the bytes it took at most beyond what its thread had
+/// allocated before, and how long it took.
 fn measured<T>(f: impl FnOnce() -> T) -> (T, usize, Duration) {
-    let _one = MEASURE.lock().unwrap_or_else(|e| e.into_inner());
-    let before = NOW.load(Ordering::Relaxed);
-    PEAK.store(before, Ordering::Relaxed);
+    let before = NOW.with(Cell::get);
+    PEAK.with(|peak| peak.set(before));
     let start = Instant::now();
     let out = f();
     let took = start.elapsed();
-    (out, PEAK.load(Ordering::Relaxed) - before, took)
+    (out, PEAK.with(Cell::get) - before, took)
 }
 
 fn crc32(data: &[u8]) -> u32 {

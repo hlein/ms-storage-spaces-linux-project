@@ -118,6 +118,29 @@
   the pool's the first copy of the newest sequence, not the one the pool
   reads; GPT entries of sizes UEFI does not have were read. Each now does
   what Windows does or refuses.
+* ReFS addresses a hostile volume could bend (audit 2026-10-21, RFW-01):
+  a virtual cluster with the bit between its container's clusters and its
+  id set (which Windows never writes) was read as the cluster without the
+  bit, an alias the reference counts did not know; a run reaching past the
+  end of a container that is not compacted was written on into the next
+  container on the disk (`refs check` took those clusters for the next
+  container's, free there); a container id too large for an address lost
+  its high bits to another container's; and a volume larger than its device
+  was taken at its boot sector's word. The first is no address now, the
+  writer refuses the second and `refs check` reports it, and such tables
+  and volumes do not open.
+* The ReFS writer (`refs write`, `refs mount --rw`) panicked on rows of a
+  hostile volume shorter than what it writes there (audit 2026-10-21,
+  RFW-02): creating or deleting a file in a directory whose own row is
+  shorter than its times, rewriting a record whose rows start before its
+  fields end, freeing clusters into an allocator row that counts more free
+  clusters than it has, and cloning a file whose size is near 2^64. They
+  are errors now. A clone of a file that names a cluster at two places
+  counted the two references as one where the cluster had no reference
+  count yet: deleting the original then freed the cluster under the clone
+  (also RFW-04). It counts both. Duplicate and overlapping extent records
+  change nothing the writer frees or counts (their claimed reference count
+  multiplication is refuted), nor does a size past a file's runs.
 * The checks of a pool of many spaces (`spaces attach`, `spaces check`)
   took about three times as long as in 1.2.2: 1.3.0's check for unmapped
   fixed spaces looked up each space's hidden spaces among all the pool's

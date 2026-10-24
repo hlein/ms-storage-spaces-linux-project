@@ -170,6 +170,16 @@ impl<D: ReadAt> Volume<D> {
         let mut sector = vec![0u8; BOOT_SECTOR_SIZE];
         dev.read_exact_at(&mut sector, offset)?;
         let boot = BootSector::parse(&sector)?;
+        // The volume lies on its device: what is checked against its size
+        // (containers, extents, writes) is so on the device too (1.3.0 took
+        // any size: audit 2026-10-21, RFW-01).
+        let room = dev.size()?.saturating_sub(offset);
+        if boot.volume_size() > room {
+            return Err(format_err!(
+                "a ReFS volume of {:#x} bytes, on a device of {room:#x} bytes from its start",
+                boot.volume_size()
+            ));
+        }
         let cluster = boot.cluster_size();
         let v1 = boot.major == 1;
         let page_size = if v1 { V1_BLOCK } else { cluster.max(16384) };
@@ -686,9 +696,19 @@ impl<D: ReadAt> Volume<D> {
         self.container_at = std::sync::OnceLock::new();
     }
 
-    /// The physical cluster of virtual cluster `vlcn`.
+    /// The physical cluster of virtual cluster `vlcn`. The bit between a
+    /// container's clusters and its id (`vlcn & cpc`) is clear in every
+    /// address Windows writes (the 41 volumes of the corpus); one with it
+    /// set is refused, as it would name the cluster of the address without
+    /// it (1.3.0 read it so: two addresses of one cluster, which reference
+    /// counts tell apart; audit 2026-10-21, RFW-01).
     pub fn translate(&self, vlcn: u64) -> Result<u64> {
         let cpc = self.clusters_per_container;
+        if vlcn & cpc != 0 {
+            return Err(format_err!(
+                "virtual cluster {vlcn:#x} has its container bit ({cpc:#x}) set"
+            ));
+        }
         let shift = 64 - cpc.leading_zeros();
         let start = self
             .containers
@@ -880,6 +900,18 @@ impl<D: ReadAt> Volume<D> {
                 w[1]
             ));
         }
+        // Every id fits a virtual cluster with the container's clusters
+        // below it: a larger one lost its high bits there, an address of
+        // another container (the corpus: ids up to the count of containers
+        // and 2 more, from compaction; audit 2026-10-21, RFW-01).
+        let shift = 64 - cpc.leading_zeros();
+        if let Some(&id) = containers.keys().chain(compacted.keys()).max()
+            && id >> (64 - shift) != 0
+        {
+            return Err(format_err!(
+                "container id {id:#x}, beyond a virtual cluster of {cpc} clusters a container"
+            ));
+        }
         self.clusters_per_container = cpc;
         self.container_at = std::sync::OnceLock::new();
         self.containers = containers;
@@ -912,7 +944,7 @@ impl<D: ReadAt> Volume<D> {
     /// `compressed_runs`).
     pub fn is_compacted(&self, vlcn: u64) -> bool {
         let shift = 64 - self.clusters_per_container.leading_zeros();
-        self.compacted.contains_key(&(vlcn >> shift))
+        vlcn & self.clusters_per_container == 0 && self.compacted.contains_key(&(vlcn >> shift))
     }
 
     /// Reads from a compacted container (see `compress`): each cluster

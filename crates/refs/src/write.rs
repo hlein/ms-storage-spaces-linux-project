@@ -595,8 +595,15 @@ impl<'v, D: WriteAt> Transaction<'v, D> {
                     }
                     *byte &= !(1 << (k % 8));
                 }
-                let free = le16(v, 0x10) + (stop - c) as u16;
-                v[0x10..0x12].copy_from_slice(&free.to_le_bytes());
+                // A row counting more free clusters than it has is not
+                // freed into (1.3.0 overflowed its count).
+                let free = u64::from(le16(v, 0x10)) + (stop - c);
+                if free > count.min(u64::from(u16::MAX)) {
+                    return Err(format_err!(
+                        "allocator {allocator}: the row at {start:#x} would count {free} free clusters of {count}"
+                    ));
+                }
+                v[0x10..0x12].copy_from_slice(&(free as u16).to_le_bytes());
                 self.freed.insert(c, stop);
                 c = stop;
             }
@@ -940,9 +947,15 @@ impl<'v, D: WriteAt> Transaction<'v, D> {
                 _ => {
                     let mut value = refcount::counts_value(block, 0, stamp);
                     value[0x18..0x1c].copy_from_slice(&(clusters.len() as u32).to_le_bytes());
+                    // A reference for each place, as above (1.3.0 counted
+                    // a cluster the runs name twice once).
                     for &c in &clusters {
                         let i = 0x1c + 2 * (c - block) as usize;
-                        value[i..i + 2].copy_from_slice(&1u16.to_le_bytes());
+                        let raw = le16(&value, i);
+                        if raw == refcount::COUNT_MASK {
+                            return Err(Error::Unsupported(format!("cluster {c:#x}: too many references")));
+                        }
+                        value[i..i + 2].copy_from_slice(&(raw + 1).to_le_bytes());
                     }
                     self.insert_sorted(tree, &row_keyed_by_value(&value, 16), &u64_key_order)?;
                     ranges.insert(block, (BLOCK, true));
@@ -3389,7 +3402,11 @@ impl<D: WriteAt> Volume<D> {
         }
         let shared: Vec<(u64, u64)> = records.iter().map(|r| (r.1, r.2)).collect();
         let size = data.size;
-        let logical = size.div_ceil(self.cluster) * self.cluster;
+        // In whole clusters (1.3.0 overflowed for a size near 2^64).
+        let logical = size
+            .div_ceil(self.cluster)
+            .checked_mul(self.cluster)
+            .ok_or_else(|| format_err!("{from}: a size of {size} bytes"))?;
         // A sparse file (holes between its records), as Windows keeps one:
         // the value's 0x30 the size in whole clusters, 0x48 the clusters
         // allocated, bit 31 of 0x50 set; the record's allocated size those
@@ -4361,15 +4378,19 @@ impl<D: WriteAt> Volume<D> {
             if data_level || set_level {
                 let to = if data_level { &mut runs } else { &mut stream_runs };
                 for x in self.extents(row_value(&r))?.iter().filter(|x| x.written) {
+                    // Within its container, compacted or not: a run is
+                    // written and freed from its first cluster on (1.3.0
+                    // checked compacted ones alone, and the others' runs
+                    // went on into the next container on the disk; audit
+                    // 2026-10-21, RFW-01). Windows' never leave theirs.
+                    if x.clusters > cpc - (x.vlcn & (cpc - 1)) {
+                        return Err(format_err!(
+                            "{path}: a run of {} clusters at {:#x}, past its container",
+                            x.clusters,
+                            x.vlcn
+                        ));
+                    }
                     if self.is_compacted(x.vlcn) {
-                        // Within its container.
-                        if x.clusters > cpc - (x.vlcn & (cpc - 1)) {
-                            return Err(format_err!(
-                                "{path}: a run of {} clusters at {:#x}, past its compressed container",
-                                x.clusters,
-                                x.vlcn
-                            ));
-                        }
                         let to = if data_level {
                             &mut compacted
                         } else {
@@ -4439,6 +4460,11 @@ impl<D: WriteAt> Volume<D> {
     fn touch_directory(&self, tx: &mut Transaction<'_, D>, path: &str, dir: u64, now: u64) -> Result<()> {
         let own = tx.find(Tree::Object(dir), &|k| k.len() >= 2 && le16(k, 0) == ROW_OWN)?;
         let v = tx.value_mut(own);
+        // Its times at 0x28..0x48, as Windows writes them (1.3.0 wrote past
+        // a shorter row: a panic).
+        if v.len() < 0x48 {
+            return Err(format_err!("directory {dir:#x}: an own row of {} bytes", v.len()));
+        }
         for at in [0x30, 0x38, 0x40] {
             v[at..at + 8].copy_from_slice(&now.to_le_bytes());
         }
@@ -5388,6 +5414,11 @@ fn embedded_rows(record: &[u8]) -> Result<Vec<Vec<u8>>> {
 /// (a u32 at 0x98; 0x9c holds the last stream set id given out).
 fn record_with_rows(record: &[u8], rows: &[Vec<u8>], links: u32) -> Result<Vec<u8>> {
     let h = le32(record, 0) as usize;
+    // Its fields up to 0xa0 before the node (every record of the corpus
+    // has 0xa8 bytes there; 1.3.0 wrote 0x98 past a shorter record).
+    if h < 0xa0 {
+        return Err(format_err!("a record of {h:#x} bytes before its rows"));
+    }
     let used: usize = rows.iter().map(Vec::len).sum();
     let free = 4 * rows.len() % 8;
     let index = 0x28 + used + free;
@@ -5641,6 +5672,19 @@ fn split_id_row(id: u64, home: u64) -> (Vec<u8>, Vec<u8>) {
 mod tests {
     use super::*;
     use storage_spaces::io::{Overlay, SparseImage};
+
+    /// A record whose node starts 0x10 bytes in (the readers take it: the
+    /// node is found from the descriptor at 0), with one row: written anew
+    /// it is an error. 1.3.0 wrote its link count at 0x98, past the 0x74
+    /// bytes it made, a panic (audit 2026-10-21, RFW-02).
+    #[test]
+    fn records_too_short_for_their_fields_are_errors() {
+        let mut record = vec![0u8; 0x80];
+        record[0..4].copy_from_slice(&0x10u32.to_le_bytes());
+        let row = vec![0u8; 0x30];
+        let e = record_with_rows(&record, &[row], 1).unwrap_err();
+        assert!(e.to_string().contains("0x10 bytes before its rows"), "{e}");
+    }
 
     /// The small fixture, its changes kept in memory.
     fn small() -> Volume<Overlay<SparseImage>> {

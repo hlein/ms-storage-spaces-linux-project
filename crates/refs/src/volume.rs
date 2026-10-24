@@ -1072,13 +1072,16 @@ impl<D: ReadAt> Volume<D> {
             let v = row.value;
             if v.len() >= 0x18 {
                 match (le16(v, 0x12), le16(v, 0x10)) {
-                    (1, n) => free += u64::from(n),
-                    (2, 0xffff) => free += le64(v, 8),
+                    (1, n) => free = free.saturating_add(u64::from(n)),
+                    (2, 0xffff) => free = free.saturating_add(le64(v, 8)),
                     _ => {}
                 }
             }
             Ok(())
         })?;
+        // Not more than the volume has (1.3.0 overflowed on rows claiming
+        // more).
+        let free = free.min(self.boot.volume_size() / self.cluster);
         *known = Some((state, free));
         Ok(free)
     }
@@ -1226,7 +1229,20 @@ fn read_log<D: ReadAt + ?Sized>(
         read(at, cluster)
     };
     let checkpoint = Lsn::from(le64(&physical(checkpoint_lcn)?, 0x70));
-    let signature = le32(&physical(SUPERBLOCK_LCN)?, 0x0c);
+    // The volume's signature, from the superblock the volume opens with:
+    // the primary, else a copy at the end (1.3.0 read the primary alone,
+    // and found no log when it was lost).
+    let total = volume_size / cluster;
+    let signature = [SUPERBLOCK_LCN, total.wrapping_sub(2), total.wrapping_sub(3)]
+        .into_iter()
+        .filter(|&lcn| lcn < total)
+        .filter_map(|lcn| physical(lcn).ok())
+        .find(|p| {
+            let (at, len) = (le32(p, 0x78) as usize, le32(p, 0x7c) as usize);
+            &p[0..4] == b"SUPB" && self_checksum_ok(p, at, len, cluster as usize, false)
+        })
+        .map(|p| le32(&p, 0x0c))
+        .ok_or_else(|| format_err!("no valid superblock"))?;
     let is_control = |c: &[u8]| &c[0..4] == b"MLog" && le32(c, 4) == signature && le64(c, 0x28) == 0;
     // The control page, which Windows keeps twice (in clusters one after
     // the other, written in turn): among the volume's first clusters, or
@@ -1502,10 +1518,15 @@ mod log_tests {
         p
     }
 
-    /// Superblock and checkpoint; the log comes from the tests.
+    /// Superblock and checkpoint; the log comes from the tests. The
+    /// superblock is sound (its reference to itself, at 0x100, of no
+    /// checksum): the log's signature is taken from a sound one.
     fn volume(checkpoint: Lsn) -> Pages {
         let mut sb = vec![0u8; 4096];
+        sb[..4].copy_from_slice(b"SUPB");
         sb[0x0c..0x10].copy_from_slice(&SIG.to_le_bytes());
+        sb[0x78..0x7c].copy_from_slice(&0x100u32.to_le_bytes());
+        sb[0x7c..0x80].copy_from_slice(&0x28u32.to_le_bytes());
         let mut cp = vec![0u8; 4096];
         cp[0x70..0x78].copy_from_slice(&raw(checkpoint).to_le_bytes());
         Pages {

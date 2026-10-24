@@ -141,6 +141,19 @@
   (also RFW-04). It counts both. Duplicate and overlapping extent records
   change nothing the writer frees or counts (their claimed reference count
   multiplication is refuted), nor does a size past a file's runs.
+* `refs check` on a hostile volume (audit 2026-10-21, RFR-01, the auditor's
+  rfr_01, rfr_04, rfr_06, rfr_08, rfr_10): a reference count row claiming
+  clusters up to 2^64 was walked cluster by cluster (no end), as an
+  allocator bitmap row's count beyond its bits; a row inside the one
+  before it made the count of a range overflow; a directory named below
+  itself was walked again and again; a page whose node does not parse, or
+  a damaged upcase table, ended the check with an error, the rest of the
+  volume unchecked. Each is a problem it reports now, and it ends. The
+  free clusters (`statfs` of a mount, `refs info`) of allocator rows
+  claiming more than 2^64 overflowed; they are the volume's at most. The
+  log (whether Windows would replay it over a change, asked before every
+  write) was not found when the primary superblock was lost, though the
+  volume opened from a copy: the log is found through the copy.
 * The checks of a pool of many spaces (`spaces attach`, `spaces check`)
   took about three times as long as in 1.2.2: 1.3.0's check for unmapped
   fixed spaces looked up each space's hidden spaces among all the pool's

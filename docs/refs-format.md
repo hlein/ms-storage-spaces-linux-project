@@ -123,7 +123,8 @@ directory of 5000 names spanning several pages.)
 or an ancestor, would have it read once per row, or forever) and expects
 a child node's level to be one less than its parent's; it refuses a tree
 otherwise, as it does one deeper than 16 levels. `refs check` reports such
-pages, and a key twice in a table, also in two of its leaves. Name rows (type 0x30) need keys of 4 bytes or more, resident data
+pages, a page whose node does not parse (and checks the rest; 1.3.0
+stopped there), and a key twice in a table, also in two of its leaves. Name rows (type 0x30) need keys of 4 bytes or more, resident data
 (at 0x3c of its value) must lie in its value.
 
 ### Virtual clusters and the container table
@@ -520,7 +521,12 @@ that one file's runs name at 1022 places counts 1021 (the corpus'
 data naming a cluster at the same place in the stream are one reference.
 `refs check` compares every count with the references the files make
 (every volume of the corpus agrees) and reports a cluster counted for
-fewer references than it has, or for more, or named by no file.
+fewer references than it has, or for more, or named by no file, and rows
+whose ranges overlap (none in the corpus). A row of counts holds a count
+for each u16 of its value; clusters its key claims beyond those have none
+(a key claiming 2^64 clusters kept 1.3.0's check going cluster by cluster
+without end), as an allocator bitmap row's clusters beyond its bits are
+free.
 
 ## ReFS 3.1, 3.4 and 3.7 (Windows Server 2016, 2019 and 2022)
 
@@ -1056,7 +1062,9 @@ ReFS write a checkpoint that covers the log (**verified**).
   of 4 KiB clusters and 13 of 64 KiB (**verified** on the corpus). It is
   512 MiB, 256 MiB on ReFS 3.1, or 1 GiB on the volumes of several TiB;
   where the size changes is not known.
-* The control page ("MLog", the volume signature at 4, zero at 0x28) is
+* The control page ("MLog", the volume signature at 4, zero at 0x28; the
+  signature is the superblock's at 0x0c, of whichever copy is sound: 1.3.0
+  read the primary alone and found no log when it was lost) is
   kept twice, in two clusters one after the other: among the volume's
   first clusters (cluster 0x30 on 4 KiB, 0x27 on 64 KiB clusters: 3.7 and
   3.14 plain corpus volumes, and the user's plain one) or right after the

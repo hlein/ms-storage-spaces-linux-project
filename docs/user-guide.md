@@ -977,7 +977,16 @@ also counts the pages only the older checkpoint references (Windows frees
 them with its next checkpoint) and, on ReFS 3.14 volumes, the clusters
 used that nothing references; Windows leaves some on every volume (about
 150 on a small one), so they are no problem by themselves, but a change by
-`refs` should not add to them.
+`refs` should not add to them. On a damaged or hostile volume it goes on
+past what it cannot read (a page whose node does not parse, a damaged
+upcase table: named among the problems, the rest checked), visits each
+directory once (one named below itself again is a problem), and takes
+rows by the ranges they hold, not by what they claim (a reference count
+row or an allocator bitmap claiming 2^64 clusters, rows inside others), so
+that it ends in time proportional to the volume's pages and files (1.3.0
+did not end on such rows, nor on a directory named below itself). Nothing
+runs it by itself: `mount.ReFS`, udisks2's mounts and the health guard run
+the quick checks only, and `spaces check --deep` runs it on request.
 
 Read: files (resident, in extents, sparse, block-cloned, deduplicated),
 directories of any size, named streams, stream snapshots (`refsutil

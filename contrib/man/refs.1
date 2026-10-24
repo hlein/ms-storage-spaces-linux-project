@@ -281,7 +281,9 @@ count table (and no count for one referenced once), and a directory's
 names in the order of the volume's upcase table, where Windows looks
 them up; the pages only the older checkpoint references and the clusters
 used that nothing references are counted (Windows leaves some on every
-volume). Exits with 1 when it finds a problem.
+volume). On a damaged volume it reports what it cannot read and checks
+the rest, visits each directory once and takes rows by what they hold,
+so that it ends. Exits with 1 when it finds a problem.
 With
 .B \-\-quick
 only what mounting checks: the boot sector, the superblock and its copies

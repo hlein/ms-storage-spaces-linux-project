@@ -298,8 +298,11 @@ impl Allocator {
                 Bits::Uniform(true) => out.push((*start, start.saturating_add(*count))),
                 Bits::Uniform(false) => {}
                 Bits::Map(b) => {
+                    // The bits the row holds (1.3.0 went on to its count:
+                    // 2^64 did not end).
+                    let count = (*count).min(8 * b.len() as u64);
                     let mut j = 0;
-                    while j < *count {
+                    while j < count {
                         let set = |j: u64| {
                             usize::try_from(j / 8)
                                 .ok()
@@ -311,7 +314,7 @@ impl Allocator {
                             continue;
                         }
                         let from = j;
-                        while j < *count && set(j) {
+                        while j < count && set(j) {
                             j += 1;
                         }
                         out.push((start + from, start + j));
@@ -539,7 +542,19 @@ impl<D: ReadAt> Volume<D> {
         // Directories (objects from the root directory on) keep their
         // names in the order of the upcase table, where Windows looks for
         // them (`Volume::upcase`; none to compare by on ReFS 1.x).
-        let up = if self.v1 { None } else { Some(self.upcase()?) };
+        let up = if self.v1 {
+            None
+        } else {
+            match self.upcase() {
+                Ok(up) => Some(up),
+                // No order to compare names by; the rest is checked (1.3.0
+                // ended here).
+                Err(e) => {
+                    report.problem(format!("the upcase table: {e}"));
+                    None
+                }
+            }
+        };
         let directory = |what: &str| {
             what.strip_prefix("object 0x")
                 .and_then(|h| u64::from_str_radix(h, 16).ok())
@@ -583,7 +598,15 @@ impl<D: ReadAt> Volume<D> {
                 table.broken = true;
                 continue;
             }
-            let node = Node::at(&page, PAGE_HEADER_SIZE)?;
+            let node = match Node::at(&page, PAGE_HEADER_SIZE) {
+                Ok(node) => node,
+                Err(e) => {
+                    // The page named, the rest checked (1.3.0 ended here).
+                    report.problem(format!("{what}: page {:#x}: {e}", r.lcns[0]));
+                    table.broken = true;
+                    continue;
+                }
+            };
             // The table's descriptor, in its root page.
             if parent.is_none() && le32(&page, PAGE_HEADER_SIZE) as usize >= DESCRIPTOR_COUNTS {
                 table.descriptor = Some((
@@ -704,7 +727,14 @@ impl<D: ReadAt> Volume<D> {
         let mut compacted: BTreeMap<u64, (usize, u32)> = BTreeMap::new();
         let mut records = std::collections::HashSet::new();
         let mut dirs = vec![(ROOT_DIRECTORY, String::new())];
+        // Each directory once: one named again (below itself) would be
+        // walked again and again (1.3.0 did not end).
+        let mut visited = std::collections::HashSet::new();
         while let Some((oid, path)) = dirs.pop() {
+            if !visited.insert(oid) {
+                report.problem(format!("{path}/: directory {oid:#x} named again"));
+                continue;
+            }
             report.directories += 1;
             let entries = match self.read_dir(oid) {
                 Ok(e) => e,
@@ -1018,7 +1048,14 @@ impl<D: ReadAt> Volume<D> {
         let total = self.boot.volume_size() / self.cluster;
         let mut runs: Vec<(u64, u64, String)> = Vec::new();
         let mut dirs = vec![(ROOT_DIRECTORY, String::new())];
+        // Each directory once: one named again (below itself) would be
+        // walked again and again (1.3.0 did not end).
+        let mut visited = std::collections::HashSet::new();
         while let Some((oid, path)) = dirs.pop() {
+            if !visited.insert(oid) {
+                report.problem(format!("{path}/: directory {oid:#x} named again"));
+                continue;
+            }
             report.directories += 1;
             let entries = match self.read_dir(oid) {
                 Ok(e) => e,
@@ -1126,7 +1163,9 @@ impl<D: ReadAt> Volume<D> {
                             push(lcn + (at - v), lcn + (first - v), 0);
                             at = *first;
                         }
-                        let stop = first.saturating_add(*n).min(v + len);
+                        // A row inside the one before (overlapping rows
+                        // are a problem of `refcount_rows`) adds nothing.
+                        let stop = first.saturating_add(*n).min(v + len).max(at);
                         for (from, to, count) in refcount::pieces(value, at, stop - at) {
                             push(lcn + (from - v), lcn + (to - v), count);
                         }
@@ -1175,6 +1214,16 @@ impl<D: ReadAt> Volume<D> {
             rows.push((first, n, row.value.to_vec()));
             Ok(())
         })?;
+        // Rows apart, in key order (1.3.0's count of a range took a row
+        // inside the one before for its rest: a panic).
+        for w in rows.windows(2) {
+            if w[0].0.saturating_add(w[0].1) > w[1].0 {
+                problems.push(format!(
+                    "reference count rows {:#x} of {:#x} clusters and {:#x} overlap",
+                    w[0].0, w[0].1, w[1].0
+                ));
+            }
+        }
         Ok((rows, problems))
     }
 }

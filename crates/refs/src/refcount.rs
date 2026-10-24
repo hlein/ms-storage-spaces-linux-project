@@ -60,13 +60,20 @@ pub(crate) fn pieces(value: &[u8], from: u64, n: u64) -> Vec<(u64, u64, u16)> {
     if le32(value, 0x14) != COUNTS {
         return vec![(start, end, le16(value, 0x1c) & COUNT_MASK)];
     }
+    // Cluster by cluster as far as the value holds counts, the rest none
+    // (1.3.0 went over the whole range: a row claiming 2^64 clusters did
+    // not end).
+    let held = first.saturating_add((value.len().saturating_sub(0x1c) / 2) as u64);
     let mut out: Vec<(u64, u64, u16)> = Vec::new();
-    for v in start..end {
-        let count = count_of(value, v).unwrap_or(0);
-        match out.last_mut() {
-            Some(l) if l.2 == count => l.1 = v + 1,
-            _ => out.push((v, v + 1, count)),
-        }
+    let mut push = |from: u64, to: u64, count: u16| match out.last_mut() {
+        Some(l) if l.2 == count => l.1 = to,
+        _ => out.push((from, to, count)),
+    };
+    for v in start..end.min(held) {
+        push(v, v + 1, count_of(value, v).unwrap_or(0));
+    }
+    if held.max(start) < end {
+        push(held.max(start), end, 0);
     }
     out
 }

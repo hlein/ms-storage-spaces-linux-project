@@ -564,8 +564,10 @@ volume in a space attached with `--degraded` or `--force` mounts only with
   as usual. Since 1.3 each pool is checked in a child process of its own,
   with a memory limit of 2048 MiB (`SPACES_POOL_MEMORY=MIB`, 0 none; the
   84 pools of the corpus check within 512) and a deadline of 120 s
-  (`SPACES_POOL_TIMEOUT=SECONDS`, 0 none; never past the time of
-  `spaces attach`; with `--deep`, which may take hours, none unless the
+  (`SPACES_POOL_TIMEOUT=SECONDS`, 0 none; never past half of what is left
+  of the time of `spaces attach`, so that the pools whose checks ended
+  have the rest to be attached in: 1.3.0 gave a pool whose checks hung all
+  of it, and under the attach units no pool was attached; with `--deep`, which may take hours, none unless the
   variable sets one; `--bundle` checks in its own process, without the
   child's limits): a pool whose checks reach either gets one failed
   `space.checks` report naming the limit, and nothing of it is attached

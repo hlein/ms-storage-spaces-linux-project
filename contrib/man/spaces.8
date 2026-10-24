@@ -475,8 +475,9 @@ whose checks need more fails (space.checks), and nothing of it is attached.
 .TP
 .B SPACES_POOL_TIMEOUT
 Seconds the child that checks one pool may take (120 by default, 0 for no
-limit; never past
-.BR SPACES_ATTACH_TIMEOUT ;
+limit; never past half of what is left of
+.BR SPACES_ATTACH_TIMEOUT ,
+so that the other pools have the rest to be attached in;
 .B check \-\-deep
 none unless this sets one).
 A child that takes longer is killed, and its pool fails (space.checks).

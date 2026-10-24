@@ -621,15 +621,24 @@ fn pool_memory() -> Option<u64> {
 }
 
 /// How long the checks of one pool may take: SPACES_POOL_TIMEOUT seconds
-/// (0: no limit), 120 by default, and no longer than what is left of the
-/// time of `spaces attach`. The deep checks, which read every copy, have
+/// (0: no limit), 120 by default, and no longer than half of what is left
+/// of the time of `spaces attach`, so that the pools whose checks ended
+/// have the other half to be attached in (1.3.0 gave a pool whose checks
+/// hung all of it: under the attach units' 80 s no pool was attached;
+/// audit 2026-10-21, SCA-01). The deep checks, which read every copy, have
 /// no limit unless SPACES_POOL_TIMEOUT sets one (a scrub of a large pool
 /// takes hours).
 fn pool_deadline(deep: bool) -> Option<Duration> {
     let own = pool_deadline_of(std::env::var("SPACES_POOL_TIMEOUT").ok().as_deref(), deep);
-    match (own, time_left()) {
-        (Some(own), Some(left)) => Some(own.min(left)),
-        (own, left) => own.or(left),
+    pool_deadline_within(own, time_left())
+}
+
+/// [`pool_deadline`] with `own` from SPACES_POOL_TIMEOUT and `left` of the
+/// run's time.
+fn pool_deadline_within(own: Option<Duration>, left: Option<Duration>) -> Option<Duration> {
+    match (own, left.map(|l| l / 2)) {
+        (Some(own), Some(half)) => Some(own.min(half)),
+        (own, half) => own.or(half),
     }
 }
 
@@ -769,7 +778,8 @@ impl Child {
         }
         let why = if timed_out {
             format!(
-                "did not end within {} s (SPACES_POOL_TIMEOUT), and were stopped",
+                "did not end within {} s (SPACES_POOL_TIMEOUT, or half the time left of this run: \
+                 SPACES_ATTACH_TIMEOUT), and were stopped",
                 deadline.map_or(0, |d| d.as_secs())
             )
         } else if err.contains("memory allocation of") {
@@ -909,6 +919,19 @@ mod tests {
         assert_eq!(pool_deadline_of(Some("30"), true), Some(Duration::from_secs(30)));
         assert_eq!(pool_deadline_of(Some("0"), false), None);
         assert_eq!(pool_deadline_of(Some("soon"), false), Some(Duration::from_secs(120)));
+    }
+
+    /// Under the attach units' 80 s a pool's checks take 40 at most, half
+    /// of what is left, leaving the rest to the pools whose checks ended
+    /// (1.3.0: all 80; audit 2026-10-21, SCA-01).
+    #[test]
+    fn a_pools_checks_take_half_the_time_left_at_most() {
+        let s = Duration::from_secs;
+        assert_eq!(pool_deadline_within(Some(s(120)), Some(s(80))), Some(s(40)));
+        assert_eq!(pool_deadline_within(Some(s(5)), Some(s(80))), Some(s(5)));
+        assert_eq!(pool_deadline_within(None, Some(s(80))), Some(s(40)));
+        assert_eq!(pool_deadline_within(Some(s(120)), None), Some(s(120)));
+        assert_eq!(pool_deadline_within(None, None), None);
     }
 
     /// A device that panics on every read once `armed`.

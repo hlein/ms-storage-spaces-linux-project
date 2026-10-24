@@ -176,6 +176,10 @@
   -x`, `rsync -t`) were overwritten by the close. The mount takes such
   names as the volume spells them, and writes a file's buffer back before
   setting its times.
+* `spaces attach` (audit 2026-10-21, SCA-01): a pool whose checks hung
+  took all the time left of the run (`SPACES_ATTACH_TIMEOUT`, 80 s under
+  the attach units), and the pools whose checks had ended were not
+  attached. A pool's checks take half of what is left at most now.
 * The checks of a pool of many spaces (`spaces attach`, `spaces check`)
   took about three times as long as in 1.2.2: 1.3.0's check for unmapped
   fixed spaces looked up each space's hidden spaces among all the pool's

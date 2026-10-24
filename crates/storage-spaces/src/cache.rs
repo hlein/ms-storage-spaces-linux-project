@@ -236,7 +236,7 @@ pub struct CacheWriter {
     next_block: u32,
     first_block: u32,
     /// Chunk number -> (block, valid sectors).
-    chunks: std::collections::BTreeMap<u64, (u32, Vec<bool>)>,
+    chunks: std::collections::BTreeMap<u64, (u32, Sectors)>,
     /// Slots written since the cache was last empty.
     slots_in_use: usize,
     /// Sequence of the valid slot at each index (0: none).
@@ -304,10 +304,9 @@ impl CacheWriter {
         let Some((block, valid)) = self.chunks.get(&(offset / chunk)) else {
             return (None, chunk - within);
         };
-        let sector = (within / self.sector) as usize;
-        let v = valid[sector];
-        let same = valid[sector..].iter().take_while(|&&x| x == v).count() as u64;
-        let len = (sector as u64 + same) * self.sector - within;
+        let sector = within / self.sector;
+        let (v, same) = valid.at(sector as u32);
+        let len = (sector + u64::from(same)) * self.sector - within;
         (v.then(|| self.block_offset(*block) + within), len)
     }
 
@@ -318,9 +317,10 @@ impl CacheWriter {
         let (block, valid) = self.chunks.get(&(offset / chunk))?;
         Some((
             *block,
-            runs_of(valid)
-                .into_iter()
-                .map(|(v, n)| (v, n as u64 * self.sector))
+            valid
+                .runs()
+                .iter()
+                .map(|&(v, n)| (v, u64::from(n) * self.sector))
                 .collect(),
         ))
     }
@@ -344,7 +344,7 @@ impl CacheWriter {
             // a chunk at most: cut off at the end of its slot, an entry made
             // the log unreadable (audit 2026-10-16, M20).
             || (offset / chunk..(offset + len).div_ceil(chunk)).any(|c| {
-                let runs = self.chunks.get(&c).map_or(1, |(_, valid)| run_count(valid));
+                let runs = self.chunks.get(&c).map_or(1, |(_, valid)| valid.words());
                 0x38 + 16 + 2 * (runs + 2) > self.header.slot_size as usize
             })
     }
@@ -361,7 +361,7 @@ impl CacheWriter {
             let mut entries = Vec::with_capacity(batch.len() * 16);
             for &offset in batch {
                 if let Some((_, valid)) = self.chunks.remove(&(offset / chunk)) {
-                    self.entry_bytes = self.entry_bytes.saturating_sub(entry_len(&valid));
+                    self.entry_bytes = self.entry_bytes.saturating_sub(valid.entry_len());
                 }
                 entries.extend_from_slice(&(offset / chunk * chunk).to_le_bytes());
                 entries.extend_from_slice(&NO_BLOCK.to_le_bytes());
@@ -389,25 +389,24 @@ impl CacheWriter {
     pub fn write(&mut self, offset: u64, len: u64) -> Vec<LogWrite> {
         let chunk = self.header.chunk_size as u64;
         let sector = self.sector;
-        let sectors = (chunk / sector) as usize;
+        let sectors = (chunk / sector) as u32;
         let mut changed = Vec::new();
         let mut at = offset;
         while at < offset + len {
             let key = at / chunk;
             let end = (offset + len).min((key + 1) * chunk);
-            let (first, last) = ((at % chunk / sector) as usize, ((end - 1) % chunk / sector) as usize);
+            let (first, last) = ((at % chunk / sector) as u32, ((end - 1) % chunk / sector) as u32);
             let next_block = &mut self.next_block;
             let mut added = false;
             let (_, valid) = self.chunks.entry(key).or_insert_with(|| {
                 let b = *next_block;
                 *next_block += 1;
                 added = true;
-                (b, vec![false; sectors])
+                (b, Sectors::new(false, sectors))
             });
-            if valid[first..=last].iter().any(|v| !v) {
-                let before = if added { 0 } else { entry_len(valid) };
-                valid[first..=last].fill(true);
-                self.entry_bytes = self.entry_bytes - before + entry_len(valid);
+            let before = if added { 0 } else { valid.entry_len() };
+            if valid.set(first, last) {
+                self.entry_bytes = self.entry_bytes - before + valid.entry_len();
                 changed.push(key);
             }
             at = end;
@@ -422,11 +421,11 @@ impl CacheWriter {
         let mut changed = Vec::new();
         for &offset in offsets {
             if let Some((_, valid)) = self.chunks.get_mut(&(offset / chunk))
-                && valid.contains(&false)
+                && !valid.is_whole()
             {
-                let before = entry_len(valid);
-                valid.fill(true);
-                self.entry_bytes = self.entry_bytes - before + entry_len(valid);
+                let before = valid.entry_len();
+                *valid = Sectors::new(true, valid.len());
+                self.entry_bytes = self.entry_bytes - before + valid.entry_len();
                 changed.push(offset / chunk);
             }
         }
@@ -467,15 +466,15 @@ impl CacheWriter {
     /// counted part and so overwrites the others.
     fn entry(&self, key: u64) -> (Vec<u8>, usize) {
         let (block, valid) = &self.chunks[&key];
-        let runs = runs_of(valid);
-        let full = runs.len() == 1;
-        let counted = if full { 0 } else { 2 * runs.len() };
+        let full = valid.runs().len() == 1;
+        let words = valid.run_words();
+        let counted = if full { 0 } else { 2 * words.len() };
         let mut e = (key * self.header.chunk_size as u64).to_le_bytes().to_vec();
         e.extend_from_slice(&block.to_le_bytes());
         e.extend_from_slice(&(if full { STATE_FULL } else { STATE_PARTIAL }).to_le_bytes());
         e.extend_from_slice(&(counted as u16).to_le_bytes());
-        for (v, n) in runs {
-            e.extend_from_slice(&((u16::from(v) << 15) | n as u16).to_le_bytes());
+        for w in words {
+            e.extend_from_slice(&w.to_le_bytes());
         }
         (e, counted)
     }
@@ -503,7 +502,7 @@ impl CacheWriter {
 
     /// Recounts what the entries of the cached chunks take.
     fn recount(&mut self) {
-        self.entry_bytes = self.chunks.values().map(|(_, valid)| entry_len(valid)).sum();
+        self.entry_bytes = self.chunks.values().map(|(_, valid)| valid.entry_len()).sum();
     }
 
     /// Appends the next slot with `count` entries, after a checkpoint where
@@ -581,29 +580,111 @@ pub(crate) fn encode_slot(
     s
 }
 
-/// Bytes the entry of a chunk with these valid sectors takes in a slot or
-/// checkpoint (8-byte aligned).
-fn entry_len(valid: &[bool]) -> usize {
-    let runs = run_count(valid);
-    let counted = if runs == 1 { 0 } else { 2 * runs };
-    (16 + counted).next_multiple_of(8)
-}
+/// Which sectors of a cached chunk hold valid data, as the writer keeps
+/// it: runs of equally valid sectors from the chunk start that cover it,
+/// neighbours differing (a whole chunk is one run). It takes what the runs
+/// take, not a flag per sector (audit 2026-10-21, SPB-03: a chunk of 64 MiB
+/// of 512-byte sectors took 128 KiB, whole or not).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Sectors(Vec<(bool, u32)>);
 
-/// Runs of equally valid sectors a chunk has.
-fn run_count(valid: &[bool]) -> usize {
-    valid.windows(2).filter(|w| w[0] != w[1]).count() + 1
-}
+impl Sectors {
+    /// `sectors` sectors, every one valid or none.
+    fn new(valid: bool, sectors: u32) -> Sectors {
+        Sectors(vec![(valid, sectors)])
+    }
 
-/// Runs of equally valid sectors, from the chunk start.
-fn runs_of(valid: &[bool]) -> Vec<(bool, usize)> {
-    let mut runs: Vec<(bool, usize)> = Vec::new();
-    for &v in valid {
-        match runs.last_mut() {
-            Some((last, n)) if *last == v => *n += 1,
-            _ => runs.push((v, 1)),
+    /// The validity of an index entry's runs (valid, sectors), cut or
+    /// filled with sectors not valid to `sectors`.
+    fn from_runs(runs: impl Iterator<Item = (bool, u64)>, sectors: u32) -> Sectors {
+        let mut out = Sectors(Vec::new());
+        let mut total = 0;
+        for (valid, n) in runs {
+            let n = n.min(u64::from(sectors - total)) as u32;
+            out.push(valid, n);
+            total += n;
+        }
+        out.push(false, sectors - total);
+        out
+    }
+
+    fn push(&mut self, valid: bool, n: u32) {
+        match self.0.last_mut() {
+            _ if n == 0 => {}
+            Some((last, m)) if *last == valid => *m += n,
+            _ => self.0.push((valid, n)),
         }
     }
-    runs
+
+    fn runs(&self) -> &[(bool, u32)] {
+        &self.0
+    }
+
+    /// Sectors of the chunk.
+    fn len(&self) -> u32 {
+        self.0.iter().map(|r| r.1).sum()
+    }
+
+    fn is_whole(&self) -> bool {
+        self.0.iter().all(|r| r.0)
+    }
+
+    /// Whether sector `s` is valid, and the sectors from it to the end of
+    /// its run.
+    fn at(&self, s: u32) -> (bool, u32) {
+        let mut start = 0;
+        for &(valid, n) in &self.0 {
+            if s < start + n {
+                return (valid, start + n - s);
+            }
+            start += n;
+        }
+        (false, 0)
+    }
+
+    /// Makes sectors `first..=last` valid; whether one was not.
+    fn set(&mut self, first: u32, last: u32) -> bool {
+        let mut out = Sectors(Vec::with_capacity(self.0.len() + 2));
+        let mut changed = false;
+        let mut start = 0;
+        for &(valid, n) in &self.0 {
+            let end = start + n;
+            let (a, b) = (first.clamp(start, end), last.saturating_add(1).clamp(start, end));
+            out.push(valid, a - start);
+            out.push(true, b - a);
+            out.push(valid, end - b);
+            changed |= !valid && b > a;
+            start = end;
+        }
+        *self = out;
+        changed
+    }
+
+    /// The run words of the entry: a run of more than 0x7fff sectors in
+    /// several (1.3.0 cut its length to 15 bits).
+    fn run_words(&self) -> Vec<u16> {
+        let mut words = Vec::with_capacity(self.0.len());
+        for &(valid, mut n) in &self.0 {
+            while n > 0 {
+                let w = n.min(0x7fff);
+                words.push((u16::from(valid) << 15) | w as u16);
+                n -= w;
+            }
+        }
+        words
+    }
+
+    /// The number of run words.
+    fn words(&self) -> usize {
+        self.0.iter().map(|r| r.1.div_ceil(0x7fff) as usize).sum()
+    }
+
+    /// Bytes the chunk's entry takes in a slot or checkpoint (8-byte
+    /// aligned).
+    fn entry_len(&self) -> usize {
+        let counted = if self.0.len() == 1 { 0 } else { 2 * self.words() };
+        (16 + counted).next_multiple_of(8)
+    }
 }
 
 /// Sequence of a slot whose signature and CRC are valid.
@@ -618,7 +699,7 @@ pub(crate) fn slot_sequence(slot: &[u8]) -> Option<u64> {
 pub const SPCHECK_SIGNATURE: &[u8; 8] = b"SPCHECK\0";
 const CHECKPOINT_HEADER: usize = 0x50;
 /// Where a checkpoint's entries start.
-const CHECKPOINT_ENTRIES: usize = 0x200;
+pub(crate) const CHECKPOINT_ENTRIES: usize = 0x200;
 /// The largest checkpoint read.
 const MAX_CHECKPOINT: usize = 16 << 20;
 /// The largest chunk taken: the owner's full data stripe, columns x
@@ -763,8 +844,8 @@ const NO_BLOCK: u32 = u32::MAX;
 /// What the index of a cache's chunks may take in memory, about, over the
 /// versions its copies hold: 4 Mi chunks, what a slot area of 64 MiB holds
 /// at most (a cache of 1 TiB in chunks of 256 KiB), whatever its entries
-/// claim.
-const MAX_INDEX: u64 = 256 << 20;
+/// claim; a parity journal's entries take the same budget.
+pub(crate) const MAX_INDEX: u64 = 256 << 20;
 /// What a chunk of the index takes, about (its key, version, block and
 /// validity in a map), besides its runs.
 const ENTRY_WEIGHT: u64 = 64;
@@ -1116,18 +1197,11 @@ impl CacheIndex {
             w.sequence = newest.sequence;
             w.next_slot = (newest.index + 1) % self.header.slot_count.max(1) as usize;
         }
-        let sectors = (self.header.chunk_size as u64 / self.sector) as usize;
+        let sectors = (self.header.chunk_size as u64 / self.sector) as u32;
         for (&key, (block, validity)) in &self.chunks {
             let valid = match validity {
-                Validity::Full => vec![true; sectors],
-                Validity::Runs(runs) => {
-                    let mut v = Vec::with_capacity(sectors);
-                    for (ok, n) in runs.iter() {
-                        v.extend(std::iter::repeat_n(ok, n as usize));
-                    }
-                    v.resize(sectors, false);
-                    v
-                }
+                Validity::Full => Sectors::new(true, sectors),
+                Validity::Runs(runs) => Sectors::from_runs(runs.iter(), sectors),
             };
             w.chunks.insert(key, (*block as u32, valid));
             w.next_block = w.next_block.max(*block as u32 + 1);
@@ -1599,7 +1673,7 @@ mod tests {
         let chunk = cache.header.chunk_size as u64;
         for &o in &offsets {
             w.chunks
-                .insert(o / chunk, (0, vec![true; (chunk / w.sector()) as usize]));
+                .insert(o / chunk, (0, Sectors::new(true, (chunk / w.sector()) as u32)));
         }
         w.recount();
         let written = w.destage(&offsets);

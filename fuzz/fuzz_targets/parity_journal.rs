@@ -94,7 +94,7 @@ fn model_round_trip(data: &[u8], owner: Guid) {
     for w in data.chunks_exact(6).take(100) {
         let first = u64::from(u32::from_le_bytes(w[..4].try_into().unwrap())) % STRIPES;
         let count = (u64::from(u16::from_le_bytes([w[4], w[5]])) + 1).min(STRIPES - first);
-        for record in journal.write(0, STRIPES, first, count) {
+        for record in journal.write(0, STRIPES, first, count).unwrap() {
             match record {
                 LogWrite::Slot(index, page) => {
                     space[0x60 + index * SLOT..0x60 + (index + 1) * SLOT].copy_from_slice(&page)

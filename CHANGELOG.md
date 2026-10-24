@@ -70,6 +70,23 @@
   cached, read from blocks that no longer held them, and the space was
   called healthy (found by the oracle run of this release on `replacedrun`).
   Every copy of each unit is read now.
+* The writers of the write-back cache and the parity journal (`--rw`) took
+  memory and time by what a small log names (audit 2026-10-21, SPB-03,
+  SPW-02): the cache writer kept a flag per sector of every cached chunk
+  (a checkpoint of 4 KiB naming 256 whole chunks of 64 MiB took 32 MiB),
+  the journal writer one per stripe of a run, each looked up among the runs
+  of the entry it continued (an entry of 10 000 runs did not finish), and a
+  journal's entries were decoded without a bound. A cache entry cut a run
+  of more than 0x7fff sectors to 15 bits, and a journal entry too long for
+  its slot was cut off with its length left as it was; the journal then no
+  longer loaded. A parity space whose journal header counts extent runs of
+  another size than the space's was written, after which it did not open,
+  and journal checkpoint areas of no bytes were taken, a checkpoint written
+  over the header. Both writers keep runs now, the journal's entries take
+  the cache index's budget, long runs take several words, an entry that
+  does not fit its slot is an error, such a space is refused for writing,
+  such checkpoint areas count as none, and run words of no stripes, which
+  Windows does not write, are refused.
 * The checks of a pool of many spaces (`spaces attach`, `spaces check`)
   took about three times as long as in 1.2.2: 1.3.0's check for unmapped
   fixed spaces looked up each space's hidden spaces among all the pool's

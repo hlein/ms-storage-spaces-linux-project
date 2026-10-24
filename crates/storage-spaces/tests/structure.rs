@@ -464,3 +464,42 @@ fn a_tier_is_laid_out_from_its_own_start_by_health() {
     assert!(h.unknown.is_empty(), "{:?}", h.unknown);
     assert_eq!(h.spaces[0].state.to_string(), "Healthy / OK");
 }
+
+/// A parity space whose journal header names extent runs of 4 GiB while
+/// its run has 2 GiB (an entry counts the stripes of a run of the size the
+/// header names): not opened for writing. 1.3.0 wrote an entry of the run's
+/// stripes, half as many as the header's runs have, and the space did not
+/// open again ("covers 4096 stripes, its run has 8192"; the auditor's
+/// repro_spw05).
+#[test]
+fn a_journal_counting_runs_of_another_size_is_not_written() {
+    let disks = new_pool(3, 8 << 30);
+    let pool = Pool::open(disks.iter().collect::<Vec<_>>()).unwrap();
+    let spec = SpaceSpec {
+        name: "parity".into(),
+        resiliency: 3,
+        size: 512 << 20,
+        thin: false,
+        copies: None,
+        columns: None,
+        interleave: None,
+        write_cache: None,
+    };
+    let (plan, _) = plan_create_space(&pool, &spec, &mut guids(0x30)).unwrap();
+    let none: [Overlay<SparseImage>; 0] = [];
+    plan.apply(&disks, &none).unwrap();
+    let pool = Pool::open(disks.iter().collect::<Vec<_>>()).unwrap();
+    let id = pool.find_space("parity").unwrap().id();
+    assert!(pool.open_space_rw(id).is_ok());
+    let child = hidden(&pool, id, SpaceRole::Other(0x0a));
+    let mut header = log_header(&pool, child);
+    assert_eq!(header.data_offset, 8 * SLAB_SIZE);
+    header.data_offset = 16 * SLAB_SIZE;
+    write_header(&pool, &disks, child, &header.encode(SPVDT_SIGNATURE), true);
+    let pool = Pool::open(disks.iter().collect::<Vec<_>>()).unwrap();
+    let Err(e) = pool.open_space_rw(id) else {
+        panic!("opened for writing")
+    };
+    assert!(e.to_string().contains("parity journal counts extent runs"), "{e}");
+    assert!(pool.open_space(id).is_ok());
+}

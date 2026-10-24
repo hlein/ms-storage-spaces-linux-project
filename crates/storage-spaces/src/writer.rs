@@ -179,6 +179,23 @@ impl<'p, D: WriteAt> SpaceWriter<'p, D> {
             });
         }
         if let Some(pj) = reader.journal().filter(|_| layout.resiliency == Resiliency::Parity) {
+            // The journal's entries count the stripes of runs of the size
+            // its header names: an entry for a run of another size made the
+            // journal unreadable once written (audit 2026-10-21, SPW-02).
+            let (run_size, stripe) = pj.run_geometry();
+            let row = SLAB_SIZE * layout.data_columns;
+            if stripe != layout.data_columns * layout.interleave
+                || layout
+                    .column_runs(0)
+                    .into_iter()
+                    .flatten()
+                    .any(|r| r.rows.checked_mul(row) != Some(run_size))
+            {
+                return Err(Error::Unsupported(format!(
+                    "space {id} cannot be opened for writing: its parity journal counts extent runs of \
+                     {run_size:#x} bytes in stripes of {stripe:#x}, which are not the space's"
+                )));
+            }
             let (jlayout, _) = Self::child_space(pool, id, SpaceRole::Other(0x0a))?;
             let (slot_offset, slot_size, _) = pj.geometry();
             journal = Some(JournalState {
@@ -816,7 +833,7 @@ impl<'p, D: WriteAt> SpaceWriter<'p, D> {
         let mut marked = false;
         for (&run_start, (run_stripes, list)) in &by_run {
             if !writer.is_listed(run_start) || list.iter().any(|&s| writer.is_consistent(run_start, *run_stripes, s)) {
-                let records = writer.mark_stripes(run_start, *run_stripes, list, false);
+                let records = writer.mark_stripes(run_start, *run_stripes, list, false)?;
                 self.write_log(&journal.area, &records)?;
                 marked = true;
             }
@@ -841,7 +858,7 @@ impl<'p, D: WriteAt> SpaceWriter<'p, D> {
         }
         pool.flush_members()?;
         for (run_start, (run_stripes, list)) in by_run {
-            let records = writer.mark_stripes(run_start, run_stripes, &list, true);
+            let records = writer.mark_stripes(run_start, run_stripes, &list, true)?;
             self.write_log(&journal.area, &records)?;
         }
         Ok(())
@@ -1433,7 +1450,7 @@ mod tests {
         let journal = r.journal().unwrap();
         let (slot_offset, slot_size, _) = journal.geometry();
         let mut jw = journal.writer(space.info.guid);
-        let records = jw.mark(0, 16384, 100, 4, false);
+        let records = jw.mark(0, 16384, 100, 4, false).unwrap();
         let (index, page) = records[0].slot().unwrap();
         let (jl, _) = super::SpaceWriter::child_space(&pool, id, SpaceRole::Other(0x0a)).unwrap();
         super::write_copies(

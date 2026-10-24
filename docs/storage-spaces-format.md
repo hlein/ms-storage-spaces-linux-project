@@ -830,7 +830,9 @@ at 0x20 (0 = mapping, 1 = initialisation record, see below), `u64 sequence` at
 (**verified**: NTFS pool `ntfsparity`, whose entries carry 4 to 14 bytes of
 runs summing to the chunk; with only 4-byte run lists, as in `parity4`,
 bytes plus padding and 16-bit words cannot be told apart.) Entries are ordered by slot sequence and then by position within
-the slot.
+the slot. A run of more than 0x7fff sectors (in chunks of more than 16 MiB
+of 512-byte sectors, not seen from Windows) is written by `spaces` in
+several words of the same validity; 1.3.0 cut its length to 15 bits.
 
 The unit of the runs is the space's logical sector (**verified**: pool
 `wc4k`, a thin simple space with 4 KiB sectors and a 1 GiB cache made by
@@ -1072,7 +1074,14 @@ interleave) and at 0x5c the number of runs (a fixed space of 2 GiB with
 checkpoints exactly like the cache's (**verified**: `parity4` and `lrc12`
 hold journal checkpoints of sequences 1025 and 2050, continuing at slot 0,
 with one entry per run; pools whose journal never wrapped have none), and
-`spaces` reads and writes it by the same rule. Mapping slots (type 0) hold
+`spaces` reads and writes it by the same rule. The extent runs of the 54
+parity spaces of the corpus with a journal that are not tiered have the
+size the header names, and their stripes its stripe size (**verified**; the
+other 6 journals are of parity tiers, which are not written); `spaces` does
+not write a space whose runs or stripes are of another size (its entries would count
+stripes the journal's readers do not expect). Checkpoint areas of fewer
+than 0x200 bytes or more than 256 MiB count as none, as for the cache. A
+run word of no stripes (0x8000) is refused: Windows writes none. Mapping slots (type 0) hold
 entries keyed by the owner offset where an extent run starts:
 
 | Offset | Size | Field |

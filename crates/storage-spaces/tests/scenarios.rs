@@ -504,7 +504,7 @@ fn parity_journal_logs_whole_stripe_writes() {
                 while at < offset + len {
                     let n = (offset + len - at).min(1 << 20);
                     if at % stripe == 0 && n % stripe == 0 {
-                        let records = journal.write(0, stripes, at / stripe, n / stripe);
+                        let records = journal.write(0, stripes, at / stripe, n / stripe).unwrap();
                         let (i, page) = records[0].slot().expect("no checkpoint before the log wraps");
                         journal_slots.push((i, content(page)));
                     } else {

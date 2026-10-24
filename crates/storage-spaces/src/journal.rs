@@ -22,7 +22,9 @@
 
 use std::collections::HashMap;
 
-use crate::cache::{Checkpoint, LogWrite, SlotSource, load_checkpoints, merge_slot_copies};
+use crate::cache::{
+    CHECKPOINT_ENTRIES, Checkpoint, LogWrite, MAX_INDEX, SlotSource, load_checkpoints, merge_slot_copies,
+};
 use crate::crc::crc32_excluding;
 use crate::error::{Result, format_err};
 use crate::guid::Guid;
@@ -54,6 +56,9 @@ pub struct ParityJournal {
     geometry: (u64, u32, u32),
     /// Checkpoint area offset, size and count from the header.
     checkpoint_geometry: (u64, u32, u32),
+    /// The size of the owner's extent runs and of its stripes the header
+    /// names.
+    run_geometry: (u64, u64),
     checkpoint: Option<Checkpoint>,
     /// The newest entry per run of the merged slot area, and its bytes.
     current: HashMap<u64, (Consistency, Vec<u8>)>,
@@ -101,7 +106,13 @@ pub(crate) fn header_geometry(head: &[u8]) -> Option<(Areas, Areas)> {
         return None;
     }
     let mut checkpoints = (le_u64(&head[0x40..]), le_u32(&head[0x48..]), le_u32(&head[0x4c..]));
-    if checkpoints.0 > MAX_LOG_OFFSET || checkpoints.2 > 4 {
+    // Areas too small for a checkpoint's header (1.3.0 took areas of no
+    // bytes at 0, and a checkpoint went over the header; audit 2026-10-21,
+    // SPW-02) or larger than 256 MiB count as none too.
+    if checkpoints.0 > MAX_LOG_OFFSET
+        || checkpoints.2 > 4
+        || !(CHECKPOINT_ENTRIES as u32..=256 << 20).contains(&checkpoints.1)
+    {
         checkpoints.2 = 0;
     }
     Some((slots, checkpoints))
@@ -134,7 +145,8 @@ impl ParityJournal {
         let (cp_offset, cp_size, cp_count) = checkpoint_geometry;
         let checkpoints = load_checkpoints(&mut read, owner, cp_offset, cp_size, cp_count)?;
         let checkpoint = checkpoints.iter().flatten().max_by_key(|c| c.sequence).cloned();
-        let current = Self::parse(&merged, slot_size, checkpoint.as_ref(), stripes)?;
+        let mut budget = MAX_INDEX;
+        let current = Self::parse(&merged, slot_size, checkpoint.as_ref(), stripes, &mut budget)?;
         let mut runs: HashMap<u64, Vec<Consistency>> = HashMap::new();
         let mut add = |entries: Entries| {
             for (offset, (c, _)) in entries {
@@ -153,7 +165,7 @@ impl ParityJournal {
                 checkpoint.as_ref()
             };
             if *copy != merged || own != checkpoint.as_ref() {
-                add(Self::parse(copy, slot_size, own, stripes)?);
+                add(Self::parse(copy, slot_size, own, stripes, &mut budget)?);
             }
         }
         Ok(Some(ParityJournal {
@@ -161,6 +173,7 @@ impl ParityJournal {
             slots: crate::cache::valid_slots(&merged, slot_size),
             geometry: (slot_offset, slot_size as u32, slot_count as u32),
             checkpoint_geometry,
+            run_geometry: (run_size, stripe),
             checkpoint,
             current,
         }))
@@ -171,11 +184,19 @@ impl ParityJournal {
     /// checkpoint's entries, then the slots from the one it names on while
     /// their sequences increase (from slot 0 without a checkpoint); the
     /// newest entry per run counts.
-    fn parse(area: &[u8], slot_size: usize, checkpoint: Option<&Checkpoint>, stripes: Option<u64>) -> Result<Entries> {
+    fn parse(
+        area: &[u8],
+        slot_size: usize,
+        checkpoint: Option<&Checkpoint>,
+        stripes: Option<u64>,
+        budget: &mut u64,
+    ) -> Result<Entries> {
         type Versioned = ((u64, usize), Consistency, Vec<u8>);
         let mut newest: HashMap<u64, Versioned> = HashMap::new();
         let mut apply = |sequence: u64, bytes: &[u8], count: usize| -> Result<()> {
-            for (index, (offset, consistency, raw)) in decode_entries(bytes, count, stripes)?.into_iter().enumerate() {
+            for (index, (offset, consistency, raw)) in
+                decode_entries(bytes, count, stripes, budget)?.into_iter().enumerate()
+            {
                 let version = (sequence, index);
                 if newest.get(&offset).is_none_or(|(v, _, _)| version > *v) {
                     newest.insert(offset, (version, consistency, raw));
@@ -305,6 +326,12 @@ impl ParityJournal {
         self.checkpoint_geometry
     }
 
+    /// The size of the owner's extent runs and of its stripes, as the
+    /// header names them: entries count the stripes of runs of that size.
+    pub fn run_geometry(&self) -> (u64, u64) {
+        self.run_geometry
+    }
+
     /// The newest valid checkpoint.
     pub fn checkpoint(&self) -> Option<&Checkpoint> {
         self.checkpoint.as_ref()
@@ -383,7 +410,7 @@ pub struct JournalWriter {
     next_slot: usize,
     sequence: u64,
     /// Owner offset where an extent run starts -> consistent stripes.
-    runs: std::collections::BTreeMap<u64, Vec<bool>>,
+    runs: std::collections::BTreeMap<u64, Stripes>,
     /// Entries of a journal this writer continues, not yet expanded, and
     /// their bytes (for checkpoints).
     loaded: HashMap<u64, Consistency>,
@@ -433,47 +460,47 @@ impl JournalWriter {
     /// Whether stripe `stripe` of the run at `run_start` (of `stripes`
     /// stripes) is recorded as consistent.
     pub fn is_consistent(&mut self, run_start: u64, stripes: u64, stripe: u64) -> bool {
-        self.run(run_start, stripes)
-            .get(stripe as usize)
-            .copied()
-            .unwrap_or(false)
+        self.run(run_start, stripes).at(stripe)
     }
 
-    fn run(&mut self, run_start: u64, stripes: u64) -> &mut Vec<bool> {
+    fn run(&mut self, run_start: u64, stripes: u64) -> &mut Stripes {
         let loaded = self.loaded.remove(&run_start);
-        self.runs.entry(run_start).or_insert_with(|| {
-            (0..stripes)
-                .map(|s| loaded.as_ref().is_some_and(|c| !c.is_dirty(s)))
-                .collect()
-        })
+        self.runs
+            .entry(run_start)
+            .or_insert_with(|| Stripes::of(loaded.as_ref(), stripes))
     }
 
     /// A write request of stripes `first..first + count` of the extent run
     /// that starts at owner offset `run_start` and has `stripes` stripes:
     /// the slot Windows writes (after a checkpoint where one is due).
-    pub fn write(&mut self, run_start: u64, stripes: u64, first: u64, count: u64) -> Vec<LogWrite> {
+    pub fn write(&mut self, run_start: u64, stripes: u64, first: u64, count: u64) -> Result<Vec<LogWrite>> {
         self.mark(run_start, stripes, first, count, true)
     }
 
     /// Records stripes `first..first + count` of the run as consistent or
     /// not: the log writes.
-    pub fn mark(&mut self, run_start: u64, stripes: u64, first: u64, count: u64, value: bool) -> Vec<LogWrite> {
-        let consistent = self.run(run_start, stripes);
-        let end = (first + count).min(consistent.len() as u64);
-        for s in first.min(end)..end {
-            consistent[s as usize] = value;
-        }
+    pub fn mark(&mut self, run_start: u64, stripes: u64, first: u64, count: u64, value: bool) -> Result<Vec<LogWrite>> {
+        self.run(run_start, stripes)
+            .set(first, first.saturating_add(count), value);
         self.entry(run_start)
     }
 
     /// Records the stripes `list` of the run as consistent or not: the log
     /// writes.
-    pub fn mark_stripes(&mut self, run_start: u64, stripes: u64, list: &[u64], value: bool) -> Vec<LogWrite> {
+    pub fn mark_stripes(&mut self, run_start: u64, stripes: u64, list: &[u64], value: bool) -> Result<Vec<LogWrite>> {
         let consistent = self.run(run_start, stripes);
-        for &s in list {
-            if let Some(c) = consistent.get_mut(s as usize) {
-                *c = value;
+        let mut list = list.to_vec();
+        list.sort_unstable();
+        list.dedup();
+        // Neighbouring stripes as one range.
+        let mut i = 0;
+        while i < list.len() {
+            let mut end = i + 1;
+            while end < list.len() && list[end] == list[end - 1] + 1 {
+                end += 1;
             }
+            consistent.set(list[i], list[end - 1] + 1, value);
+            i = end;
         }
         self.entry(run_start)
     }
@@ -481,8 +508,8 @@ impl JournalWriter {
     /// The next slot, with the entry for the run at `run_start`, after a
     /// checkpoint where the log comes round to the slot the newest one
     /// continues at.
-    fn entry(&mut self, run_start: u64) -> Vec<LogWrite> {
-        let entry = self.encode(run_start);
+    fn entry(&mut self, run_start: u64) -> Result<Vec<LogWrite>> {
+        let entry = self.encode(run_start)?;
         self.listed.insert(run_start);
         let mut out = Vec::new();
         let index = self.next_slot;
@@ -491,7 +518,7 @@ impl JournalWriter {
         if index == cp_next && overwritten > cp_seq && self.checkpoint_count > 0 {
             self.sequence += 1;
             let area = cp_area.wrapping_add(1) % self.checkpoint_count as usize;
-            let (entries, count) = self.checkpoint_entries();
+            let (entries, count) = self.checkpoint_entries()?;
             out.push(LogWrite::Checkpoint(
                 area,
                 Checkpoint::encode(self.owner, 1, self.sequence, index as u32, count, &entries),
@@ -507,18 +534,18 @@ impl JournalWriter {
             index,
             crate::cache::encode_slot(self.owner, self.slot_size, 0, self.sequence, 1, &entry),
         ));
-        out
+        Ok(out)
     }
 
     /// The entries of every run the journal lists, 8-byte aligned, and
     /// their count.
-    fn checkpoint_entries(&mut self) -> (Vec<u8>, u32) {
+    fn checkpoint_entries(&mut self) -> Result<(Vec<u8>, u32)> {
         let mut listed: Vec<u64> = self.listed.iter().copied().collect();
         listed.sort();
         let mut out = Vec::new();
         for run in &listed {
             let entry = match self.runs.contains_key(run) {
-                true => self.encode(*run),
+                true => self.encode(*run)?,
                 false => self.loaded_bytes.get(run).cloned().unwrap_or_default(),
             };
             if entry.is_empty() {
@@ -527,60 +554,170 @@ impl JournalWriter {
             out.extend_from_slice(&entry);
             out.resize(out.len().next_multiple_of(8), 0);
         }
-        (out, listed.len() as u32)
+        Ok((out, listed.len() as u32))
     }
 
     /// The entry for the run at `run_start`: a run list (state 2, as
     /// Windows writes it), or a bitmap (state 1) where the run list does not
     /// fit into a slot. Where neither fits, the run is recorded as not
-    /// consistent as a whole, which is always safe.
-    fn encode(&mut self, run_start: u64) -> Vec<u8> {
-        let capacity = (self.slot_size as usize).saturating_sub(0x38 + 12);
+    /// consistent as a whole, which is always safe; a run too long for even
+    /// that is an error (1.3.0 cut the entry off at the end of its slot,
+    /// its length left as it was: the journal no longer loaded; audit
+    /// 2026-10-21, SPW-02).
+    fn encode(&mut self, run_start: u64) -> Result<Vec<u8>> {
+        let capacity = (self.slot_size as u64).saturating_sub(0x38 + 12);
         let consistent = self.runs.get_mut(&run_start).expect("run expanded by the caller");
-        let words = |c: &[bool]| {
-            let mut words = Vec::new();
-            let mut i = 0;
-            while i < c.len() {
-                let v = c[i];
-                let n = c[i..].iter().take(0x7fff).take_while(|&&x| x == v).count();
-                words.push((u16::from(v) << 15) | n as u16);
-                i += n;
-            }
-            words
-        };
-        let mut body = Vec::new();
+        let fits = |c: &Stripes| c.word_count().saturating_mul(2) <= capacity;
+        let words = |c: &Stripes| c.words().iter().flat_map(|w| w.to_le_bytes()).collect::<Vec<u8>>();
         let mut state = 2u16;
-        let w = words(consistent);
         let mut counted = None;
-        if !consistent.contains(&false) && 2 * w.len() <= capacity {
+        let body = if consistent.all() && fits(consistent) {
             // Whole run consistent: state 3; the run words are written but
             // not counted (parity3_26100, the slot after the last stripe).
             state = 3;
             counted = Some(0);
-            w.iter().for_each(|w| body.extend_from_slice(&w.to_le_bytes()));
-        } else if 2 * w.len() <= capacity {
-            w.iter().for_each(|w| body.extend_from_slice(&w.to_le_bytes()));
+            words(consistent)
+        } else if fits(consistent) {
+            words(consistent)
         } else if consistent.len().div_ceil(8) <= capacity {
             state = 1;
-            body = vec![0u8; consistent.len().div_ceil(8)];
-            for (i, _) in consistent.iter().enumerate().filter(|c| *c.1) {
-                body[i / 8] |= 1 << (i % 8);
-            }
-            // Bits past the last stripe are set, as in all-set bitmaps.
-            if !consistent.len().is_multiple_of(8) {
-                *body.last_mut().unwrap() |= 0xff << (consistent.len() % 8);
-            }
+            consistent.bitmap()
         } else {
-            consistent.fill(false);
+            *consistent = Stripes::of(None, consistent.len());
+            if !fits(consistent) {
+                return Err(crate::Error::Unsupported(format!(
+                    "the extent run at {run_start:#x} has {} stripes, more than an entry of a parity journal slot \
+                     of {} bytes records",
+                    consistent.len(),
+                    self.slot_size
+                )));
+            }
             words(consistent)
-                .iter()
-                .for_each(|w| body.extend_from_slice(&w.to_le_bytes()));
-        }
+        };
         let mut entry = run_start.to_le_bytes().to_vec();
         entry.extend_from_slice(&state.to_le_bytes());
         entry.extend_from_slice(&counted.unwrap_or(body.len() as u16).to_le_bytes());
         entry.extend_from_slice(&body);
-        entry
+        Ok(entry)
+    }
+}
+
+/// Which stripes of an extent run the journal writer records as
+/// consistent: runs of equally consistent stripes from the run's start that
+/// cover it, neighbours differing. It takes what the runs take, not a flag
+/// per stripe (audit 2026-10-21, SPB-03: a run's stripes were expanded one
+/// by one, each looked up in the runs of the entry loaded, and a run can
+/// have 2^51 stripes).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Stripes(Vec<(bool, u64)>);
+
+impl Stripes {
+    /// The `stripes` stripes of a run as the entry `loaded` records them
+    /// (none consistent without one), in one pass over the entry.
+    fn of(loaded: Option<&Consistency>, stripes: u64) -> Stripes {
+        let bitmap = |bits: &[u8]| {
+            let covered = (bits.len() as u64).saturating_mul(8).min(stripes);
+            (0..covered)
+                .map(|s| (bits[(s / 8) as usize] >> (s % 8) & 1 == 1, 1))
+                .collect::<Vec<_>>()
+        };
+        let runs: Vec<(bool, u64)> = match loaded {
+            Some(Consistency::All) => vec![(true, stripes)],
+            Some(Consistency::Runs(runs)) => runs.clone(),
+            Some(Consistency::Bitmap(bits)) => bitmap(bits),
+            None => Vec::new(),
+        };
+        let mut out = Stripes(Vec::new());
+        let mut total = 0;
+        for (consistent, n) in runs {
+            let n = n.min(stripes - total);
+            out.push(consistent, n);
+            total += n;
+        }
+        out.push(false, stripes - total);
+        out
+    }
+
+    fn push(&mut self, consistent: bool, n: u64) {
+        match self.0.last_mut() {
+            _ if n == 0 => {}
+            Some((last, m)) if *last == consistent => *m += n,
+            _ => self.0.push((consistent, n)),
+        }
+    }
+
+    /// Stripes of the run.
+    fn len(&self) -> u64 {
+        self.0.iter().map(|r| r.1).sum()
+    }
+
+    fn all(&self) -> bool {
+        self.0.iter().all(|r| r.0)
+    }
+
+    /// Whether stripe `s` is consistent (none past the run).
+    fn at(&self, s: u64) -> bool {
+        let mut start = 0;
+        for &(consistent, n) in &self.0 {
+            if s < start + n {
+                return consistent;
+            }
+            start += n;
+        }
+        false
+    }
+
+    /// Records stripes `first..end` (within the run) as consistent or not.
+    fn set(&mut self, first: u64, end: u64, value: bool) {
+        let mut out = Stripes(Vec::with_capacity(self.0.len() + 2));
+        let mut start = 0;
+        for &(consistent, n) in &self.0 {
+            let stop = start + n;
+            let (a, b) = (first.clamp(start, stop), end.clamp(start, stop));
+            out.push(consistent, a - start);
+            out.push(value, b - a);
+            out.push(consistent, stop - b);
+            start = stop;
+        }
+        *self = out;
+    }
+
+    /// Run words of at most 0x7fff stripes each.
+    fn word_count(&self) -> u64 {
+        self.0.iter().map(|r| r.1.div_ceil(0x7fff)).sum()
+    }
+
+    /// The run words (only for a count that fits a slot).
+    fn words(&self) -> Vec<u16> {
+        let mut words = Vec::new();
+        for &(consistent, mut n) in &self.0 {
+            while n > 0 {
+                let w = n.min(0x7fff);
+                words.push((u16::from(consistent) << 15) | w as u16);
+                n -= w;
+            }
+        }
+        words
+    }
+
+    /// A bit per stripe, set where consistent, and past the last stripe (as
+    /// in all-set bitmaps): only for a run that fits a slot.
+    fn bitmap(&self) -> Vec<u8> {
+        let len = self.len();
+        let mut bits = vec![0u8; len.div_ceil(8) as usize];
+        let mut start = 0;
+        for &(consistent, n) in &self.0 {
+            if consistent {
+                for s in start..start + n {
+                    bits[(s / 8) as usize] |= 1 << (s % 8);
+                }
+            }
+            start += n;
+        }
+        if !len.is_multiple_of(8) {
+            *bits.last_mut().unwrap() |= 0xff << (len % 8);
+        }
+        bits
     }
 }
 
@@ -588,7 +725,12 @@ impl JournalWriter {
 /// start of `bytes`): run offset, consistency and the entry's bytes. With
 /// the number of `stripes` per run known, a run list must cover exactly
 /// that many and a bitmap have a bit for each (whole bytes).
-fn decode_entries(bytes: &[u8], count: usize, stripes: Option<u64>) -> Result<Vec<(u64, Consistency, Vec<u8>)>> {
+fn decode_entries(
+    bytes: &[u8],
+    count: usize,
+    stripes: Option<u64>,
+    budget: &mut u64,
+) -> Result<Vec<(u64, Consistency, Vec<u8>)>> {
     let mut out = Vec::with_capacity(count.min(4096));
     let mut pos = 0;
     for _ in 0..count {
@@ -618,11 +760,29 @@ fn decode_entries(bytes: &[u8], count: usize, stripes: Option<u64>) -> Result<Ve
                     if w == 0 {
                         break;
                     }
+                    // A run of no stripes (0x8000): none is written so
+                    // (audit 2026-10-21, SPB-03).
+                    if w & 0x7fff == 0 {
+                        return Err(format_err!(
+                            "parity journal entry for the run at {offset:#x} has a run word of no stripes"
+                        ));
+                    }
                     runs.push((w & 0x8000 != 0, (w & 0x7fff) as u64));
                 }
                 Consistency::Runs(runs)
             }
         };
+        // What the entry takes decoded (a run word 16 bytes) and as read,
+        // counted against the budget of the cache index (audit 2026-10-21,
+        // SPB-03: the journal had none).
+        let decoded = match &consistency {
+            Consistency::Runs(runs) => 16 * runs.len(),
+            Consistency::Bitmap(bits) => bits.len(),
+            Consistency::All => 0,
+        };
+        *budget = budget
+            .checked_sub((64 + decoded + raw.len()) as u64)
+            .ok_or_else(|| format_err!("the entries of the parity journal would take more than {MAX_INDEX} bytes"))?;
         if let Some(n) = stripes {
             match &consistency {
                 Consistency::Runs(runs) => {
@@ -762,10 +922,10 @@ mod tests {
         // The slot before: consistent 16352, not consistent 32.
         assert_eq!(&before.content[0x18 + 8..], &[2, 0, 4, 0, 0xe0, 0xbf, 0x20]);
         let mut w = JournalWriter::new(space.info.guid, 4096, 1024);
-        w.mark(0, 16384, 0, 16352, true);
+        w.mark(0, 16384, 0, 16352, true).unwrap();
         w.sequence = before.sequence;
         w.next_slot = last.index;
-        let records = w.write(0, 16384, 16352, 32);
+        let records = w.write(0, 16384, 16352, 32).unwrap();
         let (index, page) = records[0].slot().unwrap();
         assert_eq!((records.len(), index), (1, last.index));
         let end = page.iter().rposition(|&b| b != 0).unwrap() + 1;

@@ -308,6 +308,21 @@ impl<D: ReadAt> Mapped<'_, D> {
     fn copies_differ(&self, offset: u64, len: usize) -> Result<Option<bool>> {
         let l = &self.layout;
         let loc = l.locate(offset);
+        // Fewer than two copies on disks at hand: nothing to compare, and
+        // nothing read (the one copy of a degraded mirror tier was read up
+        // to the read budget, past the time the checks of a space may
+        // take).
+        let mut at_hand = 0;
+        for copy in 0..l.copies {
+            if let Some((disk, slab)) = l.physical(loc.column, copy, loc.row)
+                && self.pool.slab_location(disk, slab)?.is_some()
+            {
+                at_hand += 1;
+            }
+        }
+        if at_hand < 2 {
+            return Ok(None);
+        }
         let n = len.min(loc.contiguous as usize);
         let (mut first, mut other) = (vec![0u8; n], vec![0u8; n]);
         let mut read = 0;

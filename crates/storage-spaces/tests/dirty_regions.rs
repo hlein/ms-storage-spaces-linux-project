@@ -5,6 +5,7 @@
 
 use std::fs::File;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use storage_spaces::drt::DrtWriter;
 use storage_spaces::format::{SLAB_SIZE, SpaceRole};
@@ -126,6 +127,50 @@ fn listed_runs_with_one_copy_at_hand_are_not_called_compared() {
     let r = report(&pool, id);
     let drl = drl_check(&r);
     assert!(!drl.summary.contains("the copies agree"), "{}", drl.summary);
+}
+
+/// A device that counts the bytes read from it.
+struct Counting<D> {
+    inner: D,
+    read: AtomicU64,
+}
+
+impl<D: ReadAt> ReadAt for Counting<D> {
+    fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> std::io::Result<()> {
+        self.read.fetch_add(buf.len() as u64, Ordering::Relaxed);
+        self.inner.read_exact_at(buf, offset)
+    }
+    fn size(&self) -> std::io::Result<u64> {
+        self.inner.size()
+    }
+}
+
+/// The same with the one copy at hand counted: it is not read, there being
+/// nothing to compare it with. Before 1.3.1 was released, the checks of a
+/// degraded tiered space read its mirror tier's one copy up to the read
+/// budget (`ntfstier` without a disk: 2 s, 54 s on a test VM, past the 40 s
+/// the checks of a space may take; found by the VM checks of plan item
+/// 3.17).
+#[test]
+fn listed_runs_with_one_copy_at_hand_are_not_read() {
+    let images = images("mirror2");
+    let disks: Vec<Overlay<&SparseImage>> = images.iter().map(Overlay::new).collect();
+    {
+        let pool = Pool::open(disks.iter().collect::<Vec<_>>()).unwrap();
+        let id = pool.user_spaces().next().unwrap().id();
+        list(&pool, &disks, id, &[0]);
+    }
+    let one = Counting {
+        inner: &disks[0],
+        read: AtomicU64::new(0),
+    };
+    let pool = Pool::open(vec![&one]).unwrap();
+    let id = pool.user_spaces().next().unwrap().id();
+    let reader = pool.open_space(id).unwrap();
+    let before = one.read.load(Ordering::Relaxed);
+    let c = reader.check_dirty_regions(Some(16 << 20)).unwrap().unwrap();
+    assert_eq!(c.unreadable, 16 << 20, "{c:?}");
+    assert_eq!(one.read.load(Ordering::Relaxed) - before, 0, "bytes read");
 }
 
 /// A thin mirror whose log lists four unallocated runs (1 GiB) before an

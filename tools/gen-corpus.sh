@@ -130,5 +130,10 @@ wc4k       -DiskCount 1 -SsdDisks 1 -Resiliency Simple -Columns 1 -Provisioning 
 replacedpar @New-DiskStatePool.ps1 -Scenario Replaced -Resiliency Parity
 dual7k4    -DiskCount 7 -Resiliency Parity -Redundancy 2 -Columns 7 -InterleaveKB 64 -SizeMB 2560 -LogicalSectorSize 4096
 tierodd    -DiskCount 5 -SsdDisks 2 -Tiers SSD,Mirror,1024;HDD,Simple,1536,3 -Provisioning Fixed
+# Batch 12 (1.3.1, audit 2026-10-21 SPB-01): a thin parity space of two runs
+# (its second half written after a space of one slab per disk took the
+# slabs after the first) whose column 0 Windows moved for the second run
+# only, the replaced disk holding column 0 of that run and not of the first
+replacedrun @New-DiskStatePool.ps1 -Scenario Replaced -Resiliency Parity -DiskCount 4 -SizeMB 2048 -TwoRuns
 LIST
 exit $status

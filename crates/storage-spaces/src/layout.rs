@@ -144,6 +144,8 @@ pub struct Layout {
     pub copies: u64,
     pub interleave: u64,
     runs: BTreeMap<(u64, u64), Vec<Run>>,
+    /// Each column's runs as one sequence of rows ([`Layout::column_runs`]).
+    merged: BTreeMap<u64, Vec<Run>>,
     /// Out-of-date copies per column.
     stale: BTreeMap<u64, Coverage>,
     /// The copies of `stale` with a stale marker (not those being rebuilt).
@@ -299,6 +301,7 @@ impl Layout {
             m.into_iter().map(|(c, runs)| Ok((c, Coverage::new(&runs)?))).collect()
         };
         let (stale, outdated) = (cover(stale)?, cover(outdated)?);
+        let merged = merge_copies(&runs);
         Ok(Layout {
             resiliency: policy.resiliency,
             columns: policy.columns,
@@ -313,6 +316,7 @@ impl Layout {
             copies,
             interleave: policy.interleave,
             runs,
+            merged,
             stale,
             outdated,
             used,
@@ -396,16 +400,20 @@ impl Layout {
         stripe - self.run_first_row(stripe / per_row) * per_row
     }
 
-    /// The extent runs of the first current copy of `column`. A column of
-    /// one copy is numbered 0 until Windows moves it to another disk, which
-    /// numbers it 1 (**verified**: column 0 of the parity space of
-    /// `replacedpar`); 1.2.2 looked at copy 0 alone, and could not read
-    /// such a space degraded (audit 2026-10-16, S9).
+    /// The extent runs of `column` in row order: those of its first current
+    /// copy, and of a later copy for the rows no earlier one maps. A column
+    /// of one copy is numbered 0 until Windows moves it to another disk,
+    /// which numbers what it moved 1: all of it (**verified**: column 0 of
+    /// the parity space of `replacedpar`) or the runs on the disk it
+    /// replaced only (**verified**: `replacedrun`, column 0 copy 0 in rows 0
+    /// and 1, copy 1 in rows 2 and 3). Parity rotation, the logs' runs and
+    /// the writer count from these runs. 1.2.2 looked at copy 0 alone and
+    /// could not read the first degraded (audit 2026-10-16, S9); 1.3.0
+    /// looked at the first copy present alone and read rows of the second
+    /// whose run it did not see with the rotation of row 0, wrong data from
+    /// a healthy pool (audit 2026-10-21, SPB-01).
     pub fn column_runs(&self, column: u64) -> Option<&Vec<Run>> {
-        self.runs
-            .range((column, 0)..=(column, u64::MAX))
-            .next()
-            .map(|(_, runs)| runs)
+        self.merged.get(&column)
     }
 
     /// Where `row` of `column` lives in its first current copy that maps
@@ -630,6 +638,51 @@ impl Layout {
     }
 }
 
+/// Each column's runs merged over its copies ([`Layout::column_runs`]): the
+/// copies in order, each adding what of its runs lies in rows the earlier
+/// ones do not map (whole runs as Windows numbers them; a run that overlaps
+/// the rows of an earlier copy, which a mirror's later copies do, adds only
+/// the rows outside them, as a run of their own). Each list sorted, its
+/// runs apart.
+fn merge_copies(runs: &BTreeMap<(u64, u64), Vec<Run>>) -> BTreeMap<u64, Vec<Run>> {
+    let mut merged: BTreeMap<u64, Vec<Run>> = BTreeMap::new();
+    for (&(column, _), list) in runs {
+        let earlier = merged.entry(column).or_default();
+        let mut added = Vec::new();
+        for r in list {
+            let end = r.first_row + r.rows;
+            // The rows of `r` that no run of an earlier copy maps.
+            let mut row = r.first_row;
+            let i = earlier.partition_point(|e| e.first_row + e.rows <= row);
+            for e in &earlier[i..] {
+                if e.first_row >= end {
+                    break;
+                }
+                if e.first_row > row {
+                    added.push(piece(r, row, e.first_row));
+                }
+                row = row.max(e.first_row + e.rows);
+            }
+            if row < end {
+                added.push(piece(r, row, end));
+            }
+        }
+        earlier.extend(added);
+        earlier.sort_by_key(|r| r.first_row);
+    }
+    merged
+}
+
+/// The rows `from..to` of run `r`, as a run.
+fn piece(r: &Run, from: u64, to: u64) -> Run {
+    Run {
+        first_row: from,
+        rows: to - from,
+        disk_id: r.disk_id,
+        physical_slab: r.physical_slab + (from - r.first_row),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -781,5 +834,88 @@ mod tests {
         assert_eq!(l.physical(0, 0, 1), Some((1, 11)));
         assert_eq!(l.physical(0, 0, 2), None);
         assert_eq!(l.physical(0, 0, 5), Some((1, 3)));
+    }
+
+    /// Single parity of three columns, a run per row: column 0 of row 0 at
+    /// copy 0, of row 1 at copy 1 (as Windows leaves a thin parity space
+    /// whose disk under row 1's column 0 it replaced: `replacedrun`).
+    /// Column 0's runs are both rows', row 1 starts a run of its own and its
+    /// first stripe rotates from 0, unit 0 in column 0. 1.3.0 saw copy 0
+    /// alone: row 1 rotated from row 0, unit 0 in column 2 (audit
+    /// 2026-10-21, SPB-01; the auditor's case).
+    #[test]
+    fn a_column_moved_for_some_rows_keeps_their_runs() {
+        let p = Policy {
+            resiliency: Resiliency::Parity,
+            redundancy: 1,
+            copies: 1,
+            groups: 1,
+            columns: 3,
+            interleave: 256 << 10,
+        };
+        let e = |virtual_slab, column, copy, disk_id, physical_slab| ExtentRecord {
+            flags: 0,
+            stale_marker: ExtentRecord::CURRENT,
+            space_id: 1,
+            virtual_slab,
+            column,
+            copy,
+            slab_count: 1,
+            disk_id,
+            physical_slab,
+        };
+        let extents = [
+            e(0, 0, 0, 1, 0),
+            e(0, 1, 0, 2, 0),
+            e(0, 2, 0, 3, 0),
+            e(2, 0, 1, 4, 0),
+            e(2, 1, 0, 2, 1),
+            e(2, 2, 0, 3, 1),
+        ];
+        let l = Layout::new(&p, &extents).unwrap();
+        let runs: Vec<(u64, u64)> = l
+            .column_runs(0)
+            .unwrap()
+            .iter()
+            .map(|r| (r.first_row, r.disk_id))
+            .collect();
+        assert_eq!(runs, [(0, 1), (1, 4)]);
+        assert_eq!((l.run_first_row(1), l.run_start_offset(1)), (1, 2 * SLAB_SIZE));
+        let loc = l.locate(2 * SLAB_SIZE);
+        assert_eq!((loc.row, l.stripe_of(&loc), loc.column), (1, 0, 0));
+        assert_eq!(l.current(0, 1), Some((4, 0)));
+    }
+
+    /// A mirror whose second copy maps a row the first does not: the row is
+    /// in column 0's runs, the rows both copies map once, the first copy's.
+    #[test]
+    fn copies_are_merged_without_doubling_rows() {
+        let p = Policy {
+            resiliency: Resiliency::Mirror,
+            redundancy: 1,
+            copies: 2,
+            groups: 1,
+            columns: 1,
+            interleave: 256 << 10,
+        };
+        let e = |virtual_slab, copy, slab_count, disk_id, physical_slab| ExtentRecord {
+            flags: 0,
+            stale_marker: ExtentRecord::CURRENT,
+            space_id: 1,
+            virtual_slab,
+            column: 0,
+            copy,
+            slab_count,
+            disk_id,
+            physical_slab,
+        };
+        let l = Layout::new(&p, &[e(0, 0, 2, 1, 5), e(0, 1, 3, 2, 7)]).unwrap();
+        let runs: Vec<(u64, u64, u64, u64)> = l
+            .column_runs(0)
+            .unwrap()
+            .iter()
+            .map(|r| (r.first_row, r.rows, r.disk_id, r.physical_slab))
+            .collect();
+        assert_eq!(runs, [(0, 2, 1, 5), (2, 1, 2, 9)]);
     }
 }

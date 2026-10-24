@@ -605,7 +605,15 @@ parity column, rebuilt on another disk) becomes copy 1 (**verified**:
 retired and removed); readers and writers take a column's current copy
 whatever its number. 1.2.2 took copy 0 in the parity paths: such a space
 could not be read with a disk missing, nor written (tests of
-`crates/storage-spaces/tests/moved_columns.rs`).
+`crates/storage-spaces/tests/moved_columns.rs`). Windows moves only what
+lay on the disk it replaced: in `replacedrun` (a thin parity space, a run
+of extents per row) column 0 of rows 2 and 3 became copy 1 on the new
+disk, while rows 0 and 1 kept it at copy 0 (**verified**). A column's runs
+are then those of all its current copies in row order, and parity
+rotation, the logs' runs and the writer count from them; 1.3.0 counted
+from the runs of the column's first copy alone and read row 2 of the
+healthy `replacedrun` wrong (test
+`a_column_moved_for_some_rows_is_read_as_written`).
 A disk that misses writes without a replacement (**verified** byte for byte
 by the test `a_returning_disk_is_updated_first_and_the_others_at_repair`
 on the scenario `m5stale`: two-way mirror on two disks, one detached while
@@ -713,7 +721,9 @@ Column offset `o` is in row `o / 256 MiB` of the column.
   in column `(parity + 1 + i) % C`. Parity = XOR of the data units. The
   stripe number `s` counts from the first row of the extent run (type 4
   record) that holds the stripe (**verified**: `mapar`, whose parity tier has
-  one run per row; pools with a single run cannot tell the difference).
+  one run per row, and `replacedrun`, a thin parity space of a run per row
+  that reads as written only so; pools with a single run cannot tell the
+  difference).
 * Dual parity (`redundancy 2`): `D = columns - 2`; the two parity units of
   stripe `s` are in columns `P = (C - 2 - 2s) mod C` and `P + 1`, data unit
   `i` in column `(P + 2 + i) % C` (**verified**: pool `dual7`, 7 columns).

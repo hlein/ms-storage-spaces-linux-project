@@ -182,11 +182,13 @@ fn reads_fail_over_when_a_disk_disappears() {
     ];
     // The same configurations created by Windows 11 24H2; a parity space
     // whose column 0 Windows moved to another disk (audit 2026-10-16, S9:
-    // reads that knew only copy 0 of column 0).
+    // reads that knew only copy 0 of column 0), and one where it moved
+    // column 0 of some rows only (audit 2026-10-21, SPB-01: rotation counted
+    // from the runs of copy 0 alone).
     let names = base
         .iter()
         .flat_map(|n| [n.to_string(), format!("{n}_26100")])
-        .chain(["replacedpar".to_string()]);
+        .chain(["replacedpar".to_string(), "replacedrun".to_string()]);
     for name in names {
         let name = name.as_str();
         let dir = Path::new(env!("CARGO_MANIFEST_DIR"))

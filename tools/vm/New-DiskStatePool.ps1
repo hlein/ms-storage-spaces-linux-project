@@ -20,6 +20,15 @@ Scenarios:
   Usages       five members; after the space is created one member is set to
                Manual-Select, one to Hot Spare and one to Journal (if Windows
                accepts it), one to SSD and one to HDD media
+
+-TwoRuns: the space is thin, and its first half is filled before a simple
+space of one slab on every disk ("<name>-gap", filled too) takes the slabs
+after those rows, its second half after that: the second half's rows get a
+run of extents of their own. (A fixed space grown the same way ended in one
+run per column: Windows laid the growth out after the first run.) The disk
+Replaced retires is then the one under column 0 of the last run, which must
+not be the one under column 0 of the first (the script stops otherwise):
+Windows moves column 0 of some rows only.
 #>
 param(
     [Parameter(Mandatory)] [string] $Name,
@@ -28,6 +37,7 @@ param(
     [int] $DiskCount = 3,
     [int] $DiskSizeMB = 8192,
     [int] $SizeMB = 1024,
+    [switch] $TwoRuns,
     [int] $ThrottleMBps = 30,
     [string] $Root = 'C:\sstest'
 )
@@ -58,17 +68,20 @@ public static class SsPattern {
         }
     }
     public static void Fill(string device, long size, string tag, long maxBytesPerSecond) {
+        FillRange(device, 0, size, tag, maxBytesPerSecond);
+    }
+    public static void FillRange(string device, long from, long size, string tag, long maxBytesPerSecond) {
         byte[] t = System.Text.Encoding.ASCII.GetBytes(tag);
         const int chunk = 4 << 20;
         byte[] buf = new byte[chunk];
         var clock = System.Diagnostics.Stopwatch.StartNew();
         using (var fs = new FileStream(device, FileMode.Open, FileAccess.ReadWrite, FileShare.ReadWrite, 4096, FileOptions.WriteThrough)) {
-            for (long pos = 0; pos < size; pos += chunk) {
+            for (long pos = from; pos < size; pos += chunk) {
                 int n = (int)Math.Min(chunk, size - pos);
                 for (int b = 0; b < n; b += 4096) FillBlock(buf, b, (ulong)(pos + b), t);
                 fs.Position = pos;
                 fs.Write(buf, 0, n);
-                long due = (pos + n) * 1000 / maxBytesPerSecond - clock.ElapsedMilliseconds;
+                long due = (pos - from + n) * 1000 / maxBytesPerSecond - clock.ElapsedMilliseconds;
                 if (due > 0) System.Threading.Thread.Sleep((int)due);
             }
             fs.Flush(true);
@@ -98,22 +111,24 @@ function Get-Extents($v) {
         }
     })
 }
-function Write-Pattern($vdName) {
+# The pattern over [from, to) of the space (all of it by default).
+function Write-Pattern($vdName, [int64]$from = 0, [int64]$to = -1) {
     $v = Get-VirtualDisk -FriendlyName $vdName
     $d = $v | Get-Disk
     if ($d.IsOffline) { $d | Set-Disk -IsOffline $false }
     if ($d.IsReadOnly) { $d | Set-Disk -IsReadOnly $false }
-    [SsPattern]::Fill("\\.\PhysicalDrive$($d.Number)", $v.Size, $vdName, [int64]$ThrottleMBps * 1MB)
+    if ($to -lt 0) { $to = $v.Size }
+    [SsPattern]::FillRange("\\.\PhysicalDrive$($d.Number)", $from, $to, $vdName, [int64]$ThrottleMBps * 1MB)
 }
-function New-Space($vdName, [int]$mb) {
+function New-Space($vdName, [int]$mb, [string]$provisioning = 'Fixed', [switch]$NoPattern) {
     if ($Resiliency -eq 'Parity') {
         New-VirtualDisk -StoragePoolFriendlyName $poolName -FriendlyName $vdName -ResiliencySettingName Parity `
-            -PhysicalDiskRedundancy 1 -NumberOfColumns 3 -ProvisioningType Fixed -Size ([int64]$mb * 1MB) | Out-Null
+            -PhysicalDiskRedundancy 1 -NumberOfColumns 3 -ProvisioningType $provisioning -Size ([int64]$mb * 1MB) | Out-Null
     } else {
         New-VirtualDisk -StoragePoolFriendlyName $poolName -FriendlyName $vdName -ResiliencySettingName Mirror `
-            -NumberOfDataCopies 2 -NumberOfColumns 1 -ProvisioningType Fixed -Size ([int64]$mb * 1MB) | Out-Null
+            -NumberOfDataCopies 2 -NumberOfColumns 1 -ProvisioningType $provisioning -Size ([int64]$mb * 1MB) | Out-Null
     }
-    Write-Pattern $vdName
+    if (-not $NoPattern) { Write-Pattern $vdName }
 }
 function Wait-Repair {
     while (Get-StorageJob | Where-Object { $_.JobState -eq 'Running' }) { Start-Sleep -Seconds 2 }
@@ -127,14 +142,34 @@ $physical = foreach ($f in $images) { New-Vhdx $f }
 $subsystem = Get-StorageSubSystem | Where-Object FriendlyName -like 'Windows Storage*' | Select-Object -First 1
 $poolName = "ss-$Name"
 New-StoragePool -FriendlyName $poolName -StorageSubSystemUniqueId $subsystem.UniqueId -PhysicalDisks $physical | Out-Null
-New-Space $Name $SizeMB
+$extras = @()
+if ($TwoRuns) {
+    $half = [int64]$SizeMB * 1MB / 2
+    New-Space $Name $SizeMB 'Thin' -NoPattern
+    Write-Pattern $Name 0 $half
+    New-VirtualDisk -StoragePoolFriendlyName $poolName -FriendlyName "$Name-gap" -ResiliencySettingName Simple `
+        -NumberOfColumns $DiskCount -ProvisioningType Fixed -Size ([int64]$DiskCount * 256MB) | Out-Null
+    Write-Pattern "$Name-gap"
+    $extras += "$Name-gap"
+    Write-Pattern $Name $half
+} else {
+    New-Space $Name $SizeMB
+}
 $vd = Get-VirtualDisk -FriendlyName $Name
 
-# The member holding copy 0 of column 0 at the start of the space.
-$first = $vd | Get-PhysicalExtent |
-    Where-Object { $_.VirtualDiskOffset -eq 0 -and $_.ColumnNumber -eq 0 -and $_.CopyNumber -eq 0 } | Select-Object -First 1
+# The member holding copy 0 of column 0 at the start of the space (with
+# -TwoRuns: of its last run, when another disk holds the first).
+$column0 = @($vd | Get-PhysicalExtent | Where-Object { $_.ColumnNumber -eq 0 -and $_.CopyNumber -eq 0 } |
+    Sort-Object VirtualDiskOffset)
+$first = $column0 | Where-Object { $_.VirtualDiskOffset -eq 0 } | Select-Object -First 1
+if ($TwoRuns) {
+    $last = $column0[-1]
+    if ($last.PhysicalDiskUniqueId -eq $first.PhysicalDiskUniqueId) {
+        throw "column 0 of both runs is on one disk ($($first.PhysicalDiskUniqueId)): no partial move"
+    }
+    $first = $last
+}
 $victim = Get-PhysicalDisk -UniqueId $first.PhysicalDiskUniqueId
-$extras = @()
 $extentsKnown = $true
 switch ($Scenario) {
     'Retired' {

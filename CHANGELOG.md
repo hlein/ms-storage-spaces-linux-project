@@ -4,6 +4,16 @@
 
 ### Fixes
 
+* A parity space whose disk Windows replaced under some of its extent runs
+  read wrong data from the rows of those runs, healthy, and nothing failed.
+  A thin space has a run of extents per allocation; Windows moves only the
+  runs on the replaced disk and numbers what it moved copy 1. The parity
+  rotation counts from the first row of each run, and 1.3.0 (as 1.2.2) saw
+  only the runs of column 0's first copy: it rotated a moved run from the
+  rows of another. A write into a moved run was refused. (Scrub saw nothing:
+  a stripe's units agree with single parity whatever the rotation.) A
+  column's runs are now those of all its current copies (the Windows pool
+  `replacedrun` reads as written, healthy and with any disk missing).
 * The checks of a pool of many spaces (`spaces attach`, `spaces check`)
   took about three times as long as in 1.2.2: 1.3.0's check for unmapped
   fixed spaces looked up each space's hidden spaces among all the pool's

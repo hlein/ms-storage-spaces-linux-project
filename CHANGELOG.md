@@ -22,6 +22,18 @@
   and the second degraded, and the writer refuses both: 1.3.0 wrote into
   such a thin row by allocating it again, its pool database then holding two
   extents for one column on every disk, and the pool no longer opened.
+* A space whose hidden structures or tiers do not hold what the records
+  name was called healthy (audit 2026-10-21, SPB-02, SPG-02): a write-back
+  cache whose header puts its chunks where the cache space has no extent
+  (1.3.0 read the data the cache held as zeros), beyond that space or over
+  its slot area, a parity journal whose areas lie so, and a fixed tiered
+  space one of whose tiers lost all its extent records, or whose tiers end
+  before it does (the rest read as zeros). Such spaces fail now: they are
+  not read or written, and `health()` does not know the state of the tiered
+  ones. `health()` also laid every tier out from the start of the space
+  rather than its own, so that a tier starting off a whole row of its own
+  layout made the space's state unknown (SPA-05); it is laid out as it is
+  read.
 * The checks of a pool of many spaces (`spaces attach`, `spaces check`)
   took about three times as long as in 1.2.2: 1.3.0's check for unmapped
   fixed spaces looked up each space's hidden spaces among all the pool's

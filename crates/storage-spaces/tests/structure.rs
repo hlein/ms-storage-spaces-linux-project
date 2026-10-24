@@ -2,11 +2,16 @@
 //! database, or a hostile one): not called healthy, and not written where
 //! writing would make the database worse (audit 2026-10-21, SPA-01). The
 //! pools are made by the planner on images in memory.
+use std::fs::File;
+use std::path::Path;
+
+use storage_spaces::cache::{CacheHeader, SPCACHE_SIGNATURE};
 use storage_spaces::database::Database;
-use storage_spaces::format::{ExtentRecord, POOL_DB_OFFSET, Policy, Resiliency, SLAB_SIZE};
+use storage_spaces::format::{ExtentRecord, POOL_DB_OFFSET, Policy, Resiliency, SLAB_SIZE, SpaceRole};
 use storage_spaces::guard::{self, Options};
 use storage_spaces::health::{HealthStatus, health};
 use storage_spaces::io::{Overlay, SparseImage, WriteAt};
+use storage_spaces::journal::SPVDT_SIGNATURE;
 use storage_spaces::layout::{Condition, Layout};
 use storage_spaces::ops::{BlankDisk, SpaceSpec, check_pool, plan_create_pool, plan_create_space};
 use storage_spaces::report::Verdict;
@@ -162,4 +167,188 @@ fn a_mirror_row_short_of_a_copy_is_degraded() {
     let l = Layout::new(&policy, &[copy0, copy1, third]).unwrap();
     let r = l.redundancy(|_| true, |_| false);
     assert_eq!((r.left, r.short), (Some(1), false));
+}
+
+fn images(name: &str) -> Vec<SparseImage> {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures").join(name);
+    (0..)
+        .map_while(|i| File::open(dir.join(format!("disk{i}.fixture"))).ok())
+        .map(|f| SparseImage::read_from(f).unwrap())
+        .collect()
+}
+
+/// A write-back cache whose header names its chunks where its space has no
+/// extent (at 512 GiB in a cache of 1 GiB) or over its own slot area: the
+/// space is not read or written, and the guard fails it. 1.3.0 called the
+/// first healthy and read the chunks the cache holds as zeros (the
+/// auditor's spb_02).
+#[test]
+fn a_cache_header_naming_regions_its_space_does_not_hold_fails() {
+    let images = images("parity3_26100");
+    for (what, data_offset) in [("unmapped", 512u64 << 30), ("over the slots", 0x2000)] {
+        let disks: Vec<Overlay<&SparseImage>> = images.iter().map(Overlay::new).collect();
+        {
+            let pool = Pool::open(disks.iter().collect::<Vec<_>>()).unwrap();
+            let id = pool.find_space("parity3_26100").unwrap().id();
+            let w = pool.open_space_rw(id).unwrap();
+            w.write_all_at(&[0xa5; 4096], 0).unwrap();
+            w.flush().unwrap();
+            drop(w);
+            let mut header = pool.open_space(id).unwrap().cache().unwrap().header.clone();
+            header.data_offset = data_offset;
+            let bytes = header.encode(SPCACHE_SIGNATURE);
+            let container = pool.children(id).find(|c| c.info.role == SpaceRole::Cache).unwrap();
+            let child = pool.children(container.id()).next().unwrap();
+            let l = Layout::new(child.info.policy.as_ref().unwrap(), &child.extents).unwrap();
+            for copy in l.copies_of(0) {
+                let (disk, slab) = l.physical(0, copy, 0).unwrap();
+                let (device, at) = pool.slab_location(disk, slab).unwrap().unwrap();
+                disks[device].write_all_at(&bytes, at).unwrap();
+            }
+        }
+        let pool = Pool::open(disks.iter().collect::<Vec<_>>()).unwrap();
+        let space = pool.find_space("parity3_26100").unwrap();
+        let Err(e) = pool.open_space(space.id()) else {
+            panic!("{what}: the space opened")
+        };
+        assert!(e.to_string().contains("of the write-back cache"), "{what}: {e}");
+        let report = guard::space_report(&pool, space, &[], &Options::default(), &mut |_, _, _| Vec::new());
+        assert_eq!(report.verdict(), Verdict::Failed, "{what}: {}", report.to_text());
+        assert!(pool.open_space_rw(space.id()).is_err(), "{what}: opened for writing");
+    }
+}
+
+/// A parity journal whose header puts its slot area beyond its space (at
+/// 512 GiB in a journal of 256 MiB) or its checkpoint areas over the slots:
+/// the space is not read, and the guard fails it. 1.3.0 read the slots there
+/// as zeros, an empty journal, and called the space healthy.
+#[test]
+fn a_journal_header_naming_regions_its_space_does_not_hold_fails() {
+    let images = images("parity3_26100");
+    for what in ["slots beyond", "checkpoints over the slots"] {
+        let disks: Vec<Overlay<&SparseImage>> = images.iter().map(Overlay::new).collect();
+        {
+            let pool = Pool::open(disks.iter().collect::<Vec<_>>()).unwrap();
+            let id = pool.find_space("parity3_26100").unwrap().id();
+            let container = pool
+                .children(id)
+                .find(|c| c.info.role == SpaceRole::Other(0x0a))
+                .unwrap();
+            let child = pool.children(container.id()).next().unwrap();
+            let mut b = [0u8; CacheHeader::SIZE];
+            pool.open_space(child.id()).unwrap().read_exact_at(&mut b, 0).unwrap();
+            let (u64_at, u32_at) = (
+                |at: usize| u64::from_le_bytes(b[at..at + 8].try_into().unwrap()),
+                |at: usize| u32::from_le_bytes(b[at..at + 4].try_into().unwrap()),
+            );
+            let mut header = CacheHeader {
+                owner_guid: Guid::from_mixed_endian(b[8..24].try_into().unwrap()),
+                sequence: u64_at(0x28),
+                slot_offset: u64_at(0x30),
+                slot_size: u32_at(0x38),
+                slot_count: u32_at(0x3c),
+                checkpoint_offset: u64_at(0x40),
+                checkpoint_size: u32_at(0x48),
+                checkpoint_count: u32_at(0x4c),
+                data_offset: u64_at(0x50),
+                chunk_size: u32_at(0x58),
+                chunk_count: u32_at(0x5c),
+            };
+            match what {
+                "slots beyond" => header.slot_offset = 512 << 30,
+                _ => header.checkpoint_offset = 0x3000,
+            }
+            let bytes = header.encode(SPVDT_SIGNATURE);
+            let l = Layout::new(child.info.policy.as_ref().unwrap(), &child.extents).unwrap();
+            for copy in l.copies_of(0) {
+                let (disk, slab) = l.physical(0, copy, 0).unwrap();
+                let (device, at) = pool.slab_location(disk, slab).unwrap().unwrap();
+                disks[device].write_all_at(&bytes, at).unwrap();
+            }
+        }
+        let pool = Pool::open(disks.iter().collect::<Vec<_>>()).unwrap();
+        let space = pool.find_space("parity3_26100").unwrap();
+        let Err(e) = pool.open_space(space.id()) else {
+            panic!("{what}: the space opened")
+        };
+        assert!(e.to_string().contains("of the parity journal"), "{what}: {e}");
+        let report = guard::space_report(&pool, space, &[], &Options::default(), &mut |_, _, _| Vec::new());
+        assert_eq!(report.verdict(), Verdict::Failed, "{what}: {}", report.to_text());
+    }
+}
+
+/// A fixed tiered space one of whose tiers lost all its extent records, or
+/// whose tiers end before the space does: its state is not known to
+/// health(), the guard fails it and it is not read. 1.3.0 called both
+/// healthy and read the rest as zeros (the auditor's spg02).
+#[test]
+fn a_tiered_space_whose_tiers_do_not_hold_it_fails() {
+    for what in ["a tier without extents", "tiers short of the space"] {
+        let mut pool = Pool::open(images("tiered")).unwrap();
+        let id = pool.user_spaces().next().unwrap().id();
+        let hdd = pool
+            .children(id)
+            .find(|c| c.info.is_child && c.info.range.is_some_and(|(start, _)| start > 0))
+            .unwrap()
+            .id();
+        match what {
+            "a tier without extents" => pool.spaces.get_mut(&hdd).unwrap().extents.clear(),
+            _ => pool.spaces.get_mut(&id).unwrap().info.size = Some(3 << 30),
+        }
+        let h = health(&pool).unwrap();
+        assert!(h.spaces.iter().all(|s| s.id != id), "{what}: {:?}", h.spaces);
+        assert!(h.unknown.iter().any(|(s, _)| *s == id), "{what}: {:?}", h.unknown);
+        let space = &pool.spaces[&id];
+        let report = guard::space_report(&pool, space, &[], &Options::default(), &mut |_, _, _| Vec::new());
+        assert_eq!(report.verdict(), Verdict::Failed, "{what}: {}", report.to_text());
+        assert!(pool.open_space(id).is_err(), "{what}: the space opened");
+    }
+}
+
+/// A tiered space whose first tier is one slab and whose second has two
+/// columns: the second tier's rows count from its range's start, so the
+/// space is healthy, as the reader takes it. 1.3.0's health() laid the tier
+/// out from 0 and found its extent "not aligned to a row" (the auditor's
+/// spa_05).
+#[test]
+fn a_tier_is_laid_out_from_its_own_start_by_health() {
+    let mut pool = Pool::open(images("tiered")).unwrap();
+    let id = pool.user_spaces().next().unwrap().id();
+    let tiers: Vec<u64> = pool
+        .children(id)
+        .filter(|c| c.info.is_child && !c.extents.is_empty())
+        .map(|c| c.id())
+        .collect();
+    assert_eq!(tiers.len(), 2);
+    let t0 = pool.spaces.get_mut(&tiers[0]).unwrap();
+    let mut policy = t0.info.policy.unwrap();
+    policy.columns = 1;
+    t0.info.policy = Some(policy);
+    t0.info.range = Some((0, SLAB_SIZE));
+    t0.extents.retain(|e| e.column == 0 && e.virtual_slab == 0);
+    for e in &mut t0.extents {
+        e.slab_count = 1;
+    }
+    let t1 = pool.spaces.get_mut(&tiers[1]).unwrap();
+    let mut policy = t1.info.policy.unwrap();
+    policy.columns = 2;
+    (policy.resiliency, policy.redundancy, policy.copies) = (Resiliency::Simple, 0, 1);
+    t1.info.policy = Some(policy);
+    t1.info.range = Some((SLAB_SIZE, 2 * SLAB_SIZE));
+    let column = |column: u64, e: &ExtentRecord| ExtentRecord {
+        flags: 4,
+        stale_marker: ExtentRecord::CURRENT,
+        space_id: tiers[1],
+        virtual_slab: 1,
+        column,
+        copy: 0,
+        slab_count: 1,
+        ..*e
+    };
+    t1.extents = vec![column(0, &t1.extents[0]), column(1, &t1.extents[1])];
+    pool.spaces.get_mut(&id).unwrap().info.size = Some(3 * SLAB_SIZE);
+    assert!(pool.open_space(id).is_ok());
+    let h = health(&pool).unwrap();
+    assert!(h.unknown.is_empty(), "{:?}", h.unknown);
+    assert_eq!(h.spaces[0].state.to_string(), "Healthy / OK");
 }

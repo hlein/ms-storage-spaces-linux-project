@@ -150,7 +150,12 @@ pub fn health<D: ReadAt>(pool: &Pool<D>) -> Result<Health> {
         let layouts = family
             .iter()
             .filter(|s| !s.extents.is_empty())
-            .filter_map(|s| s.info.policy.as_ref().map(|policy| Layout::new(policy, &s.extents)))
+            .filter_map(|s| {
+                // A tier's rows count from the start of its range.
+                let base = s.info.range.map_or(0, |(start, _)| start);
+                let policy = s.info.policy.as_ref()?;
+                Some(Layout::with_base(policy, &s.extents, base))
+            })
             .collect::<Result<Vec<Layout>>>();
         let layouts = match layouts {
             Ok(l) => l,

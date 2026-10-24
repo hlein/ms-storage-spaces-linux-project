@@ -304,7 +304,8 @@ four HDD disks and a four-column simple tier):
   HDD tier starts at a whole row of its own: an SSD tier asked for with
   1 GiB over an HDD tier of three columns (rows of 768 MiB) became 1.5 GiB
   (**verified**: `tierodd`, test `windows_starts_tiers_at_whole_rows`; a
-  tier off its rows, which `health()` lays out from 0, does not come).
+  tier off its rows does not come, though `spaces` lays each tier out from
+  its own start, `health()` too since 1.3.1).
 * The cache's chunks are a data stripe of the HDD tier (512 KiB over two
   data columns, 1 MiB over four); the parity journal's runs are an HDD row
   (allocation unit times data columns), counted over the whole space
@@ -582,7 +583,12 @@ extents. After the parent id a type 6 record holds `u32`, then the start and
 length of the child within the parent's address space (`u64` BE each: SSD
 0/1 GiB, HDD 1 GiB/2 GiB; a cache child covers its own size from 0). Extent
 virtual slab numbers are those of the parent space; rows and parity rotation
-of a tier count from the tier's start. Tier templates created with
+of a tier count from the tier's start. The tiers follow one another from 0
+to the size of the space (**verified**: `tiered`, `mapar`, `ntfstier`,
+`ntfsmapar`, `tierodd`); a fixed tiered space whose tiers leave a gap,
+overlap or end before it does, or one of whose tiers has no extent, is not
+read: what they leave would read as zeros (audit 2026-10-21, SPG-02). Tier
+templates created with
 `New-StorageTier` are separate type 6 records without extents (see
 "Storage tiers" under creating a space).
 
@@ -790,6 +796,14 @@ The cache space starts with a header:
 | 0x50 | 8 | data area offset |
 | 0x58 | 4 | chunk size = owner full data stripe (data columns x interleave) |
 | 0x5c | 4 | number of chunks in the data area |
+
+The header, the slot area, the checkpoint areas and the data area follow
+one another in the cache space without overlapping, all on rows its extents
+map (**verified**: the 153 caches and parity journals of the corpus, a
+journal having no data area: its 0x50 is a size). `spaces` does not read a
+space whose cache or journal header names a region beyond its space, on a
+row without an extent (it would read as zeros) or over another region
+(audit 2026-10-21, SPB-02).
 
 Slots ("SPSLOT\0\0"): same GUID, size and CRC fields as the header, `u32 type`
 at 0x20 (0 = mapping, 1 = initialisation record, see below), `u64 sequence` at

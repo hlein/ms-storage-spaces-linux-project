@@ -678,6 +678,71 @@ impl<D: ReadAt> Mapped<'_, D> {
             "the header of the {what} does not check out on any copy at hand: {why}"
         ))
     }
+
+    /// Checks the regions the header of the hidden structure `part` names
+    /// ([`log_regions`]): each inside the structure's `size` bytes, on rows
+    /// every column has an extent for (an unmapped row reads as zeros), and
+    /// none overlapping another or the header (audit 2026-10-21, SPB-02).
+    fn check_regions(&self, part: Part, size: u64, regions: &[(&str, u64, u64)]) -> Result<()> {
+        let l = &self.layout;
+        let row = SLAB_SIZE * l.data_columns;
+        let mut named: Vec<&(&str, u64, u64)> = regions.iter().filter(|r| r.2 > 0).collect();
+        named.sort_by_key(|r| r.1);
+        for &&(what, offset, len) in &named {
+            let place = || format!("the {what} of the {} ({len:#x} bytes at {offset:#x})", part.name());
+            let end = offset.checked_add(len).filter(|&end| end <= size);
+            let Some(end) = end else {
+                return Err(format_err!("{} reaches beyond its {size:#x} bytes", place()));
+            };
+            let unmapped = match offset.checked_sub(l.base) {
+                Some(from) => l.unmapped_in(from / row..(end - l.base).div_ceil(row)),
+                None => Some(0),
+            };
+            if let Some(r) = unmapped {
+                return Err(format_err!("{} lies on row {r}, which has no extent", place()));
+            }
+        }
+        for pair in named.windows(2) {
+            let ((a, a_at, a_len), (b, b_at, _)) = (pair[0], pair[1]);
+            if a_at + a_len > *b_at {
+                return Err(format_err!(
+                    "the {a} of the {} ({a_len:#x} bytes at {a_at:#x}) overlaps its {b} (at {b_at:#x})",
+                    part.name()
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// What the header of a write-back cache or parity journal names in its
+/// space, as (what, offset, length): the header itself, the slot area (from
+/// its offset, slot size and count), the checkpoint areas (offset, size of
+/// each, count) and the chunks (offset and bytes; none for a journal, whose
+/// header has the size of an extent run there).
+fn log_regions(
+    slots: (u64, u32, u32),
+    checkpoints: (u64, u32, u32),
+    data: (u64, u64),
+) -> [(&'static str, u64, u64); 4] {
+    [
+        ("header", 0, CacheHeader::SIZE as u64),
+        ("slot area", slots.0, u64::from(slots.1) * u64::from(slots.2)),
+        (
+            "checkpoint areas",
+            checkpoints.0,
+            u64::from(checkpoints.1) * u64::from(checkpoints.2),
+        ),
+        ("data area", data.0, data.1),
+    ]
+}
+
+/// The size of a hidden space: its range's, or what its extents map.
+fn hidden_size<D>(space: &Space, mapped: &Mapped<'_, D>) -> u64 {
+    space
+        .info
+        .range
+        .map_or_else(|| mapped.layout.mapped_size(), |(_, len)| len)
 }
 
 /// Why fixed space `space` leaves a row of its size without data, if it
@@ -707,16 +772,45 @@ pub(crate) fn unmapped(space: &Space, children: &[&Space]) -> Option<String> {
             }
         ))
     };
-    let tiers: Vec<&Space> = children
+    // Every tier the database lists, with extents or not: a tier whose
+    // extent records all went missing leaves its range without data.
+    let mut tiers: Vec<&Space> = children
         .iter()
-        .filter(|c| c.info.is_child && !c.extents.is_empty())
+        .filter(|c| c.info.is_child && (c.info.range.is_some() || !c.extents.is_empty()))
         .copied()
         .collect();
     if tiers.is_empty() {
-        gap(space, space.info.size?)
-    } else {
-        tiers.iter().find_map(|t| gap(t, t.info.range?.1))
+        return gap(space, space.info.size?);
     }
+    // The tiers follow one another from the start of the space to its end
+    // (Windows: tiered, mapar, tierodd).
+    tiers.sort_by_key(|t| t.info.range.map(|r| r.0));
+    let mut next = 0u64;
+    for t in &tiers {
+        let Some((start, len)) = t.info.range else {
+            return Some(format!(
+                "the storage tier {:?} of the fixed space {:?} has no range",
+                t.name(),
+                space.name()
+            ));
+        };
+        if start != next {
+            return Some(format!(
+                "the storage tiers of the fixed space {:?} {} at {next:#x} (the tier {:?} starts at {start:#x})",
+                space.name(),
+                if start > next { "leave a gap" } else { "overlap" },
+                t.name()
+            ));
+        }
+        next = start.saturating_add(len);
+    }
+    if let Some(size) = space.info.size.filter(|&size| next < size) {
+        return Some(format!(
+            "the storage tiers of the fixed space {:?} end at {next:#x}, before its {size:#x} bytes",
+            space.name()
+        ));
+    }
+    tiers.iter().find_map(|t| gap(t, t.info.range?.1))
 }
 
 impl<D: ReadAt> Mapped<'_, D> {
@@ -940,6 +1034,13 @@ impl<'p, D: ReadAt> SpaceReader<'p, D> {
                 header.owner_guid
             ));
         }
+        let h = &header;
+        let regions = log_regions(
+            (h.slot_offset, h.slot_size, h.slot_count),
+            (h.checkpoint_offset, h.checkpoint_size, h.checkpoint_count),
+            (h.data_offset, u64::from(h.chunk_size) * u64::from(h.chunk_count)),
+        );
+        mapped.check_regions(Part::Cache, hidden_size(child, &mapped), &regions)?;
         let index = CacheIndex::load(header, pool.logical_sector_size, Slots(&mapped, head))?;
         Ok(Some((mapped, index)))
     }
@@ -966,7 +1067,12 @@ impl<'p, D: ReadAt> SpaceReader<'p, D> {
                     mapped.no_slots_without_header(Part::Journal)?;
                     return Ok(None);
                 };
-                return ParityJournal::load(owner, Slots(&mapped, head));
+                let journal = ParityJournal::load(owner, Slots(&mapped, head))?;
+                if let Some(j) = &journal {
+                    let regions = log_regions(j.geometry(), j.checkpoint_geometry(), (0, 0));
+                    mapped.check_regions(Part::Journal, hidden_size(child, &mapped), &regions)?;
+                }
+                return Ok(journal);
             }
         }
         Ok(None)
@@ -984,10 +1090,7 @@ impl<'p, D: ReadAt> SpaceReader<'p, D> {
                 // corrupt metadata can make circular.
                 let mapped = Mapped::new(pool, child)?;
                 let base = mapped.layout.base;
-                let size = child
-                    .info
-                    .range
-                    .map_or_else(|| mapped.layout.mapped_size(), |(_, len)| len);
+                let size = hidden_size(child, &mapped);
                 return Self::drt_pages(&mapped, base, size, notes);
             }
         }

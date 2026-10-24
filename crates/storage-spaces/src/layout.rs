@@ -480,6 +480,12 @@ impl Layout {
     /// current or out of date: a row a fixed space maps (a thin one reads
     /// zeros there).
     pub fn unmapped_row(&self, rows: u64) -> Option<u64> {
+        self.unmapped_in(0..rows)
+    }
+
+    /// The first row of `rows` that a column has no extent for, current or
+    /// out of date.
+    pub fn unmapped_in(&self, rows: std::ops::Range<u64>) -> Option<u64> {
         (0..self.columns)
             .filter_map(|column| {
                 let stale = self.stale.get(&column).into_iter().flat_map(|c| {
@@ -496,14 +502,14 @@ impl Layout {
                     .chain(stale)
                     .collect();
                 covered.sort_unstable();
-                let mut next = 0;
+                let mut next = rows.start;
                 for (start, end) in covered {
                     if start > next {
                         break;
                     }
                     next = next.max(end);
                 }
-                (next < rows).then_some(next)
+                (next < rows.end).then_some(next)
             })
             .min()
     }

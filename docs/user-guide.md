@@ -259,7 +259,13 @@ that Windows reads the result back. `attach --rw` refuses, with the reason:
   diverging metadata (attach them to Windows first);
 * degraded spaces, dual parity spaces, storage tiers and mirror-accelerated
   parity;
-* write-back caches whose mirrored copies disagree after a crash.
+* write-back caches whose mirrored copies disagree after a crash;
+* a parity journal whose header counts extent runs of another size than
+  the space's, and a write-back cache or parity journal whose sequence
+  numbers are used up (within 2^32 of 2^64: no log Windows writes, a
+  damaged or hostile one). A parity journal without checkpoint areas whose
+  slots come round to the one its log is read from takes no more writes
+  (I/O errors) rather than write over the entries there.
 
 Thin spaces allocate a row (256 MiB per column and copy) when a write first
 reaches it, as Windows does: the pool database on every member records the
@@ -479,6 +485,10 @@ keeping the first mirror copy and recomputing parity from the data.
 * Dual parity spaces are not created, nor tiered spaces of other shapes
   than an SSD mirror over an HDD tier; existing ones are read, and their
   pools can be changed otherwise.
+* `space resize` grows a fixed space only where its allocation unit is
+  whole slabs and its extents map whole groups (as Windows creates them);
+  others are refused (1.3.0 wrote extents of no slabs, or over the space's
+  own, and the pool database no longer opened).
 * Pools of version 29 (Insider builds) get no new spaces; their records
   differ there. Other changes keep each record's own layout.
 * Windows 11 24H2 crashed (a bugcheck in its Storage Spaces driver) when a
@@ -523,15 +533,25 @@ volume in a space attached with `--degraded` or `--force` mounts only with
   nothing to compare it with.
 * `pool.clean`: the metadata agrees with itself and with the devices (no
   extent on a disk it does not list, no disk given twice or cloned, no two
-  records with one id).
+  records with one id, no two spaces with one GUID, no name holding a NUL
+  character, none of which Windows writes: each is suspect).
 * `space.state`: the state Windows would show (Healthy, Warning /
-  Degraded, Unhealthy).
+  Degraded, Unhealthy). Windows allocates a row's columns together: a row
+  with extents for some of its columns only lost the others' (Unhealthy,
+  failed; 1.3.0 took them for unallocated), and a mirror row with fewer
+  current copies than the space keeps (one being rebuilt, or none
+  recorded) is degraded.
 * `space.layout`: the slab map parses; no slab is mapped twice, no extent
   lies outside its space or beyond its disk's partition; a fixed space maps
   every row of its size (one with rows left without an extent lost extent
-  records, and fails).
+  records, and fails), and a fixed tiered space's tiers follow one another
+  from its start to its end, each with its extents (a tier that lost them,
+  or tiers that leave a gap, overlap or end early, fail).
 * `space.cache`: the write-back cache loads and its copies agree (cached
-  chunks are a note).
+  chunks are a note); the areas its header names (slots, checkpoints, the
+  chunks) lie inside the cache space, on rows that have extents, apart from
+  one another and from the header, or the space fails (as for the parity
+  journal's).
 * `space.journal`: the stripes the parity journal does not record as
   consistent match their parity (Windows lists stripes never written and
   those its cache holds too; up to 1 GiB is read, the rest is checked when
@@ -548,12 +568,15 @@ volume in a space attached with `--degraded` or `--force` mounts only with
   failed; a header zero everywhere is a structure never written (a note).
 * `space.partitions`: the protective MBR, both GPT headers with their
   CRCs and positions, both copies of the partition entries the same, the
-  partitions inside the space and apart; a primary header lost with the backup
-  valid is suspect, and the partitions are read from the backup (their
-  file systems are checked); a protective MBR without a GPT is suspect.
+  partitions inside the space and apart; a primary header lost or not
+  checking out, or entries that do not, with the backup valid is suspect,
+  and the partitions are read from the backup (their file systems are
+  checked); a protective MBR without a GPT is suspect. Entries of a size
+  UEFI does not have (128 bytes times a power of two) are not read; MBR
+  partitions are numbered by their slot, as the kernel numbers them.
 * `fs.ntfs`: the NTFS boot sector and its copy, in the sector after the
   volume (where Windows writes it; 1.2.2 looked in the partition's last
-  sector), agree.
+  sector), agree; a volume of no sectors is suspect.
 * `fs.refs.boot`, `fs.refs.superblock`, `fs.refs.checkpoint`,
   `fs.refs.log`: the ReFS boot sector (the volume fits its partition), the
   superblock and its two copies, both checkpoints, and that the log holds
@@ -811,7 +834,9 @@ read (`O_TMPFILE`, mode 0600; 1.2.2 made it 0644 under a name others could
 guess, for a moment), in `$REFS_TMPDIR` or the system's temporary
 directory; when it is closed or synced, what was written goes
 to the volume as Windows writes it: changed bytes where they are,
-appended data in new runs, a shortened file's tail freed, the touched
+appended data in new runs, a shortened file's tail freed and the rest of
+its new last cluster zeros on the disk too (1.3.0 left the old bytes
+there, an integrity stream's under their old checksum), the touched
 clusters of an integrity stream copied on write; what lies past a file's
 old end reads as zeros where nothing was written there, also after it
 was shortened and grown again (1.2.2 let the bytes it held there come
@@ -1003,7 +1028,11 @@ directory once (one named below itself again is a problem), and takes
 rows by the ranges they hold, not by what they claim (a reference count
 row or an allocator bitmap claiming 2^64 clusters, rows inside others), so
 that it ends in time proportional to the volume's pages and files (1.3.0
-did not end on such rows, nor on a directory named below itself). Nothing
+did not end on such rows, nor on a directory named below itself). A run
+of a file that goes on past its container's last cluster, which Windows
+never writes, is a problem too, and the writing commands refuse such a
+file (1.3.0 checked the runs of compacted containers alone, and wrote the
+others' on into the next container on the disk). Nothing
 runs it by itself: `mount.ReFS`, udisks2's mounts and the health guard run
 the quick checks only, and `spaces check --deep` runs it on request.
 

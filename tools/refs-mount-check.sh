@@ -207,7 +207,18 @@ for name in "${names[@]}"; do
   # are suspect and were not mounted, so not compared.
   "$refs" mount --force "${source[@]}" "$mnt" &
   pid=$!
-  for _ in $(seq 100); do mountpoint -q "$mnt" && break; sleep 0.1; done
+  # Up to 2 minutes: a volume in a pool of large images on a slow disk,
+  # read cold, took more than the 10 s this waited before, and the check
+  # compared the empty directory, then waited for ever on the mount that
+  # came up after it (the 22.04 VM, r314mirror, 2026-10-24).
+  for _ in $(seq 1200); do mountpoint -q "$mnt" && break; kill -0 "$pid" 2>/dev/null || break; sleep 0.1; done
+  if ! mountpoint -q "$mnt"; then
+    echo "FAIL $name: not mounted within 2 minutes"
+    failed=1
+    kill "$pid" 2>/dev/null
+    wait "$pid"
+    continue
+  fi
   python3 - "$dir/manifest.json" "$mnt" <<'EOF' || failed=1
 import hashlib, json, os, sys
 manifest = json.load(open(sys.argv[1], encoding="utf-8-sig"))

@@ -200,7 +200,8 @@ fail. The programs they run (dmsetup, losetup, nbd\-client, systemctl,
 udevadm, journalctl) are stopped after 120 s, or when the run's time is up.
 .TP
 .B detach
-Removes the devices of the given space (name, GUID or device-mapper name) or
+Removes the devices of the given space (its name as Windows gives it, its
+GUID or its device-mapper name) or
 of all attached spaces, and stops their serving processes; a name that
 matches no attached space fails, and one that matches attached spaces of
 two pools is refused, naming them. A space whose devices are in use stays

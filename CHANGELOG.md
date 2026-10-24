@@ -180,6 +180,18 @@
   took all the time left of the run (`SPACES_ATTACH_TIMEOUT`, 80 s under
   the attach units), and the pools whose checks had ended were not
   attached. A pool's checks take half of what is left at most now.
+* `spaces attach` and `spaces detach` (audit 2026-10-21, SCA-02, SCA-04,
+  SCA-05): a space whose name holds letters device-mapper names do not
+  take (`"Storage space"`, `my-data`, `Фото`) could not be detached by
+  that name; two spaces alike in a second pool of the name
+  got the same device-mapper name, and the second's attach failed; a
+  device path relative to the directory `spaces attach` ran in reached the
+  space's server, a unit started in `/`, which found no such file; and a
+  cut-off attach whose state listed no devices was taken for complete when
+  undoing it failed again (the space "already attached" with nothing
+  attached). The state keeps the space's name, names already taken are
+  passed over, paths are made absolute (links stay links), and such a
+  state is not completed.
 * The checks of a pool of many spaces (`spaces attach`, `spaces check`)
   took about three times as long as in 1.2.2: 1.3.0's check for unmapped
   fixed spaces looked up each space's hidden spaces among all the pool's

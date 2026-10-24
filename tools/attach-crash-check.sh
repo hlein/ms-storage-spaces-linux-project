@@ -40,6 +40,18 @@
 #   onepool   attach --pool of the first pool beside a pool that cannot be
 #             assembled (one of its two disks given): the first pool's space
 #             is attached and the run succeeds, the other pool named
+#   detachname two spaces named "Storage space" and "my-data" attached:
+#             detach "Storage space" detaches that one and leaves the other
+#             (1.3.0 found none: it matched the name against the end of the
+#             device-mapper name, where the space is "_")
+#   relative  attach of wc4k (served by ublk) through the image's path
+#             relative to the directory it runs in: attached (1.3.0's server,
+#             a unit started in /, found no such file)
+#   promote   a state of a cut-off attach that lists no devices and whose
+#             device is held open (as a teardown that removed the devices and
+#             failed later leaves it): the next attach does not take it for
+#             attached (1.3.0 did, 0 devices of 0: the space was "already
+#             attached" with nothing attached)
 # Build: cargo build --release --target x86_64-unknown-linux-musl -p spaces-cli --features test-hooks
 # Usage: [LINUX_VM_HOST=user@address] tools/attach-crash-check.sh SPACES [CASE...]
 # Pools: wc4k in ~/sstest/pools on the VM (tools/guard-check.sh copies it
@@ -49,7 +61,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 binary=${1:?usage: tools/attach-crash-check.sh SPACES [CASE...]}
 shift
-cases=${*:-steps kill names leftovers busy children budget onepool}
+cases=${*:-steps kill names leftovers busy children budget onepool detachname relative promote}
 host=${LINUX_VM_HOST:-claude@192.168.189.143}
 [[ $host == *@* ]] || host=codex@$host
 ssh_opts=(-o BatchMode=yes -o ConnectTimeout=10 -o IdentitiesOnly=yes -i "$HOME/.ssh/rustadmin_vm_ed25519")
@@ -111,7 +123,7 @@ cleanup() {
     sudo rm -f "/run/storage-spaces/$g.state"
   done
   # Devices without a UUID (1.2.2's) by the names of these pools.
-  for d in $(ls /dev/mapper | grep -E '^ss-ss_(wc4k|crash|names|hog|part)-' | sort -r); do
+  for d in $(ls /dev/mapper | grep -E '^ss-ss_(wc4k|crash|names|names2|hog|part)-' | sort -r); do
     sudo dmsetup remove --retry "$d" >/dev/null 2>&1 || true
   done
   sudo dmsetup remove "$leftover" >/dev/null 2>&1 || true
@@ -405,6 +417,61 @@ for c in $CASES; do
       result ok onepool "$(one "$out" | cut -c1-160)"
     else
       result fail onepool "exit $rc: $(one "$out")"
+    fi ;;
+  detachname)
+    truncate -s 4G "$scratch/names2.img"
+    if ! "$spaces" pool create --name ss_names2 --yes "$scratch/names2.img" >/dev/null 2>&1; then
+      result fail detachname "cannot make the pool"
+      continue
+    fi
+    for n in "Storage space" my-data; do
+      "$spaces" space create --name "$n" --resiliency simple --size 1G --yes "$scratch/names2.img" >/dev/null
+    done
+    newloop "$scratch/names2.img" -r
+    names2_loop=$LOOP
+    # guid takes the JSON without its blanks: the name as it is there.
+    sp=$(guid Storagespace "$names2_loop") md=$(guid my-data "$names2_loop")
+    if [[ -z $sp || -z $md ]]; then
+      result fail detachname "no GUIDs of the spaces (${sp:-none}, ${md:-none})"
+      continue
+    fi
+    guids+=("$sp" "$md")
+    sudo "$spaces" attach --space "$sp" "$names2_loop" >/dev/null 2>&1 || true
+    sudo "$spaces" attach --space "$md" "$names2_loop" >/dev/null 2>&1 || true
+    rc=0
+    out=$(sudo "$spaces" detach "Storage space" 2>&1) || rc=$?
+    if [[ $rc == 0 && -z $(left "$sp") && -n $(left "$md") ]]; then
+      result ok detachname "$(one "$out" | cut -c1-120)"
+    else
+      result fail detachname "exit $rc: $(one "$out"); left of it:$(left "$sp"); of my-data:$(left "$md")"
+    fi
+    sudo "$spaces" detach "$sp" >/dev/null 2>&1 || true
+    sudo "$spaces" detach "$md" >/dev/null 2>&1 || true ;;
+  relative)
+    rc=0
+    out=$(cd "$scratch" && sudo "$spaces" attach --space "$wc4k" wc4k.img 2>&1) || rc=$?
+    if [[ $rc == 0 && -e /dev/mapper/ss-ss_wc4k-wc4k ]]; then
+      result ok relative "$(one "$out" | cut -c1-120)"
+    else
+      result fail relative "exit $rc: $(one "$out")"
+    fi
+    sudo "$spaces" detach "$wc4k" >/dev/null 2>&1 || true ;;
+  promote)
+    fake=00000000-0000-4000-8000-0000000000ab
+    truncate -s 64M "$scratch/held.img"
+    newloop "$scratch/held.img"
+    held_loop=$LOOP
+    sudo bash -c 'sleep 600 < "$1" & echo $! > "$2"' _ "$held_loop" "$scratch/holder.pid"
+    printf 'space=%s\npool=00000000-0000-4000-8000-0000000000aa\nbackend=fuse\nstatus=attaching\ndevice=%s\n' "$fake" "$held_loop" |
+      sudo tee "/run/storage-spaces/$fake.state" >/dev/null
+    out=$(sudo "$spaces" attach --space "$fake" "$crash_loop" 2>&1) || true
+    st=$(sudo sed -n 's/^status=//p' "/run/storage-spaces/$fake.state" 2>/dev/null) || true
+    sudo kill "$(cat "$scratch/holder.pid")" 2>/dev/null || true
+    sudo rm -f -- "/run/storage-spaces/$fake.state"
+    if [[ $st == attaching ]]; then
+      result ok promote "$(one "$out" | cut -c1-140)"
+    else
+      result fail promote "status ${st:-none} after: $(one "$out")"
     fi ;;
   *) result fail "$c" "unknown case" ;;
   esac

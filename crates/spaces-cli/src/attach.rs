@@ -116,6 +116,8 @@ pub struct State {
     /// The arguments of `spaces attach` that attach the space again as it
     /// is (`detach --outdated` does after an upgrade).
     pub args: Vec<String>,
+    /// The space's name as Windows gives it (states of 1.3.0 have none).
+    pub name: Option<String>,
 }
 
 impl State {
@@ -162,6 +164,7 @@ impl State {
             ("fuse_mount", &self.fuse_mount),
             ("verdict", &self.verdict),
             ("report", &self.report),
+            ("name", &self.name),
         ] {
             if let Some(v) = value {
                 text += &format!("{key}={v}\n");
@@ -220,6 +223,7 @@ impl State {
                 "forced" => s.forced = value == "1",
                 "report" => s.report = Some(value),
                 "arg" => s.args.push(value),
+                "name" => s.name = Some(value),
                 _ => {}
             }
         }
@@ -433,14 +437,24 @@ fn partition_devices(parts: Vec<Partition>, size: u64) -> std::result::Result<Ve
 /// (left over from an interrupted run).
 fn unique_dm_name(base: String, pool_guid: &str, space_guid: &str, attached: &[State]) -> String {
     let short = |guid: &str| -> String { guid.chars().filter(char::is_ascii_hexdigit).take(8).collect() };
-    let holder = attached
-        .iter()
-        .find(|s| s.dm.first() == Some(&base) && !s.space_guid.eq_ignore_ascii_case(space_guid));
-    match holder {
-        None => base,
+    let other = |s: &&State| !s.space_guid.eq_ignore_ascii_case(space_guid);
+    let taken = |name: &str| {
+        attached
+            .iter()
+            .filter(other)
+            .any(|s| s.dm.first().is_some_and(|d| d == name))
+    };
+    let first = match attached.iter().filter(other).find(|s| s.dm.first() == Some(&base)) {
+        None => base.clone(),
         Some(s) if !s.pool_guid.eq_ignore_ascii_case(pool_guid) => format!("{base}-{}", short(pool_guid)),
         Some(_) => format!("{base}-{}", short(space_guid)),
-    }
+    };
+    // That one taken too (spaces alike in two pools of one name: 1.3.0 gave
+    // the second pool's two the same name, and the second attach failed):
+    // the space's own digits, then both.
+    let space = format!("{base}-{}", short(space_guid));
+    let both = format!("{base}-{}-{}", short(pool_guid), short(space_guid));
+    [first, space].into_iter().find(|n| !taken(n)).unwrap_or(both)
 }
 
 /// The device-mapper UUID of the device `name` of `state`: the space's,
@@ -483,10 +497,19 @@ pub fn select_attached(states: Vec<State>, key: Option<&str>) -> Result<Vec<Stat
     let Some(key) = key else {
         return Ok(states);
     };
+    // By the name the state keeps; a state of 1.3.0, which keeps none, by
+    // the name as dm_name spells it (1.3.0 matched the name as given against
+    // the device-mapper name, where "Storage space" is "Storage_space": no
+    // space with such a name could be named; audit 2026-10-21, SCA-05).
+    let spelt = clean_name(key);
     let found: Vec<State> = states
         .into_iter()
         .filter(|s| {
-            key.eq_ignore_ascii_case(&s.space_guid) || s.dm.first().is_some_and(|d| d == key || names_space(d, key))
+            key.eq_ignore_ascii_case(&s.space_guid)
+                || s.name.as_deref().is_some_and(|n| n.eq_ignore_ascii_case(key))
+                || s.dm
+                    .first()
+                    .is_some_and(|d| d == key || names_space(d, key) || (s.name.is_none() && names_space(d, &spelt)))
         })
         .collect();
     if found.len() > 1 {
@@ -504,20 +527,23 @@ pub fn select_attached(states: Vec<State>, key: Option<&str>) -> Result<Vec<Stat
     Ok(found)
 }
 
+/// A name as device-mapper names take it: letters other than ASCII
+/// letters, digits and `_.+` made `_`.
+fn clean_name(s: &str) -> String {
+    s.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || "_.+".contains(c) {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
 /// Device-mapper name for a space: `ss-<pool>-<space>` with unsafe characters replaced.
 pub fn dm_name(pool: &str, space: &str) -> String {
-    let clean = |s: &str| -> String {
-        s.chars()
-            .map(|c| {
-                if c.is_ascii_alphanumeric() || "_.+".contains(c) {
-                    c
-                } else {
-                    '_'
-                }
-            })
-            .collect()
-    };
-    let mut name = format!("ss-{}-{}", clean(pool), clean(space));
+    let mut name = format!("ss-{}-{}", clean_name(pool), clean_name(space));
     name.truncate(100);
     name
 }
@@ -1010,12 +1036,14 @@ pub fn attach_space(pool: &Pool<File>, space: &Space, paths: &[PathBuf], request
         verdict: Some(verdict.as_str().into()),
         forced: verdict != Verdict::Healthy,
         report: report.map(|p| p.display().to_string()),
-        // An argument with a line break in it does not fit the state file.
+        // An argument with a line break in it does not fit the state file;
+        // nor does such a name.
         args: if args.iter().any(|a| a.contains('\n')) {
             Vec::new()
         } else {
             args
         },
+        name: Some(space.name().to_string()).filter(|n| !n.contains('\n')),
         ..Default::default()
     };
     state.save()?;
@@ -1473,7 +1501,12 @@ pub fn reconcile() {
         let name = state.dm.first().cloned().unwrap_or_else(|| state.space_guid.clone());
         match teardown(&state) {
             Ok(()) => eprintln!("{name}: undid an attach that was cut off"),
-            Err(e) if own_devices(&state).len() == state.dm.len() => {
+            // Complete only where it lists devices and they are all there:
+            // a teardown that removed them and failed later leaves a state
+            // listing none, which 1.3.0 took for complete (0 of 0), and the
+            // space was "already attached" with nothing attached (audit
+            // 2026-10-21, SCA-02).
+            Err(e) if !state.dm.is_empty() && own_devices(&state).len() == state.dm.len() => {
                 state.status = Status::Attached;
                 match state.save() {
                     Ok(()) => eprintln!("{name}: completed an attach that was cut off ({e:#})"),
@@ -1859,6 +1892,76 @@ mod name_tests {
             "ss-Storage_pool-games"
         );
         assert_eq!(dm_name("p", "Фото"), dm_name("p", "Игры"));
+    }
+
+    /// Two pools of one name, the first with a space "Фото" attached, the
+    /// second with "Фото" and "Игры", which dm_name makes alike: each gets a
+    /// device-mapper name no attached space has. 1.3.0 gave both of the
+    /// second pool's the name its first got (the pool's GUID after the
+    /// name), and the second's attach failed: the device existed (the
+    /// auditor's repro_sca04, part 3).
+    #[test]
+    fn spaces_alike_in_two_pools_of_one_name_get_apart() {
+        let base = dm_name("pool", "Фото");
+        assert_eq!(base, dm_name("pool", "Игры"));
+        let (pool1, pool2) = (
+            "11111111-0000-4000-8000-000000000001",
+            "22222222-0000-4000-8000-000000000002",
+        );
+        let (sp1, sp2, sp3) = (
+            "aaaaaaaa-0000-4000-8000-000000000001",
+            "bbbbbbbb-0000-4000-8000-000000000002",
+            "cccccccc-0000-4000-8000-000000000003",
+        );
+        let mut held = vec![State {
+            space_guid: sp1.into(),
+            ..attached(&base, pool1)
+        }];
+        let second = unique_dm_name(base.clone(), pool2, sp2, &held);
+        assert_ne!(second, base);
+        held.push(State {
+            space_guid: sp2.into(),
+            ..attached(&second, pool2)
+        });
+        let third = unique_dm_name(base.clone(), pool2, sp3, &held);
+        assert!(
+            held.iter().all(|s| s.dm.first() != Some(&third)),
+            "{third:?} is attached already"
+        );
+    }
+
+    /// An attached space named as Windows names it ("Storage space", with
+    /// a space; "my-data"; "Фото"): `spaces detach NAME` finds it by the
+    /// name its state keeps, also among others whose device-mapper names
+    /// end alike. 1.3.0 matched the name against the end of the
+    /// device-mapper name, where dm_name had replaced those letters, and
+    /// found none (audit 2026-10-21, SCA-05).
+    #[test]
+    fn spaces_are_detached_by_the_names_windows_gives_them() {
+        let state = |guid: &str, name: &str, dm: &str| {
+            State::parse(&format!(
+                "space={guid}\npool=p\nbackend=dm\nstatus=attached\nname={name}\ndm={dm}\n"
+            ))
+        };
+        let states = || {
+            vec![
+                state("1", "Storage space", &dm_name("Storage pool", "Storage space")),
+                state("2", "my-data", &dm_name("Storage pool", "my-data")),
+                state("3", "Фото", &dm_name("Storage pool", "Фото")),
+                state("4", "Игры", &(dm_name("Storage pool", "Игры") + "-44444444")),
+            ]
+        };
+        let pick = |key: &str| -> Vec<String> {
+            select_attached(states(), Some(key))
+                .unwrap()
+                .into_iter()
+                .map(|s| s.space_guid)
+                .collect()
+        };
+        assert_eq!(pick("Storage space"), ["1"]);
+        assert_eq!(pick("my-data"), ["2"]);
+        assert_eq!(pick("Фото"), ["3"]);
+        assert_eq!(pick("Игры"), ["4"]);
     }
 
     /// Every device of a space carries its UUID, a partition's with its

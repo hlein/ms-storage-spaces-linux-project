@@ -151,7 +151,10 @@ or its name, the same for every command. A key that names several spaces
 of a pool (a name two spaces share, or a name that is another space's GUID
 or id) is refused, with the spaces it names; give the id of the one meant.
 `--pool` takes a pool's GUID or name; a name two pools share is refused
-likewise, naming them by their GUIDs. `spaces detach <space>` naming no
+likewise, naming them by their GUIDs. `spaces detach <space>` takes the
+space's name as Windows gives it (`"Storage space"`, `Фото`; 1.3.0 matched
+the name against the end of the device-mapper name, where such names are
+spelt otherwise, and found none), its GUID or its device-mapper name; naming no
 attached space fails, and one naming attached spaces of two pools (pools
 of one name) is refused, naming them: give the GUID or device-mapper name.
 
@@ -181,7 +184,10 @@ the first eight hex digits of the pool's GUID follow,
 <space>` finds both. Two spaces of one pool whose names give one device
 name (`Фото` and `Игры` both give `____`) get the first eight hex digits of
 the space's GUID after the second (1.2.2 gave both one name, failed to
-attach the second and removed the first one's device). Every device
+attach the second and removed the first one's device); where that name is
+taken too (two such spaces in a second pool of the name), the next gets
+the digits of both (1.3.0 gave the two the same one, and the second's
+attach failed). Every device
 carries the device-mapper UUID `STORAGESPACES-<pool guid>-<space guid>`
 (`-p<N>` for a partition, `dmsetup info -c -o name,uuid`), and only
 devices with the UUID of a space are removed for it. Partition devices are created from the partitions
@@ -195,8 +201,10 @@ An attach that is cut off (killed, a crash, a timeout) leaves nothing
 unknown: `spaces attach` writes the space's state before it sets anything
 up, marked attaching, with the server and the devices it will make, and
 again after each step. The next `spaces attach` or `spaces detach` undoes
-such an attach first (or completes it, where its devices are all there and
-in use); `spaces status` lists it meanwhile. Devices with the UUID of a
+such an attach first (or completes it, where it lists devices and they are
+all there and in use; 1.3.0 also took one that lists none, as a teardown
+that removed them and failed later leaves it, for complete, and the space
+was "already attached" with nothing attached); `spaces status` lists it meanwhile. Devices with the UUID of a
 space and no state (a state that was lost) are listed by `spaces status`
 and removed by `sudo spaces detach --leftovers`.
 

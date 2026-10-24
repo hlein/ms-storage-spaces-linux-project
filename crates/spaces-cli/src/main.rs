@@ -1210,6 +1210,16 @@ fn cmd_attach(
 ) -> Result<()> {
     use std::io::IsTerminal;
     check::start_attach_time();
+    // Paths from here on are absolute: a space's server is a unit started
+    // in /, and the arguments kept to attach the space again (detach
+    // --outdated) are used from anywhere (1.3.0 passed a relative path on,
+    // and the server found no such file; audit 2026-10-21, SCA-04). Links
+    // stay links (a /dev/disk/by-id name is kept as given).
+    let devices: Vec<PathBuf> = devices
+        .iter()
+        .map(|d| std::path::absolute(d).unwrap_or_else(|_| d.clone()))
+        .collect();
+    let devices = &devices[..];
     let _lock = attach::lock()?;
     attach::reconcile();
     let groups: Vec<Vec<PathBuf>> = if devices.is_empty() {

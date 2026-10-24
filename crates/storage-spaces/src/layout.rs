@@ -27,6 +27,9 @@ pub struct Redundancy {
     pub missing: bool,
     /// Some copies are out of date.
     pub stale: bool,
+    /// Some rows have fewer current copies than the policy keeps (one being
+    /// rebuilt, or none recorded) with every disk at hand.
+    pub short: bool,
 }
 
 impl Redundancy {
@@ -36,6 +39,7 @@ impl Redundancy {
             left: self.left.min(other.left),
             missing: self.missing || other.missing,
             stale: self.stale || other.stale,
+            short: self.short || other.short,
         }
     }
 }
@@ -142,6 +146,8 @@ pub struct Layout {
     /// rows and parity rotation count from here.
     pub base: u64,
     pub copies: u64,
+    /// The copies of each row the policy keeps (1 for simple and parity).
+    pub required: u64,
     pub interleave: u64,
     runs: BTreeMap<(u64, u64), Vec<Run>>,
     /// Each column's runs as one sequence of rows ([`Layout::column_runs`]).
@@ -314,6 +320,10 @@ impl Layout {
             },
             base,
             copies,
+            required: match policy.resiliency {
+                Resiliency::Mirror => policy.copies.max(1),
+                _ => 1,
+            },
             interleave: policy.interleave,
             runs,
             merged,
@@ -533,26 +543,33 @@ impl Layout {
             let mut lost_columns = 0;
             let mut reduced = false;
             let mut allocated = false;
-            for (&column, numbers) in &self.used {
+            let mut unmapped = 0;
+            for column in 0..self.columns {
+                let numbers = self.used.get(&column).map_or(&[][..], Vec::as_slice);
                 let stale = self.has_stale_copy(column, row);
                 let copies: Vec<u64> = numbers
                     .iter()
                     .filter_map(|&copy| self.physical(column, copy, row).map(|(disk, _)| disk))
                     .collect();
                 if copies.is_empty() && !stale {
+                    unmapped += 1;
                     continue;
                 }
                 allocated = true;
                 let readable = copies.iter().filter(|&&d| present(d)).count();
                 if readable == 0 {
                     lost_columns += 1;
-                } else if readable < copies.len() || stale {
+                } else if readable < copies.len() || stale || (copies.len() as u64) < self.required {
                     reduced = true;
                 }
             }
             if !allocated {
                 continue;
             }
+            // Windows allocates a row's columns together (thin or fixed): a
+            // column without an extent in a row others have is lost (1.3.0
+            // took it for unallocated; audit 2026-10-21, SPA-01).
+            lost_columns += unmapped;
             let row_condition = match self.resiliency {
                 Resiliency::Parity if lost_columns > tolerance => Condition::Failed,
                 Resiliency::Parity if lost_columns > 0 || reduced => Condition::Degraded,
@@ -582,12 +599,15 @@ impl Layout {
             left: Some(tolerance),
             missing: false,
             stale: false,
+            short: false,
         };
         for row in self.bounds() {
             let mut lost_columns = 0;
             let mut least_copies = u64::MAX;
             let mut allocated = false;
-            for (&column, numbers) in &self.used {
+            let mut unmapped = 0;
+            for column in 0..self.columns {
+                let numbers = self.used.get(&column).map_or(&[][..], Vec::as_slice);
                 let outdated = self.outdated.get(&column).map_or(&[][..], |c| c.at(row));
                 let copies: Vec<u64> = numbers
                     .iter()
@@ -595,10 +615,12 @@ impl Layout {
                     .chain(outdated.iter().copied().filter(|&d| evacuating(d)))
                     .collect();
                 if copies.is_empty() && !self.has_stale_copy(column, row) {
+                    unmapped += 1;
                     continue;
                 }
                 allocated = true;
                 out.stale |= outdated.iter().any(|&d| !evacuating(d));
+                out.short |= (copies.len() as u64) < self.required;
                 let readable = copies.iter().filter(|&&d| present(d)).count() as u64;
                 out.missing |= readable < copies.len() as u64;
                 if readable == 0 {
@@ -608,6 +630,12 @@ impl Layout {
             }
             if !allocated {
                 continue;
+            }
+            // A column without an extent in a row others have is lost (see
+            // `condition`).
+            if unmapped > 0 {
+                lost_columns += unmapped;
+                least_copies = 0;
             }
             let left = match self.resiliency {
                 Resiliency::Parity => tolerance.checked_sub(lost_columns),

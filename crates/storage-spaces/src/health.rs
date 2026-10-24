@@ -145,6 +145,7 @@ pub fn health<D: ReadAt>(pool: &Pool<D>) -> Result<Health> {
             left: Some(u64::MAX),
             missing: false,
             stale: false,
+            short: false,
         };
         let layouts = family
             .iter()
@@ -186,7 +187,7 @@ pub fn health<D: ReadAt>(pool: &Pool<D>) -> Result<Health> {
                 words.extend(["No Redundancy", "Degraded"]);
                 HealthStatus::Unhealthy
             }
-            _ if !missing && !r.stale => {
+            _ if !missing && !r.stale && !r.short => {
                 words.push("OK");
                 HealthStatus::Healthy
             }

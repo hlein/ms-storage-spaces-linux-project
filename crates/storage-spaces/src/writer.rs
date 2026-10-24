@@ -280,6 +280,16 @@ impl<'p, D: WriteAt> SpaceWriter<'p, D> {
         if row_allocated(&self.layout(), row) {
             return Ok(()); // allocated while waiting for the lock
         }
+        // A row some of whose columns have extents is not unallocated: its
+        // records would be written twice (1.3.0 did, and the pool database
+        // no longer opened; audit 2026-10-21, SPA-01).
+        let l = self.layout();
+        if let Some(column) = (0..l.columns).find(|&c| l.current(c, row).is_some() || l.has_stale_copy(c, row)) {
+            return Err(Error::Pool(format!(
+                "row {row} has an extent for column {column} but not for every column: not allocated again"
+            )));
+        }
+        drop(l);
         let pool = self.reader.pool();
         let layout = self.layout().clone();
         let mut used = BTreeSet::new();

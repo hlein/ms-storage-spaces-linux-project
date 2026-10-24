@@ -14,6 +14,14 @@
   a stripe's units agree with single parity whatever the rotation.) A
   column's runs are now those of all its current copies (the Windows pool
   `replacedrun` reads as written, healthy and with any disk missing).
+* A space whose pool database lacks extents Windows always writes was called
+  healthy (audit 2026-10-21, SPA-01): a row of a thin space with some of its
+  columns' extents and not the others' (Windows allocates a row's columns
+  together), and a mirror row with fewer current copies than its policy
+  keeps (a copy being rebuilt, or none recorded). The first is failed now
+  and the second degraded, and the writer refuses both: 1.3.0 wrote into
+  such a thin row by allocating it again, its pool database then holding two
+  extents for one column on every disk, and the pool no longer opened.
 * The checks of a pool of many spaces (`spaces attach`, `spaces check`)
   took about three times as long as in 1.2.2: 1.3.0's check for unmapped
   fixed spaces looked up each space's hidden spaces among all the pool's

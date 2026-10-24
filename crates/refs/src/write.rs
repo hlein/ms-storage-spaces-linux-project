@@ -2038,6 +2038,19 @@ impl<D: WriteAt> Volume<D> {
     /// in part, or not; a change built on the volume as read before could
     /// write over pages the checkpoint on disk names, 1.2.2 went on so).
     /// One that cannot be read again takes no more changes.
+    /// The clock of the pages the commit being made writes: that of the
+    /// commit held back (`in_one_commit`), else one past the checkpoint's.
+    /// After the first change of a held commit the checkpoint read is the
+    /// held one, its clock already the commit's (1.3.0 stamped the extent
+    /// map pages of a later change one past it).
+    fn next_clock(&self) -> u64 {
+        self.held
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .map_or(self.checkpoint.clock + 1, |h| h.clock)
+    }
+
     pub(crate) fn committed(&mut self, result: Result<()>) -> Result<()> {
         let loaded = self.load();
         if loaded.is_err() {
@@ -2607,7 +2620,7 @@ impl<D: WriteAt> Volume<D> {
             // Its clusters, header and reference.
             let lcns = tx.take(ROOT_MEDIUM_ALLOCATOR, page_size / self.cluster as usize)?;
             let named = lcns.iter().map(|&l| self.virtual_of(l)).collect::<Result<Vec<_>>>()?;
-            page[0x10..0x18].copy_from_slice(&(self.checkpoint.clock + 1).to_le_bytes());
+            page[0x10..0x18].copy_from_slice(&self.next_clock().to_le_bytes());
             for (k, l) in named.iter().enumerate() {
                 page[0x20 + 8 * k..0x28 + 8 * k].copy_from_slice(&l.to_le_bytes());
             }
@@ -2654,7 +2667,7 @@ impl<D: WriteAt> Volume<D> {
         page[h..h + node.len()].copy_from_slice(&node);
         let lcns = tx.take(ROOT_MEDIUM_ALLOCATOR, page_size / self.cluster as usize)?;
         let named = lcns.iter().map(|&l| self.virtual_of(l)).collect::<Result<Vec<_>>>()?;
-        page[0x10..0x18].copy_from_slice(&(self.checkpoint.clock + 1).to_le_bytes());
+        page[0x10..0x18].copy_from_slice(&self.next_clock().to_le_bytes());
         for (k, l) in named.iter().enumerate() {
             page[0x20 + 8 * k..0x28 + 8 * k].copy_from_slice(&l.to_le_bytes());
         }
@@ -2752,6 +2765,11 @@ impl<D: WriteAt> Volume<D> {
                 touched.extend(from / cluster..to.div_ceil(cluster));
             }
         }
+        // Shortened into a cluster: the rest of it zeros, copied on write
+        // where a change there would be, else in place once committed
+        // (1.3.0 left the old bytes there).
+        let tail = (new_size < stream.size && !new_size.is_multiple_of(cluster)).then_some(new_size / cluster);
+        touched.extend(tail);
         let own: Vec<(u64, u64)> = touched
             .iter()
             .filter_map(|c| mine.get(c).map(|&v| (*c, v)))
@@ -2888,7 +2906,24 @@ impl<D: WriteAt> Volume<D> {
             tx.commit()
         };
         self.committed(committed)?;
+        if let Some(c) = tail
+            && !copies.iter().any(|&(a, b)| a <= c && c < b)
+            && let Some(&vlcn) = mine.get(&c)
+        {
+            self.zero_tail(self.translate(vlcn)?, new_size)?;
+        }
         Ok(true)
+    }
+
+    /// Zeros the bytes of physical cluster `lcn` past `size`, the new end
+    /// of the stream whose last cluster it is.
+    fn zero_tail(&self, lcn: u64, size: u64) -> Result<()> {
+        let cluster = self.cluster;
+        let at = lcn
+            .checked_mul(cluster)
+            .ok_or_else(|| format_err!("cluster {lcn:#x} outside the volume"))?;
+        self.write_volume(at + size % cluster, &vec![0u8; (cluster - size % cluster) as usize])?;
+        Ok(self.dev.flush()?)
     }
 
     /// `update_file` for an integrity stream, as Windows changes one: the
@@ -2952,6 +2987,11 @@ impl<D: WriteAt> Volume<D> {
                 (from < to).then(|| (from / cluster, to.div_ceil(cluster)))
             })
             .collect();
+        // Shortened into a cluster: it is copied too, the rest of it zeros
+        // under a new checksum (1.3.0 left the old bytes there).
+        if new_size < stream.size && !new_size.is_multiple_of(cluster) && new_size / cluster < kept {
+            touched.push((new_size / cluster, new_size / cluster + 1));
+        }
         touched.sort_unstable();
         let mut copies: Vec<(u64, u64)> = Vec::new();
         for (a, b) in touched {
@@ -3273,7 +3313,17 @@ impl<D: WriteAt> Volume<D> {
             store_in(&mut tx, &fa, &record)?;
             tx.commit()
         };
-        self.committed(committed)
+        self.committed(committed)?;
+        // Shortened into a cluster: the rest of it zeros, where it is (no
+        // other file shares it), once committed (1.3.0 left the old bytes
+        // there).
+        if new_size < old_size && !new_size.is_multiple_of(cluster) {
+            let c = new_size / cluster;
+            if let Some(&(vcn, vlcn, _)) = xs.iter().find(|&&(vcn, _, n)| vcn <= c && c < vcn + n) {
+                self.zero_tail(self.translate(vlcn + (c - vcn))?, new_size)?;
+            }
+        }
+        Ok(())
     }
 
     /// Writes the bytes [from, to) of `data` where a run of clusters has

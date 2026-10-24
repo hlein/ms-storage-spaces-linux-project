@@ -154,6 +154,20 @@
   log (whether Windows would replay it over a change, asked before every
   write) was not found when the primary superblock was lost, though the
   volume opened from a copy: the log is found through the copy.
+* ReFS writer details (audit 2026-10-21, RFW-03, RFW-04, the auditor's
+  rfw_01 and rfw_02): the extent map pages written by a later step of
+  one commit (an integrity stream written into the file made in the same
+  commit, a clone into a file made for it) carried a clock one past the
+  commit's; a file shortened in place kept its old bytes in the rest of
+  its new last cluster on the disk (an integrity stream there under its
+  old checksum, a file with stream snapshots in its live level's
+  cluster); and a checkpoint's roots were taken from its whole page,
+  though its checksum covers its first cluster, which a commit then
+  indexed past (a panic). The pages carry the commit's clock, the rest of
+  the cluster is zeros (copied on write where an integrity stream or a
+  snapshot's level has the cluster, else written where it is once the
+  commit is on the disk), and such a checkpoint does not open. Windows
+  attached volumes changed so as healthy and read every file as written.
 * The checks of a pool of many spaces (`spaces attach`, `spaces check`)
   took about three times as long as in 1.2.2: 1.3.0's check for unmapped
   fixed spaces looked up each space's hidden spaces among all the pool's

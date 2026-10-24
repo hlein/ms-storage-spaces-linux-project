@@ -289,9 +289,14 @@ impl<D: ReadAt> Volume<D> {
             .unwrap_or_else(|e| e.into_inner())
             .as_ref()
             .and_then(|h| Some((h.slot, h.clock, h.page.clone()?)));
+        // Its first cluster, which its checksum covers (every checkpoint
+        // of the corpus; the writer writes that one): 1.3.0 took roots
+        // from the rest of the page too, unchecked, which a commit, writing
+        // the cluster, then indexed past.
+        let one = (cluster as usize).min(chkp.len());
         self.checkpoint = match held {
             Some((slot, clock, page)) => Self::parse_checkpoint(slot, clock, &page)?,
-            None => Self::parse_checkpoint(lcn, clock, &chkp)?,
+            None => Self::parse_checkpoint(lcn, clock, &chkp[..one])?,
         };
         // The tables kept from it, read again only when their roots changed
         // (copy on write gives a changed table a new root; 1.2.2 read both
@@ -596,7 +601,7 @@ impl<D: ReadAt> Volume<D> {
             .enumerate()
             .map(|(i, &at)| {
                 page.get(at..at + reference_size)
-                    .ok_or_else(|| format_err!("checkpoint root {i} outside the page"))
+                    .ok_or_else(|| format_err!("checkpoint root {i} outside its cluster"))
                     .and_then(PageRef::parse)
             })
             .collect::<Result<Vec<_>>>()?;

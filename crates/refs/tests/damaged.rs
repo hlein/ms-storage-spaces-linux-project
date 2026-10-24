@@ -4,6 +4,8 @@
 //! page they hit; the fuzz targets, which accept every checksum, go deeper.
 //! The parsers behind the checksums get random bytes below.)
 
+// Of the forge, what these tests need.
+#[allow(dead_code)]
 mod forge;
 
 use std::fs::File;

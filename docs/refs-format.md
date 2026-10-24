@@ -743,10 +743,15 @@ table's rows for a text diff):
   extent records after the file's own (its record count and sizes
   grow); `refs` appends and truncates the same way (Volume::update_file).
   What lies past a file's old end is written as new data, zeros where
-  nothing was written there: a shortened file keeps its old bytes in the
-  rest of its last cluster (the level's valid length ends before them),
-  and 1.2.2 let them reappear when the file grew past them, in place
-  and through the mount alike. Changes in place are written a MiB at a
+  nothing was written there, and 1.2.2 let the old bytes a shortened file
+  kept in the rest of its last cluster reappear when the file grew past
+  them, in place and through the mount alike. Since 1.3.1 a file shortened
+  into a cluster has the rest of it zeros on the disk too (1.3.0 left the
+  old bytes there, the level's valid length ending before them): written
+  where it is once the commit is down (a crash before it leaves the file
+  as it was), or, for an integrity stream and a cluster only a snapshot's
+  level has, copied on write with the rest zeros (an integrity stream's
+  cluster under its new checksum). Changes in place are written a MiB at a
   time.
 * Block reference counts (root 6): rows keyed by a range of virtual
   clusters (first, count), the key being the first 16 bytes of the value
@@ -956,7 +961,11 @@ table's rows for a text diff):
   its old clusters are freed in the same commit, its header names its new
   virtual clusters (0x20) and the new clock (0x10); references are
   updated child first with their checksums, through the object table
-  rows of roots 0 and 5. The checkpoint is a single cluster: the new one
+  rows of roots 0 and 5. The checkpoint is a single cluster (its own
+  checksum covers that cluster on every volume of the corpus, also where
+  pages are 16 KiB; `refs` takes no root reference from past it: 1.3.0
+  read the whole page, and a commit, writing the cluster, indexed past it
+  for a root there): the new one
   goes to the older slot with the next clock (0x10 and 0x60), the counter
   at 0x68 incremented, the changed roots' references, its own cluster in
   its self reference, and its own checksum; writing it is the commit
@@ -1008,7 +1017,9 @@ table's rows for a text diff):
   as a transaction of its own, but its checkpoint stays in memory, the next
   step builds on it, nothing takes the clusters the steps freed (the
   checkpoint on disk may still use them), and the last step writes one
-  checkpoint, of one clock and generation more. A crash before that leaves
+  checkpoint, of one clock and generation more; every page the steps write
+  carries that clock (1.3.0 stamped the extent map pages of a later step,
+  one past it: the checkpoint in memory after a step is the held one). A crash before that leaves
   the volume as it was, one after it as after all of them (test
   `interrupted_writes_leave_the_old_or_the_new_volume`, every write prefix
   and torn write; 1.2.2 left the target deleted, an empty clone or no

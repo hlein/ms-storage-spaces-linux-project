@@ -219,6 +219,19 @@ impl Forge {
         None
     }
 
+    /// Changes the current checkpoint (its clusters, as many as a page
+    /// has) with `change`, and seals it again.
+    pub fn edit_checkpoint(&mut self, change: impl FnOnce(&mut Vec<u8>)) {
+        let vol = self.volume().unwrap();
+        let (cluster, lcn) = (vol.cluster, vol.checkpoint.lcn);
+        let clusters: Vec<u64> = (lcn..lcn + vol.page_size / cluster).collect();
+        drop(vol);
+        let mut chkp = self.read(&clusters, cluster);
+        change(&mut chkp);
+        seal(&mut chkp, cluster as usize);
+        self.write(&clusters, cluster, &chkp);
+    }
+
     /// Sets the physical start of container `id` (the u64 16 bytes before
     /// the end of its row in the container table).
     pub fn set_container_start(&mut self, id: u64, start: u64) {

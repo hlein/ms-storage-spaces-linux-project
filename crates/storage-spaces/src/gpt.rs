@@ -65,8 +65,10 @@ fn table_at<D: ReadAt + ?Sized>(dev: &D, sector: u64, lba: u64, size: u64) -> Re
     }
     let header_size = u32::from_le_bytes(header[12..16].try_into().unwrap()) as usize;
     let sound_header = (92..=header.len()).contains(&header_size)
-        && crate::crc::crc32_excluding(&header[..header_size], 16)
-            == u32::from_le_bytes(header[16..20].try_into().unwrap())
+        && crate::crc::matches(
+            crate::crc::crc32_excluding(&header[..header_size], 16),
+            u32::from_le_bytes(header[16..20].try_into().unwrap()),
+        )
         && u64::from_le_bytes(header[24..32].try_into().unwrap()) == lba;
     let entries_lba = u64::from_le_bytes(header[72..80].try_into().unwrap());
     let count = u32::from_le_bytes(header[80..84].try_into().unwrap()) as usize;
@@ -84,7 +86,11 @@ fn table_at<D: ReadAt + ?Sized>(dev: &D, sector: u64, lba: u64, size: u64) -> Re
         return Ok(None);
     };
     let table = read_vec(dev, table_start, count * entry_size)?;
-    let sound = sound_header && crate::crc::crc32(&table) == u32::from_le_bytes(header[88..92].try_into().unwrap());
+    let sound = sound_header
+        && crate::crc::matches(
+            crate::crc::crc32(&table),
+            u32::from_le_bytes(header[88..92].try_into().unwrap()),
+        );
     let mut parts = Vec::new();
     for (i, entry) in table.chunks_exact(entry_size).enumerate() {
         let type_guid = Guid::from_mixed_endian(entry[0..16].try_into().unwrap());

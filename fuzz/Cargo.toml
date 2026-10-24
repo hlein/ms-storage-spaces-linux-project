@@ -139,3 +139,17 @@ path = "fuzz_targets/report_json.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "journal_writer"
+path = "fuzz_targets/journal_writer.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "cache_writer"
+path = "fuzz_targets/cache_writer.rs"
+test = false
+doc = false
+bench = false

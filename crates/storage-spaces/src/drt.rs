@@ -120,7 +120,10 @@ impl DirtyRegions {
             return None;
         }
         let span = 0x18 + 8 * count;
-        if crc32_excluding(&h[..span], 0x14) != u32::from_le_bytes(h[0x14..0x18].try_into().unwrap()) {
+        if !crate::crc::matches(
+            crc32_excluding(&h[..span], 0x14),
+            u32::from_le_bytes(h[0x14..0x18].try_into().unwrap()),
+        ) {
             return None; // torn copy
         }
         Some(DrtHeader {

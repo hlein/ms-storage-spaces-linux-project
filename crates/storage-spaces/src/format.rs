@@ -102,7 +102,7 @@ impl DiskHeader {
 const HEADER_CRC_SPAN: usize = 0x200;
 
 fn header_crc_ok(b: &[u8]) -> bool {
-    crc32_excluding(&b[..HEADER_CRC_SPAN], 0x0c) == be_u32(&b[0x0c..])
+    crate::crc::matches(crc32_excluding(&b[..HEADER_CRC_SPAN], 0x0c), be_u32(&b[0x0c..]))
 }
 
 /// Header of a metadata database ("SDBC").

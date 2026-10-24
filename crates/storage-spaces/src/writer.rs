@@ -208,6 +208,14 @@ impl<'p, D: WriteAt> SpaceWriter<'p, D> {
                 },
                 writer: Mutex::new(pj.writer(reader.space.info.guid)),
             });
+            if journal
+                .as_ref()
+                .is_some_and(|j| j.writer.lock().unwrap_or_else(|e| e.into_inner()).used_up())
+            {
+                return Err(Error::Unsupported(
+                    "the parity journal's log has used up its sequence numbers (a slot near 2^64)".into(),
+                ));
+            }
         }
         let mut cache = None;
         if let Some(index) = reader.cache() {
@@ -227,6 +235,14 @@ impl<'p, D: WriteAt> SpaceWriter<'p, D> {
                     pending: Vec::new(),
                 }),
             });
+            if cache
+                .as_ref()
+                .is_some_and(|c| c.log.read().unwrap_or_else(|e| e.into_inner()).writer.used_up())
+            {
+                return Err(Error::Unsupported(
+                    "the write-back cache's log has used up its sequence numbers (a slot near 2^64)".into(),
+                ));
+            }
         }
         let space = reader.space;
         let alloc = match (space.info.provisioning, space.info.policy) {

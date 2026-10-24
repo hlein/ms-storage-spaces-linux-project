@@ -209,6 +209,19 @@
   a signal waits for the requests under way, flushes once (not after a
   panic) and removes the socket, the ublk server ends with an error, and
   such a run is refused.
+* The writers of the write-back cache and the parity journal (`--rw`)
+  continued a log after the slot of the highest sequence, which a damaged
+  or hostile log may hold past the end of what is read: the writes they
+  logged were not read again (cached data lost, stripes left dirty); and a
+  log whose newest sequence was 2^64 - 1 made them overflow (a panic); and
+  the journal writer, its log come round to the slot it is read from
+  without a checkpoint area to carry the entries there, wrote over them, so
+  that stripes being written loaded as consistent. They continue where the
+  log is read to, such a log is not written, and such a journal takes no
+  more writes.
+  Found by the new fuzz targets `cache_writer` and `journal_writer` (which
+  continue fuzzed logs), with the Storage Spaces checksums now passed in
+  fuzzing builds as the ReFS ones are.
 * The checks of a pool of many spaces (`spaces attach`, `spaces check`)
   took about three times as long as in 1.2.2: 1.3.0's check for unmapped
   fixed spaces looked up each space's hidden spaces among all the pool's

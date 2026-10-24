@@ -62,6 +62,8 @@ pub struct ParityJournal {
     checkpoint: Option<Checkpoint>,
     /// The newest entry per run of the merged slot area, and its bytes.
     current: HashMap<u64, (Consistency, Vec<u8>)>,
+    /// The slot after the last one the log was read to: where it goes on.
+    continues: usize,
 }
 
 /// The header of a new parity journal (a 256 MiB child space): the cache
@@ -126,7 +128,7 @@ impl ParityJournal {
         if &head[0..8] != SPVDT_SIGNATURE {
             return Ok(None);
         }
-        if crc32_excluding(&head, 0x24) != le_u32(&head[0x24..]) {
+        if !crate::crc::matches(crc32_excluding(&head, 0x24), le_u32(&head[0x24..])) {
             return Err(format_err!("parity journal header checksum mismatch"));
         }
         if Guid::from_mixed_endian(head[8..24].try_into().unwrap()) != owner {
@@ -146,7 +148,7 @@ impl ParityJournal {
         let checkpoints = load_checkpoints(&mut read, owner, cp_offset, cp_size, cp_count)?;
         let checkpoint = checkpoints.iter().flatten().max_by_key(|c| c.sequence).cloned();
         let mut budget = MAX_INDEX;
-        let current = Self::parse(&merged, slot_size, checkpoint.as_ref(), stripes, &mut budget)?;
+        let (current, continues) = Self::parse(&merged, slot_size, checkpoint.as_ref(), stripes, &mut budget)?;
         let mut runs: HashMap<u64, Vec<Consistency>> = HashMap::new();
         let mut add = |entries: Entries| {
             for (offset, (c, _)) in entries {
@@ -165,7 +167,7 @@ impl ParityJournal {
                 checkpoint.as_ref()
             };
             if *copy != merged || own != checkpoint.as_ref() {
-                add(Self::parse(copy, slot_size, own, stripes, &mut budget)?);
+                add(Self::parse(copy, slot_size, own, stripes, &mut budget)?.0);
             }
         }
         Ok(Some(ParityJournal {
@@ -176,6 +178,7 @@ impl ParityJournal {
             run_geometry: (run_size, stripe),
             checkpoint,
             current,
+            continues,
         }))
     }
 
@@ -183,14 +186,15 @@ impl ParityJournal {
     /// checkpoint describes, read as Windows reads a cache log: the
     /// checkpoint's entries, then the slots from the one it names on while
     /// their sequences increase (from slot 0 without a checkpoint); the
-    /// newest entry per run counts.
+    /// newest entry per run counts. With it, the slot after the last one
+    /// read, where the log goes on.
     fn parse(
         area: &[u8],
         slot_size: usize,
         checkpoint: Option<&Checkpoint>,
         stripes: Option<u64>,
         budget: &mut u64,
-    ) -> Result<Entries> {
+    ) -> Result<(Entries, usize)> {
         type Versioned = ((u64, usize), Consistency, Vec<u8>);
         let mut newest: HashMap<u64, Versioned> = HashMap::new();
         let mut apply = |sequence: u64, bytes: &[u8], count: usize| -> Result<()> {
@@ -212,22 +216,25 @@ impl ParityJournal {
             None => (0, 0),
         };
         let slots: Vec<&[u8]> = area.chunks_exact(slot_size).collect();
+        let mut read = 0;
         for k in 0..slots.len() {
             let slot = slots[(start + k) % slots.len()];
             let sequence = le_u64(&slot[0x28..]);
             if &slot[0..8] != SPSLOT_SIGNATURE
                 || le_u32(&slot[0x1c..]) as usize != slot_size
-                || crc32_excluding(slot, 0x24) != le_u32(&slot[0x24..])
+                || !crate::crc::matches(crc32_excluding(slot, 0x24), le_u32(&slot[0x24..]))
                 || sequence <= last
             {
                 break; // the end of the log
             }
             last = sequence;
+            read = k + 1;
             if le_u32(&slot[0x20..]) == 0 {
                 apply(sequence, &slot[0x38..], le_u32(&slot[0x30..]) as usize)?;
             }
         }
-        Ok(newest.into_iter().map(|(k, (_, c, raw))| (k, (c, raw))).collect())
+        let entries = newest.into_iter().map(|(k, (_, c, raw))| (k, (c, raw))).collect();
+        Ok((entries, (start + read) % slots.len().max(1)))
     }
 
     /// Whether stripe `stripe` (counted from the start of the extent run that
@@ -343,16 +350,16 @@ impl ParityJournal {
     pub fn writer(&self, owner: Guid) -> JournalWriter {
         let (_, slot_size, slot_count) = self.geometry;
         let mut w = JournalWriter::new(owner, slot_size, slot_count);
-        // A checkpoint newer than every slot continues at the slot it names.
-        if let Some(c) = &self.checkpoint {
-            (w.sequence, w.next_slot) = (c.sequence, c.next_slot as usize % slot_count.max(1) as usize);
+        // The log goes on after the last slot it was read to, its sequence
+        // past every slot's, so that no slot past the end is read after the
+        // new ones (1.3.0 went on after the slot of the highest sequence,
+        // which may lie past the end, where no load looks; found by the
+        // journal_writer fuzz target).
+        w.sequence = self.checkpoint.as_ref().map_or(0, |c| c.sequence);
+        if let Some(newest) = self.slots.iter().map(|s| s.sequence).max() {
+            w.sequence = w.sequence.max(newest);
         }
-        if let Some(newest) = self.slots.iter().max_by_key(|s| s.sequence)
-            && newest.sequence > w.sequence
-        {
-            w.sequence = newest.sequence;
-            w.next_slot = (newest.index + 1) % slot_count.max(1) as usize;
-        }
+        w.next_slot = self.continues % slot_count.max(1) as usize;
         for s in &self.slots {
             if let Some(v) = w.slot_seq.get_mut(s.index) {
                 *v = s.sequence;
@@ -505,16 +512,38 @@ impl JournalWriter {
         self.entry(run_start)
     }
 
+    /// Whether the log's sequence numbers are used up: every slot takes the
+    /// next one (two with a checkpoint), and a log a hostile disk continued
+    /// from near 2^64 has none left (1.3.0 counted on past it, a panic).
+    /// Room is kept for 2^32 slots.
+    pub fn used_up(&self) -> bool {
+        self.sequence > u64::MAX - (1 << 32)
+    }
+
     /// The next slot, with the entry for the run at `run_start`, after a
     /// checkpoint where the log comes round to the slot the newest one
     /// continues at.
     fn entry(&mut self, run_start: u64) -> Result<Vec<LogWrite>> {
+        if self.used_up() {
+            return Err(format_err!(
+                "the parity journal's log has used up its sequence numbers (a slot near 2^64)"
+            ));
+        }
         let entry = self.encode(run_start)?;
         self.listed.insert(run_start);
         let mut out = Vec::new();
         let index = self.next_slot;
         let (cp_seq, cp_area, cp_next) = self.checkpoint.unwrap_or((0, usize::MAX, 0));
         let overwritten = self.slot_seq.get(index).copied().unwrap_or(0);
+        // Come round to the slot the log is read from: its entries go into a
+        // checkpoint first; without a checkpoint area they would be lost,
+        // stripes being written then loading as consistent (1.3.0 wrote
+        // over them; found by the journal_writer fuzz target).
+        if index == cp_next && overwritten > cp_seq && self.checkpoint_count == 0 {
+            return Err(crate::Error::Unsupported(
+                "the parity journal's log is full, and it has no checkpoint area to carry its entries".into(),
+            ));
+        }
         if index == cp_next && overwritten > cp_seq && self.checkpoint_count > 0 {
             self.sequence += 1;
             let area = cp_area.wrapping_add(1) % self.checkpoint_count as usize;

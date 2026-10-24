@@ -4,7 +4,8 @@ into their corpus (fuzz/corpus/<target>/seed-*), and the dictionaries
 (fuzz/dicts/<target>.dict, which libFuzzer gets as -dict). The cases are
 those of the code audit of 2026-10-16: partition tables and boot sectors
 with numbers past any disk (guard_userdata), record fields at the edges of
-their types (policy_fields). tools/fuzz-long.sh runs it before fuzzing:
+their types (policy_fields); and for the writer targets (journal_writer,
+cache_writer) the corpora of the readers with writes after them. tools/fuzz-long.sh runs it before fuzzing:
 python3 fuzz/seeds.py
 """
 import os
@@ -237,6 +238,44 @@ def guard_dict():
     return "\n".join(lines) + "\n"
 
 
+def writer_seeds(source, limit=400):
+    """The inputs of `source`'s corpus (parity_journal, cache_index), which
+    the writer targets read the same way, with 64 bytes of writes after
+    them."""
+    d = os.path.join(CORPUS, source)
+    seeds = {}
+    if os.path.isdir(d):
+        for name in sorted(os.listdir(d))[:limit]:
+            with open(os.path.join(d, name), "rb") as f:
+                data = f.read()
+            if name.startswith("seed-"):
+                continue
+            seeds[f"{source}-{name[:16]}"] = data + struct.pack("<I", zlib.crc32(data)) * 16
+    return seeds
+
+
+def journal_writer_seeds():
+    """Beside the parity_journal corpus: a slot of 0x1000 bytes holding an
+    entry of 2000 runs of 0x7fff stripes (the auditor's spb_03, for the
+    journal), and one whose sequence is 2^64 - 1 (plan item 3.14)."""
+    seeds = writer_seeds("parity_journal")
+    many = [((i & 1) << 15) | 0x7FFF for i in range(2000)]
+    for name, words, sequence in [("many-runs", many, 5), ("sequence-top", [0x10], (1 << 64) - 1)]:
+        space = bytearray(0x60 + 0x1000)
+        space[0x38:0x3C] = struct.pack("<I", 0x1000 - 0x40)
+        space[0x3C:0x40] = struct.pack("<I", 1)
+        slot = bytearray(0x1000)
+        slot[0:8] = b"SPSLOT\0\0"
+        slot[0x18:0x1C] = struct.pack("<I", 1)
+        slot[0x28:0x30] = struct.pack("<Q", sequence)
+        slot[0x30:0x34] = struct.pack("<I", 1)
+        entry = struct.pack("<QHH", 0, 2, 2 * len(words)) + b"".join(struct.pack("<H", w) for w in words)
+        slot[0x38 : 0x38 + len(entry)] = entry
+        space[0x60:] = slot
+        seeds[name] = bytes(space) + bytes(64)
+    return seeds
+
+
 def write_dir(target, seeds):
     d = os.path.join(CORPUS, target)
     os.makedirs(d, exist_ok=True)
@@ -247,6 +286,8 @@ def write_dir(target, seeds):
 
 write_dir("guard_userdata", guard_seeds())
 write_dir("policy_fields", policy_seeds())
+write_dir("journal_writer", journal_writer_seeds())
+write_dir("cache_writer", writer_seeds("cache_index"))
 os.makedirs(DICTS, exist_ok=True)
 with open(os.path.join(DICTS, "refs_volume.dict"), "w") as f:
     f.write(refs_dict())

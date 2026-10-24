@@ -46,7 +46,11 @@ fuzz_target!(|data: &[u8]| {
             if let Some(h) = &c.header {
                 let page = h.encode();
                 let covered = 0x18 + 8 * h.runs.len();
-                assert_eq!(page[..covered], c.page[..covered]);
+                // The CRC as stored aside: fuzzing builds take any (the
+                // encoder writes the right one).
+                let mut stored = c.page[..covered].to_vec();
+                stored[0x14..0x18].copy_from_slice(&page[0x14..0x18]);
+                assert_eq!(page[..covered], stored[..]);
                 let again = DirtyRegions::load(0x4000, |off, buf| {
                     buf.fill(0);
                     if off == 0 {

@@ -24,6 +24,14 @@ pub fn crc32(data: &[u8]) -> u32 {
         .fold(!0u32, |c, &b| TABLE[((c ^ b as u32) & 0xff) as usize] ^ (c >> 8))
 }
 
+/// Whether a checksum read is the one computed: always in fuzzing builds,
+/// so that the fuzzed bytes reach the parsers behind the checksums, as the
+/// ReFS ones do (1.3.0's fuzz targets stopped at every checksum their
+/// harnesses did not set).
+pub fn matches(computed: u32, stored: u32) -> bool {
+    cfg!(fuzzing) || computed == stored
+}
+
 /// CRC-32 of `data` with the 4-byte checksum field at `field` treated as zero.
 pub fn crc32_excluding(data: &[u8], field: usize) -> u32 {
     let mut copy = data.to_vec();

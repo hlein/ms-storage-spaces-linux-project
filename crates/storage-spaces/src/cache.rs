@@ -329,6 +329,9 @@ impl CacheWriter {
     /// than are left without reusing ones that still map cached data: then
     /// everything has to be destaged first.
     pub fn is_full_for(&self, offset: u64, len: u64) -> bool {
+        if self.used_up() {
+            return true;
+        }
         let chunk = self.header.chunk_size as u64;
         let new = (offset / chunk..(offset + len).div_ceil(chunk))
             .filter(|c| !self.chunks.contains_key(c))
@@ -354,6 +357,9 @@ impl CacheWriter {
     /// block, as Windows logs them. Once the cache is empty its blocks are
     /// handed out from the first again.
     pub fn destage(&mut self, offsets: &[u64]) -> Vec<LogWrite> {
+        if self.used_up() {
+            return Vec::new();
+        }
         let chunk = self.header.chunk_size as u64;
         let capacity = (self.header.slot_size as usize).saturating_sub(0x38) / 16;
         let mut slots = Vec::new();
@@ -503,6 +509,15 @@ impl CacheWriter {
     /// Recounts what the entries of the cached chunks take.
     fn recount(&mut self) {
         self.entry_bytes = self.chunks.values().map(|(_, valid)| valid.entry_len()).sum();
+    }
+
+    /// Whether the log's sequence numbers are used up: every slot takes the
+    /// next one (two with a checkpoint), and a log a hostile disk continued
+    /// from near 2^64 has none left (1.3.0 counted on past it, a panic;
+    /// found by the cache_writer fuzz target). Room is kept for 2^32
+    /// slots, many times what any log holds.
+    pub fn used_up(&self) -> bool {
+        self.sequence > u64::MAX - (1 << 32)
     }
 
     /// Appends the next slot with `count` entries, after a checkpoint where
@@ -692,7 +707,7 @@ pub(crate) fn slot_sequence(slot: &[u8]) -> Option<u64> {
     (slot.len() >= 0x38
         && &slot[0..8] == SPSLOT_SIGNATURE
         && le_u32(&slot[0x1c..]) as usize == slot.len()
-        && crc32_excluding(slot, 0x24) == le_u32(&slot[0x24..]))
+        && crate::crc::matches(crc32_excluding(slot, 0x24), le_u32(&slot[0x24..])))
     .then(|| le_u64(&slot[0x28..]))
 }
 
@@ -747,14 +762,14 @@ impl Checkpoint {
             || &b[..8] != SPCHECK_SIGNATURE
             || Guid::from_mixed_endian(b[8..24].try_into().unwrap()) != owner
             || le_u32(&b[0x1c..]) as usize != CHECKPOINT_HEADER
-            || crc32_excluding(&b[..CHECKPOINT_HEADER], 0x24) != le_u32(&b[0x24..])
+            || !crate::crc::matches(crc32_excluding(&b[..CHECKPOINT_HEADER], 0x24), le_u32(&b[0x24..]))
         {
             return None;
         }
         let start = le_u32(&b[0x40..]) as usize;
         let len = le_u32(&b[0x48..]) as usize;
         let entries = b.get(start..start.checked_add(len)?)?;
-        if le_u32(&b[0x34..]) as usize != start + len || crc32(entries) != le_u32(&b[0x30..]) {
+        if le_u32(&b[0x34..]) as usize != start + len || !crate::crc::matches(crc32(entries), le_u32(&b[0x30..])) {
             return None;
         }
         Some(Checkpoint {
@@ -934,7 +949,9 @@ impl CacheHeader {
         if &b[0..8] != SPCACHE_SIGNATURE {
             return Ok(None);
         }
-        if le_u32(&b[0x1c..]) as usize != Self::SIZE || crc32_excluding(&b[..Self::SIZE], 0x24) != le_u32(&b[0x24..]) {
+        if le_u32(&b[0x1c..]) as usize != Self::SIZE
+            || !crate::crc::matches(crc32_excluding(&b[..Self::SIZE], 0x24), le_u32(&b[0x24..]))
+        {
             return Err(format_err!("cache header checksum mismatch"));
         }
         let h = CacheHeader {
@@ -1007,6 +1024,8 @@ pub struct CacheIndex {
     conflicts: HashSet<u64>,
     slots: Vec<Slot>,
     checkpoint: Option<Checkpoint>,
+    /// The slot after the last one the log was read to: where it goes on.
+    continues: usize,
 }
 
 impl CacheIndex {
@@ -1027,7 +1046,7 @@ impl CacheIndex {
         )?;
         let checkpoint = checkpoints.iter().flatten().max_by_key(|c| c.sequence).cloned();
         let mut budget = MAX_INDEX;
-        let chunks = Self::map(&header, sector, &merged, checkpoint.as_ref(), &mut budget)?;
+        let (chunks, continues) = Self::map(&header, sector, &merged, checkpoint.as_ref(), &mut budget)?;
         let mut conflicts = HashSet::new();
         for (i, copy) in copies.iter().enumerate() {
             // Each copy with its own checkpoint, where the copies line up.
@@ -1039,7 +1058,7 @@ impl CacheIndex {
             if *copy == merged && own == checkpoint.as_ref() {
                 continue;
             }
-            let other = Self::map(&header, sector, copy, own, &mut budget)?;
+            let (other, _) = Self::map(&header, sector, copy, own, &mut budget)?;
             for key in chunks.keys().chain(other.keys()) {
                 if chunks.get(key) != other.get(key) {
                     conflicts.insert(*key);
@@ -1056,26 +1075,28 @@ impl CacheIndex {
             conflicts,
             slots,
             checkpoint,
+            continues,
         })
     }
 
     /// The chunk mapping one version of the slot area and checkpoint
     /// describes, read as Windows does (see [`Checkpoint`]): the
     /// checkpoint, then the slots from the one it names on while their
-    /// sequences increase (from slot 0 without a checkpoint).
+    /// sequences increase (from slot 0 without a checkpoint); and the slot
+    /// after the last one read, where the log goes on.
     fn map(
         header: &CacheHeader,
         sector: u64,
         area: &[u8],
         checkpoint: Option<&Checkpoint>,
         budget: &mut u64,
-    ) -> Result<ChunkMap> {
+    ) -> Result<(ChunkMap, usize)> {
         let slot_size = header.slot_size as usize;
         let valid = |slot: &[u8]| {
             &slot[0..8] == SPSLOT_SIGNATURE
                 && Guid::from_mixed_endian(slot[8..24].try_into().unwrap()) == header.owner_guid
                 && le_u32(&slot[0x1c..]) as usize == slot_size
-                && crc32_excluding(slot, 0x24) == le_u32(&slot[0x24..])
+                && crate::crc::matches(crc32_excluding(slot, 0x24), le_u32(&slot[0x24..]))
         };
         let slots: Vec<&[u8]> = area.chunks_exact(slot_size).collect();
 
@@ -1122,6 +1143,7 @@ impl CacheIndex {
             }
             None => (0, 0),
         };
+        let mut read = 0;
         for k in 0..slots.len() {
             let slot = slots[(start + k) % slots.len()];
             let sequence = le_u64(&slot[0x28..]);
@@ -1129,17 +1151,19 @@ impl CacheIndex {
                 break; // the end of the log
             }
             last = sequence;
+            read = k + 1;
             if le_u32(&slot[0x20..]) == SLOT_TYPE_MAPPING {
                 apply(sequence, &slot[0x38..], le_u32(&slot[0x30..]) as usize)?;
             }
         }
-        Ok(newest_for_chunk
+        let map = newest_for_chunk
             .into_iter()
             .filter_map(|(key, (version, target))| {
                 let (block, valid) = target?;
                 (newest_for_block.get(&block) == Some(&version)).then_some((key, (block, valid)))
             })
-            .collect())
+            .collect();
+        Ok((map, (start + read) % slots.len().max(1)))
     }
 
     /// The newest valid checkpoint.
@@ -1186,17 +1210,16 @@ impl CacheIndex {
                 *v = s.sequence;
             }
         }
-        // A checkpoint newer than every slot continues at the slot it names.
-        if let Some(c) = &self.checkpoint {
-            w.sequence = c.sequence;
-            w.next_slot = c.next_slot as usize % self.header.slot_count.max(1) as usize;
+        // The log goes on after the last slot it was read to, its sequence
+        // past every slot's, so that no slot past the end is read after the
+        // new ones (1.3.0 went on after the slot of the highest sequence,
+        // which may lie past the end, where no load looks: the writes were
+        // lost; found by the cache_writer fuzz target).
+        w.sequence = self.checkpoint.as_ref().map_or(0, |c| c.sequence);
+        if let Some(newest) = self.slots.iter().map(|s| s.sequence).max() {
+            w.sequence = w.sequence.max(newest);
         }
-        if let Some(newest) = self.slots.iter().max_by_key(|s| s.sequence)
-            && newest.sequence > w.sequence
-        {
-            w.sequence = newest.sequence;
-            w.next_slot = (newest.index + 1) % self.header.slot_count.max(1) as usize;
-        }
+        w.next_slot = self.continues % self.header.slot_count.max(1) as usize;
         let sectors = (self.header.chunk_size as u64 / self.sector) as u32;
         for (&key, (block, validity)) in &self.chunks {
             let valid = match validity {

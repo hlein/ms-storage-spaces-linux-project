@@ -267,8 +267,9 @@ fn a_journals_entries_have_the_cache_index_budget() {
 
 /// A journal header naming two checkpoint areas of no bytes at 0 (the
 /// header's own place): they count as none, and the writer never writes a
-/// checkpoint, however often its log wraps. 1.3.0 wrote one over the header
-/// (the auditor's repro_spw05).
+/// checkpoint. 1.3.0 wrote one over the header (the auditor's
+/// repro_spw05). Come round to slot 0, where the log is read from, it
+/// refuses (plan item 3.14: the entries there would be lost).
 #[test]
 fn checkpoint_areas_of_no_bytes_are_none() {
     let mut header = journal_header(0x1000, 4, 0, 0);
@@ -284,10 +285,14 @@ fn checkpoint_areas_of_no_bytes_are_none() {
     let journal = load(&area).unwrap().unwrap();
     assert_eq!(journal.checkpoint_geometry().2, 0);
     let mut writer = journal.writer(OWNER);
-    for k in 0..12 {
+    for k in 0..4 {
         let writes = writer.write(0, 64, k, 1).unwrap();
         assert!(writes.iter().all(|w| w.slot().is_some()), "write {k}: a checkpoint");
     }
+    let Err(e) = writer.write(0, 64, 4, 1) else {
+        panic!("written over slot 0")
+    };
+    assert!(e.to_string().contains("no checkpoint area"), "{e}");
 }
 
 /// A run of 66 000 000 stripes: even recorded as not consistent as a whole
@@ -302,4 +307,200 @@ fn a_run_too_long_for_a_slot_is_an_error_not_a_cut_entry() {
         panic!("written")
     };
     assert!(e.to_string().contains("more than an entry"), "{e}");
+}
+
+/// A cache whose newest slot has the sequence 2^64 - 2 (which a hostile
+/// disk can store): a writer continuing it is full (each slot takes the
+/// next sequence, and none is left), and destaging writes nothing. 1.3.0
+/// added one past 2^64, a panic (found by the cache_writer fuzz target of
+/// plan item 3.14).
+#[test]
+fn a_cache_whose_sequences_are_used_up_takes_no_writes() {
+    let header = CacheHeader {
+        owner_guid: OWNER,
+        sequence: 1,
+        slot_offset: 0x1000,
+        slot_size: 0x1000,
+        slot_count: 16,
+        checkpoint_offset: 0,
+        checkpoint_size: 0,
+        checkpoint_count: 0,
+        data_offset: 0x10_0000,
+        chunk_size: 64 << 10,
+        chunk_count: 64,
+    };
+    let mut entries = 0u64.to_le_bytes().to_vec();
+    entries.extend_from_slice(&0u32.to_le_bytes());
+    entries.extend_from_slice(&3u16.to_le_bytes());
+    entries.extend_from_slice(&0u16.to_le_bytes());
+    let mut area = vec![0u8; 0x1000 + 16 * 0x1000];
+    area[..CacheHeader::SIZE].copy_from_slice(&header.encode(storage_spaces::cache::SPCACHE_SIGNATURE));
+    area[0x1000..0x2000].copy_from_slice(&slot(0x1000, u64::MAX - 1, 1, &entries));
+    let index = CacheIndex::load(header, 512, |off: u64, buf: &mut [u8]| {
+        buf.copy_from_slice(&area[off as usize..off as usize + buf.len()]);
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(index.cached_chunks(), 1);
+    let mut writer = index.writer(0);
+    assert!(writer.is_full_for(0x2_0000, 512), "a write would be taken");
+    let records = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| writer.destage(&[0]))).expect("a panic");
+    assert!(records.is_empty());
+}
+
+/// A parity journal whose newest slot has the sequence 2^64 - 1: a writer
+/// continuing it refuses to log, without a panic. 1.3.0 added one past
+/// 2^64 (the pattern of the cache's, plan item 3.14).
+#[test]
+fn a_journal_whose_sequences_are_used_up_takes_no_writes() {
+    let entry = run_entry(0, &[0x0010]);
+    let mut area = vec![0u8; 0x1000 + 4 * 0x1000];
+    area[..0x60].copy_from_slice(&journal_header(0x1000, 4, 0, 0));
+    area[0x1000..0x2000].copy_from_slice(&slot(0x1000, u64::MAX, 1, &entry));
+    let journal = load(&area).unwrap().unwrap();
+    let mut writer = journal.writer(OWNER);
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = writer.write(0, 64, 0, 1);
+    }));
+    assert!(r.is_ok(), "a panic");
+}
+
+/// What a writer's write returns, in either form (a list, or a result of
+/// one, as the journal's writer returns since 1.3.1).
+trait Records {
+    fn records(self) -> Vec<LogWrite>;
+}
+
+impl Records for Vec<LogWrite> {
+    fn records(self) -> Vec<LogWrite> {
+        self
+    }
+}
+
+impl Records for storage_spaces::Result<Vec<LogWrite>> {
+    fn records(self) -> Vec<LogWrite> {
+        self.unwrap()
+    }
+}
+
+/// Puts `records` in `area`: slots of `size` bytes from 0x1000.
+fn apply(area: &mut [u8], size: usize, records: Vec<LogWrite>) {
+    for r in records {
+        match r {
+            LogWrite::Slot(i, page) => area[0x1000 + i * size..0x1000 + (i + 1) * size].copy_from_slice(&page),
+            LogWrite::Checkpoint(..) => panic!("no checkpoint areas"),
+        }
+    }
+}
+
+/// A cache whose log ends at slot 0 (slot 1 holds nothing), with a slot of
+/// a higher sequence past it (3, from an older lap or a damaged disk): the
+/// loader stops at the end and takes slot 3 for none of the log. A writer
+/// continuing it must write where the log goes on, so that what it logs
+/// loads again. 1.3.0 continued after the highest sequence (slot 4), where
+/// no load looks: the writes were lost (found by the cache_writer fuzz
+/// target of plan item 3.14).
+#[test]
+fn a_cache_writer_continues_where_the_log_ends() {
+    let header = CacheHeader {
+        owner_guid: OWNER,
+        sequence: 1,
+        slot_offset: 0x1000,
+        slot_size: 0x1000,
+        slot_count: 8,
+        checkpoint_offset: 0,
+        checkpoint_size: 0,
+        checkpoint_count: 0,
+        data_offset: 0x10_0000,
+        chunk_size: 64 << 10,
+        chunk_count: 64,
+    };
+    let entry = |chunk: u64, block: u32| {
+        let mut e = (chunk * (64 << 10)).to_le_bytes().to_vec();
+        e.extend_from_slice(&block.to_le_bytes());
+        e.extend_from_slice(&3u16.to_le_bytes());
+        e.extend_from_slice(&0u16.to_le_bytes());
+        e
+    };
+    let mut area = vec![0u8; 0x1000 + 8 * 0x1000];
+    area[..CacheHeader::SIZE].copy_from_slice(&header.encode(storage_spaces::cache::SPCACHE_SIGNATURE));
+    area[0x1000..0x2000].copy_from_slice(&slot(0x1000, 10, 1, &entry(0, 0)));
+    area[0x4000..0x5000].copy_from_slice(&slot(0x1000, 100, 1, &entry(1, 1)));
+    let load = |area: &[u8]| {
+        CacheIndex::load(header.clone(), 512, |off: u64, buf: &mut [u8]| {
+            buf.copy_from_slice(&area[off as usize..off as usize + buf.len()]);
+            Ok(())
+        })
+        .unwrap()
+    };
+    let index = load(&area);
+    assert_eq!(index.cached_chunks(), 1);
+    let mut writer = index.writer(2);
+    let offset = 5 * (64 << 10);
+    apply(&mut area, 0x1000, writer.write(offset, 4096));
+    let expected = writer.lookup(offset).expect("cached");
+    match load(&area).lookup(offset) {
+        storage_spaces::cache::Lookup::Hit { cache_offset, .. } => assert_eq!(cache_offset, expected),
+        other => panic!("the write did not load again: {other:?}"),
+    }
+}
+
+/// A journal whose log ends at slot 0 (its entry: the 16 stripes of run 0
+/// being written; slot 1 holds nothing), with a slot of a higher sequence
+/// past it (3): a writer continuing it logs the 16 stripes consistent where
+/// the log goes on, and they load so. 1.3.0 continued after the highest
+/// sequence, where no load looks, and the stripes stayed dirty (found by the
+/// journal_writer fuzz target of plan item 3.14).
+#[test]
+fn a_journal_writer_continues_where_the_log_ends() {
+    let mut area = vec![0u8; 0x1000 + 8 * 0x1000];
+    area[..0x60].copy_from_slice(&journal_header(0x1000, 8, 0, 0));
+    area[0x1000..0x2000].copy_from_slice(&slot(0x1000, 10, 1, &run_entry(0, &[0x0010])));
+    area[0x4000..0x5000].copy_from_slice(&slot(0x1000, 100, 1, &run_entry(1 << 30, &[0x0010])));
+    let journal = load(&area).unwrap().unwrap();
+    assert!(journal.is_dirty(0, 5));
+    let mut writer = journal.writer(OWNER);
+    apply(&mut area, 0x1000, writer.write(0, 16, 0, 16).records());
+    let again = load(&area).unwrap().unwrap();
+    for stripe in [0, 7, 15] {
+        assert!(!again.is_dirty(0, stripe), "stripe {stripe} of the written run");
+    }
+}
+
+/// What a writer's write returns, the records or none where it refused.
+trait Maybe {
+    fn maybe(self) -> Option<Vec<LogWrite>>;
+}
+
+impl Maybe for Vec<LogWrite> {
+    fn maybe(self) -> Option<Vec<LogWrite>> {
+        Some(self)
+    }
+}
+
+impl Maybe for storage_spaces::Result<Vec<LogWrite>> {
+    fn maybe(self) -> Option<Vec<LogWrite>> {
+        self.ok()
+    }
+}
+
+/// A journal of one slot and no checkpoint areas, its slot holding the 16
+/// stripes of run 0 being written: a write of another run would overwrite
+/// the slot the log is read from, with nowhere to carry run 0's entry. It
+/// is refused, and run 0 stays dirty. 1.3.0 overwrote the slot, and the
+/// stripes of run 0 loaded as consistent, their parity perhaps stale
+/// (found by the journal_writer fuzz target of plan item 3.14).
+#[test]
+fn a_journal_without_room_for_its_entries_is_not_overwritten() {
+    let mut area = vec![0u8; 0x2000];
+    area[..0x60].copy_from_slice(&journal_header(0x1000, 1, 0, 0));
+    area[0x1000..0x2000].copy_from_slice(&slot(0x1000, 10, 1, &run_entry(0, &[0x0010])));
+    let journal = load(&area).unwrap().unwrap();
+    assert!(journal.is_dirty(0, 5));
+    let mut writer = journal.writer(OWNER);
+    if let Some(records) = writer.write(1 << 30, 16, 0, 16).maybe() {
+        apply(&mut area, 0x1000, records);
+    }
+    let again = load(&area).unwrap().unwrap();
+    assert!(again.is_dirty(0, 5), "the stripes of run 0 load as consistent");
 }

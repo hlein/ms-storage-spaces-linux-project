@@ -1047,7 +1047,7 @@ impl GptHeader {
         let mut copy = self.raw[..self.header_size].to_vec();
         let stored = u32::from_le_bytes(copy[0x10..0x14].try_into().unwrap());
         copy[0x10..0x14].fill(0);
-        crc32(&copy) == stored
+        crate::crc::matches(crc32(&copy), stored)
     }
 
     /// Whether the entry array is plausible (and small enough to read).
@@ -1229,7 +1229,7 @@ fn partition_check(
             ];
             let parts = match entries_of(&b) {
                 Ok(t) => {
-                    if crc32(&t) != b.entries_crc {
+                    if !crate::crc::matches(crc32(&t), b.entries_crc) {
                         problems.push(
                             Evidence::new("the backup partition entries' CRC32")
                                 .at(at(b.entries_lba))
@@ -1346,7 +1346,7 @@ fn partition_check(
     }
     let primary_entries = match entries_of(&primary) {
         Ok(t) => {
-            if crc32(&t) != primary.entries_crc {
+            if !crate::crc::matches(crc32(&t), primary.entries_crc) {
                 problems.push(
                     Evidence::new("the primary partition entries' CRC32")
                         .at(at(primary.entries_lba))
@@ -1492,8 +1492,9 @@ fn partition_check(
     // backup at the last LBA that does, as for a primary lost (1.3.0 took
     // the primary's entries: none at all where it counted none; audit
     // 2026-10-21, the auditor's spa_06 and spg06).
-    let sound =
-        |h: &GptHeader, t: &Option<Vec<u8>>| h.crc_ok() && t.as_ref().is_some_and(|t| crc32(t) == h.entries_crc);
+    let sound = |h: &GptHeader, t: &Option<Vec<u8>>| {
+        h.crc_ok() && t.as_ref().is_some_and(|t| crate::crc::matches(crc32(t), h.entries_crc))
+    };
     let fallback = (!sound(&primary, &primary_entries) || primary.my_lba != 1)
         .then(|| {
             let b = read(last, sector as usize)

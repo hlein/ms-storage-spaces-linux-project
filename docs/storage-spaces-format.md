@@ -919,6 +919,21 @@ seen: `mirrorthin`, `paritythin`, `crashmirror`, `crashparity`), written
 when the cache is initialised; their mapping slots start at sequence 2. It
 carries no mappings and is skipped.
 
+`spaces` continues a log (the writers of the cache and of the parity
+journal, which share the slot format) after the last slot the replay
+reached, its sequence above every valid slot's, so that what it writes is
+replayed and no slot past the end after it. 1.3.0 continued after the slot
+of the highest sequence, which a damaged or hostile log may hold past the
+end of the replay: what it wrote was not read again (found by the
+`cache_writer` and `journal_writer` fuzz targets). A log whose newest
+sequence is within 2^32 of 2^64 takes no writes (the space is not opened
+for writing): 1.3.0 counted on past 2^64, a panic. A parity journal whose
+log would come round to the slot it is read from, with no checkpoint area
+to carry its entries (Windows' journals have two), takes no more writes:
+1.3.0 wrote over that slot, and the stripes its entries listed as being
+written loaded as consistent. (The cache's writer is full before its log
+can come round so: it counts the slots in use.)
+
 Data of owner offset `X` held in the cache is at cache offset
 `data_offset + chunk_index * chunk_size + (X % chunk_size)`.
 

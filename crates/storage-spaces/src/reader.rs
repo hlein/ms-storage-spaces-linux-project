@@ -560,14 +560,53 @@ impl<D: ReadAt> Mapped<'_, D> {
         Ok(true)
     }
 
+    /// Reads the `rank`-th copy of each unit `len` bytes at `offset` cover,
+    /// in the order of the copies' numbers: a copy of the range as the disks
+    /// hold it, whatever the extents number it (a run Windows moved is
+    /// numbered beyond the others, column by column: in replacedrun's cache
+    /// column 0 has copies 0 and 1, column 1 copies 0 and 2). False when a
+    /// unit has no such copy on the disks at hand.
+    fn read_rank(&self, rank: usize, mut offset: u64, mut buf: &mut [u8]) -> Result<bool> {
+        let l = &self.layout;
+        if offset.checked_add(buf.len() as u64).is_none() || offset < l.base {
+            return Err(format_err!(
+                "a read of {} bytes at {offset:#x} reaches beyond any space",
+                buf.len()
+            ));
+        }
+        while !buf.is_empty() {
+            let loc = l.locate(offset);
+            let n = buf.len().min(loc.contiguous as usize);
+            let place = l
+                .copies_of(loc.column)
+                .iter()
+                .filter_map(|&copy| l.physical(loc.column, copy, loc.row))
+                .nth(rank);
+            let Some((disk, slab)) = place else {
+                return Ok(false);
+            };
+            match self.pool.read_slab(disk, slab, loc.offset_in_slab, &mut buf[..n]) {
+                Ok(true) => {}
+                Ok(false) | Err(Error::Io(_)) => return Ok(false),
+                Err(e) => return Err(e),
+            }
+            offset += n as u64;
+            buf = &mut buf[n..];
+        }
+        Ok(true)
+    }
+
     /// Reads a slot area (write-back cache or parity journal) from every
-    /// copy that is complete on the disks at hand.
+    /// copy that is complete on the disks at hand ([`Mapped::read_rank`]:
+    /// 1.3.0 took copy `k` of every column, and read one copy of the slot
+    /// area of a cache whose copies a disk replacement numbered column by
+    /// column; one damaged slot then rolled its log back unseen).
     fn read_slot_copies(&self, offset: u64, len: usize) -> Result<Vec<Vec<u8>>> {
         let mut copies = Vec::new();
-        if self.layout.resiliency == Resiliency::Mirror {
-            for copy in 0..self.layout.copies {
+        if self.layout.resiliency == Resiliency::Mirror && offset >= self.layout.base {
+            for rank in 0..self.layout.copies as usize {
                 let mut area = vec![0u8; len];
-                if self.read_copy(copy, offset, &mut area)? {
+                if self.read_rank(rank, offset, &mut area)? {
                     copies.push(area);
                 }
             }

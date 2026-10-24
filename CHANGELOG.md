@@ -62,6 +62,14 @@
   2026-10-21, SPB-06). It refuses the first; it compares the copies of the
   listed runs first, as `spaces check` does, and refuses the mirror where
   they differ or there are more than 1 GiB of them.
+* The slot area of a write-back cache or parity journal whose mirror copies
+  a disk replacement had numbered column by column (Windows numbers a moved
+  copy beyond the others in its column: `replacedrun`'s cache has copies 0
+  and 1 in one column, 0 and 2 in the other) was read from one copy only.
+  One damaged slot there ended the log: chunks destaged since came back as
+  cached, read from blocks that no longer held them, and the space was
+  called healthy (found by the oracle run of this release on `replacedrun`).
+  Every copy of each unit is read now.
 * The checks of a pool of many spaces (`spaces attach`, `spaces check`)
   took about three times as long as in 1.2.2: 1.3.0's check for unmapped
   fixed spaces looked up each space's hidden spaces among all the pool's

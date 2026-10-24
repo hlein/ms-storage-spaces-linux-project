@@ -619,7 +619,14 @@ are then those of all its current copies in row order, and parity
 rotation, the logs' runs and the writer count from them; 1.3.0 counted
 from the runs of the column's first copy alone and read row 2 of the
 healthy `replacedrun` wrong (test
-`a_column_moved_for_some_rows_is_read_as_written`).
+`a_column_moved_for_some_rows_is_read_as_written`). The copies of a mirror
+are numbered so column by column: in `replacedrun`'s write-back cache (two
+columns, two copies) column 0 of its first row has copies 0 and 1, column 1
+copies 0 and 2 (on the new disk) (**verified**). A copy of a range that
+spans columns, such as a slot area, is the first, second, ... copy of each
+unit it covers; 1.3.1 reads it so, where 1.3.0 took copy `k` of every
+column and read such a slot area from one copy (test
+`the_slot_area_of_a_cache_moved_column_by_column_is_read_from_both_copies`).
 A disk that misses writes without a replacement (**verified** byte for byte
 by the test `a_returning_disk_is_updated_first_and_the_others_at_repair`
 on the scenario `m5stale`: two-way mirror on two disks, one detached while

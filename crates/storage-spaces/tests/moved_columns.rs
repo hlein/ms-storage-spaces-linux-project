@@ -18,7 +18,11 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use storage_spaces::Pool;
-use storage_spaces::io::{Overlay, ReadAt, SparseImage};
+use storage_spaces::format::SpaceRole;
+use storage_spaces::guard::{self, Options};
+use storage_spaces::io::{Overlay, ReadAt, SparseImage, WriteAt};
+use storage_spaces::layout::Layout;
+use storage_spaces::report::Verdict;
 use storage_spaces::testpattern;
 
 fn images(name: &str) -> Vec<SparseImage> {
@@ -207,4 +211,68 @@ fn a_column_moved_for_some_rows_is_written() {
     let pool = Pool::open(disks.iter().collect::<Vec<_>>()).unwrap();
     let found = storage_spaces::ops::scrub_spaces(&pool, Some(id)).unwrap();
     assert_eq!((found.mismatches, found.unsettled), (0, 0), "{:?}", found.lines);
+}
+
+/// The write-back cache of `replacedrun` is a two-column mirror whose copies
+/// the disk replacement numbered column by column: column 0 of its first row
+/// has copies 0 and 1, column 1 copies 0 and 2. Its slot area is read from
+/// both copies: of a chunk cached by one slot and destaged by the next, the
+/// second damaged on one copy, the destage is read from the other copy, and
+/// the copies' disagreement makes the space suspect. 1.3.0 read the slot area
+/// of copy 0 alone, where the damaged slot ended the log: the chunk was cached
+/// again with what its block held, and the space healthy (the oracle of plan
+/// item 3.2, replacedrun damage mutant 252).
+#[test]
+fn the_slot_area_of_a_cache_moved_column_by_column_is_read_from_both_copies() {
+    let images = images("replacedrun");
+    let disks: Vec<Overlay<&SparseImage>> = images.iter().map(Overlay::new).collect();
+    let pool = Pool::open(disks.iter().collect::<Vec<_>>()).unwrap();
+    let id = pool.find_space("replacedrun").unwrap().id();
+    let container = pool.children(id).find(|c| c.info.role == SpaceRole::Cache).unwrap();
+    let child = pool.children(container.id()).find(|c| !c.extents.is_empty()).unwrap();
+    let l = Layout::with_base(child.info.policy.as_ref().unwrap(), &child.extents, 0).unwrap();
+    // Writes `bytes` at cache offset `at` on every copy of its unit, or on
+    // the first.
+    let put = |at: u64, bytes: &[u8], every: bool| {
+        let loc = l.locate(at);
+        let places: Vec<(u64, u64)> = l
+            .copies_of(loc.column)
+            .iter()
+            .filter_map(|&copy| l.physical(loc.column, copy, loc.row))
+            .collect();
+        assert_eq!(places.len(), 2);
+        for &(disk, slab) in &places[..if every { 2 } else { 1 }] {
+            let (device, start) = pool.slab_location(disk, slab).unwrap().unwrap();
+            disks[device].write_all_at(bytes, start + loc.offset_in_slab).unwrap();
+        }
+    };
+    let reader = pool.open_space(id).unwrap();
+    let index = reader.cache().unwrap();
+    let header = index.header.clone();
+    let mut w = index.writer(64);
+    let mut slots = w.write(0, 4096);
+    slots.extend(w.destage(&[0]));
+    drop(reader);
+    let slot_at = |i: usize| header.slot_offset + i as u64 * u64::from(header.slot_size);
+    for s in &slots {
+        let (i, page) = s.slot().unwrap();
+        put(slot_at(i), page, true);
+    }
+    let report = |pool: &Pool<&Overlay<&SparseImage>>| {
+        guard::space_report(pool, &pool.spaces[&id], &[], &Options::default(), &mut |_, _, _| {
+            Vec::new()
+        })
+    };
+    let r = pool.open_space(id).unwrap();
+    assert_eq!(r.cache().unwrap().cached_chunks(), 0);
+    assert_eq!(report(&pool).verdict(), Verdict::Healthy, "{}", report(&pool).to_text());
+    drop(r);
+
+    let (last, _) = slots.last().unwrap().slot().unwrap();
+    put(slot_at(last), &[0u8; 512], false);
+    let r = pool.open_space(id).unwrap();
+    let cache = r.cache().unwrap();
+    assert_eq!(cache.cached_chunks(), 0, "the log rolled back");
+    assert_eq!(cache.conflicting_offsets(), [0]);
+    assert_eq!(report(&pool).verdict(), Verdict::Suspect, "{}", report(&pool).to_text());
 }

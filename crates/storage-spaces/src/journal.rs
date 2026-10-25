@@ -366,6 +366,7 @@ impl ParityJournal {
             }
         }
         w.checkpoint_count = self.checkpoint_geometry.2.min(4);
+        w.checkpoint_size = u64::from(self.checkpoint_geometry.1);
         w.checkpoint = self
             .checkpoint
             .as_ref()
@@ -429,6 +430,9 @@ pub struct JournalWriter {
     /// Number of checkpoint areas (0: none known), and the sequence, area
     /// and next slot of the newest checkpoint.
     checkpoint_count: u32,
+    /// The bytes of a checkpoint area (no limit for a model without a
+    /// header): a checkpoint longer is not written.
+    checkpoint_size: u64,
     checkpoint: Option<(u64, usize, usize)>,
 }
 
@@ -447,6 +451,7 @@ impl JournalWriter {
             listed: Default::default(),
             slot_seq: vec![0; slot_count as usize],
             checkpoint_count: 0,
+            checkpoint_size: u64::MAX,
             checkpoint: None,
         }
     }
@@ -545,13 +550,22 @@ impl JournalWriter {
             ));
         }
         if index == cp_next && overwritten > cp_seq && self.checkpoint_count > 0 {
-            self.sequence += 1;
             let area = cp_area.wrapping_add(1) % self.checkpoint_count as usize;
             let (entries, count) = self.checkpoint_entries()?;
-            out.push(LogWrite::Checkpoint(
-                area,
-                Checkpoint::encode(self.owner, 1, self.sequence, index as u32, count, &entries),
-            ));
+            let page = Checkpoint::encode(self.owner, 1, self.sequence + 1, index as u32, count, &entries);
+            // A checkpoint longer than its area would be written over what
+            // follows it (a hostile header's small areas, or more entries
+            // than Windows' areas hold): the journal is full (found by the
+            // journal_writer fuzz target, plan item 3.16).
+            if page.len() as u64 > self.checkpoint_size {
+                return Err(crate::Error::Unsupported(format!(
+                    "the parity journal's checkpoint of {} bytes does not fit its checkpoint area of {} bytes",
+                    page.len(),
+                    self.checkpoint_size
+                )));
+            }
+            self.sequence += 1;
+            out.push(LogWrite::Checkpoint(area, page));
             self.checkpoint = Some((self.sequence, area, index));
         }
         self.sequence += 1;

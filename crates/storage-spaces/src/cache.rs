@@ -500,10 +500,19 @@ impl CacheWriter {
 
     /// Whether a checkpoint of the map might not fit into a checkpoint area
     /// once a write touches `touched` chunks (each new one, or one more run
-    /// in each, takes at most 24 bytes more).
+    /// in each, takes at most 24 bytes more), in the whole pages
+    /// [`Checkpoint::encode`] writes (the entries alone were weighed, and a
+    /// page of 4 KiB was written into areas of less; plan item 3.16).
     fn checkpoint_may_overflow(&self, touched: u64) -> bool {
         let bound = CHECKPOINT_ENTRIES as u64 + self.entry_bytes as u64 + touched * 24;
-        bound > u64::from(self.header.checkpoint_size)
+        bound.next_multiple_of(4096) > u64::from(self.header.checkpoint_size)
+    }
+
+    /// Whether a checkpoint of what the cache holds now fits its checkpoint
+    /// areas (always, without any): destaging may write one, and a cache
+    /// whose doesn't is not written ([`crate::writer::SpaceWriter::open`]).
+    pub fn checkpoint_fits(&self) -> bool {
+        self.header.checkpoint_count == 0 || !self.checkpoint_may_overflow(0)
     }
 
     /// Recounts what the entries of the cached chunks take.

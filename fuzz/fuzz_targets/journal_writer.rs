@@ -77,6 +77,15 @@ fuzz_target!(|data: &[u8]| {
     // Where the header puts its slots and checkpoints.
     let (slot_offset, slot_size) = (le64(&space, 0x30) as usize, le32(&space, 0x38) as usize);
     let (cp_offset, cp_size) = (le64(&space, 0x40) as usize, le32(&space, 0x48) as usize);
+    // Checkpoint areas over the header or the slots are refused before any
+    // writer sees them (the guard's check of the regions a header names,
+    // since 1.3.1): not a case for the writer.
+    let cp_count = journal.checkpoint_geometry().2;
+    let slots_end = 0x60 + slot_size.saturating_mul(le32(&space, 0x3c) as usize);
+    let cp_end = cp_offset.saturating_add(cp_size.saturating_mul(cp_count as usize));
+    if cp_count > 0 && cp_offset < slots_end && cp_end > 0 {
+        return;
+    }
     // One stripe count for every run (a run has one).
     let stripes = 1 + u64::from(le32(writes, 60) % (1 << 20));
     let step = (stripes / 64).max(1) as usize;

@@ -222,6 +222,14 @@
   Found by the new fuzz targets `cache_writer` and `journal_writer` (which
   continue fuzzed logs), with the Storage Spaces checksums now passed in
   fuzzing builds as the ReFS ones are.
+* The writers of the write-back cache and the parity journal wrote a
+  checkpoint of whole pages, 4 KiB at least, into checkpoint areas a
+  header made smaller, over what follows them; the journal writer weighed
+  its checkpoint against its area not at all, the cache writer its entries
+  alone. A checkpoint that does not fit is not written: the journal is full
+  (the write fails), the cache takes no writes, and `--rw` refuses a cache
+  whose checkpoint of what it holds does not fit. Found by `journal_writer`
+  in the fuzzing of this release.
 * The checks of a pool of many spaces (`spaces attach`, `spaces check`)
   took about three times as long as in 1.2.2: 1.3.0's check for unmapped
   fixed spaces looked up each space's hidden spaces among all the pool's

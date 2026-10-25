@@ -1105,6 +1105,11 @@ other 6 journals are of parity tiers, which are not written); `spaces` does
 not write a space whose runs or stripes are of another size (its entries would count
 stripes the journal's readers do not expect). Checkpoint areas of fewer
 than 0x200 bytes or more than 256 MiB count as none, as for the cache. A
+checkpoint is whole pages of 4 KiB (Windows' areas hold 0x46000 bytes or
+more): one longer than its area is not written (the journal is full, a
+write fails), and a cache whose checkpoint might not fit takes no writes
+(since 1.3.1: a header's areas of less than 4 KiB got a page of 4 KiB,
+over what follows them). A
 run word of no stripes (0x8000) is refused: Windows writes none. Mapping slots (type 0) hold
 entries keyed by the owner offset where an extent run starts:
 

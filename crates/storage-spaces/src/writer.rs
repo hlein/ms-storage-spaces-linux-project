@@ -243,6 +243,14 @@ impl<'p, D: WriteAt> SpaceWriter<'p, D> {
                     "the write-back cache's log has used up its sequence numbers (a slot near 2^64)".into(),
                 ));
             }
+            if cache
+                .as_ref()
+                .is_some_and(|c| !c.log.read().unwrap_or_else(|e| e.into_inner()).writer.checkpoint_fits())
+            {
+                return Err(Error::Unsupported(
+                    "a checkpoint of what the write-back cache holds does not fit its checkpoint areas".into(),
+                ));
+            }
         }
         let space = reader.space;
         let alloc = match (space.info.provisioning, space.info.policy) {

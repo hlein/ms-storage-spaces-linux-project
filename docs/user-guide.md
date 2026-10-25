@@ -263,9 +263,11 @@ that Windows reads the result back. `attach --rw` refuses, with the reason:
 * a parity journal whose header counts extent runs of another size than
   the space's, and a write-back cache or parity journal whose sequence
   numbers are used up (within 2^32 of 2^64: no log Windows writes, a
-  damaged or hostile one). A parity journal without checkpoint areas whose
-  slots come round to the one its log is read from takes no more writes
-  (I/O errors) rather than write over the entries there.
+  damaged or hostile one), and a write-back cache a checkpoint of whose
+  contents would not fit its checkpoint areas. A parity journal without
+  checkpoint areas whose slots come round to the one its log is read from,
+  or whose checkpoint would not fit its area, takes no more writes (I/O
+  errors) rather than write over the entries there or past the area.
 
 Thin spaces allocate a row (256 MiB per column and copy) when a write first
 reaches it, as Windows does: the pool database on every member records the

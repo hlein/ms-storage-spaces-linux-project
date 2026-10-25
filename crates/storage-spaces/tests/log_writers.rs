@@ -504,3 +504,88 @@ fn a_journal_without_room_for_its_entries_is_not_overwritten() {
     let again = load(&area).unwrap().unwrap();
     assert!(again.is_dirty(0, 5), "the stripes of run 0 load as consistent");
 }
+
+/// A journal of one slot whose checkpoint area holds 0x300 bytes (a hostile
+/// header; Windows' hold 0x46000 or more): come round to its slot, the
+/// writer would write a checkpoint of 4 KiB there, over what follows the
+/// area. It refuses. 1.3.1's candidate wrote it (found by the
+/// journal_writer fuzz target in the campaign of plan item 3.16, where the
+/// area overlapped the header and the journal loaded empty).
+#[test]
+fn a_journal_checkpoint_larger_than_its_area_is_not_written() {
+    let header = CacheHeader {
+        owner_guid: OWNER,
+        sequence: 1,
+        slot_offset: 0x1000,
+        slot_size: 0x1000,
+        slot_count: 1,
+        checkpoint_offset: 0x2000,
+        checkpoint_size: 0x300,
+        checkpoint_count: 1,
+        data_offset: 0,
+        chunk_size: 0,
+        chunk_count: 1,
+    }
+    .encode(SPVDT_SIGNATURE);
+    let mut area = vec![0u8; 0x3000];
+    area[..header.len()].copy_from_slice(&header);
+    let journal = load(&area).unwrap().unwrap();
+    assert_eq!(journal.checkpoint_geometry(), (0x2000, 0x300, 1));
+    let mut writer = journal.writer(OWNER);
+    assert!(writer.write(0, 64, 0, 1).unwrap().iter().all(|w| w.slot().is_some()));
+    match writer.write(0, 64, 1, 1) {
+        Err(e) => assert!(e.to_string().contains("checkpoint area"), "{e}"),
+        Ok(records) => {
+            for r in &records {
+                if let LogWrite::Checkpoint(_, page) = r {
+                    panic!("a checkpoint of {:#x} bytes for an area of 0x300", page.len());
+                }
+            }
+        }
+    }
+}
+
+/// A cache whose checkpoint areas hold 0x300 bytes, written and destaged
+/// until its log comes round: no checkpoint longer than an area is made
+/// (Checkpoint::encode writes 4 KiB at least; the writer weighed the
+/// entries alone against the area).
+#[test]
+fn a_cache_checkpoint_larger_than_its_area_is_not_written() {
+    let header = CacheHeader {
+        owner_guid: OWNER,
+        sequence: 1,
+        slot_offset: 0x1000,
+        slot_size: 0x1000,
+        slot_count: 16,
+        checkpoint_offset: 0x11000,
+        checkpoint_size: 0x300,
+        checkpoint_count: 2,
+        data_offset: 0x10_0000,
+        chunk_size: 64 << 10,
+        chunk_count: 64,
+    };
+    let area = vec![0u8; 0x12000];
+    let index = CacheIndex::load(header, 512, |off: u64, buf: &mut [u8]| {
+        buf.copy_from_slice(&area[off as usize..off as usize + buf.len()]);
+        Ok(())
+    })
+    .unwrap();
+    let mut writer = index.writer(0);
+    for k in 0..64u64 {
+        let offset = k * (64 << 10);
+        let mut records = Vec::new();
+        if !writer.is_full_for(offset, 4096) {
+            records.extend(writer.write(offset, 4096));
+            records.extend(writer.destage(&[offset]));
+        }
+        for r in &records {
+            if let LogWrite::Checkpoint(_, page) = r {
+                assert!(
+                    page.len() <= 0x300,
+                    "write {k}: a checkpoint of {:#x} bytes",
+                    page.len()
+                );
+            }
+        }
+    }
+}

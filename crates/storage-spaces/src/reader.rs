@@ -305,7 +305,9 @@ impl<D: ReadAt> Mapped<'_, D> {
 
     /// Whether the present copies of `len` bytes at mirror offset `offset`
     /// (within one unit) differ; `None` when fewer than two can be read.
-    fn copies_differ(&self, offset: u64, len: usize) -> Result<Option<bool>> {
+    /// The copies are read into `buffers`, which the caller keeps from one
+    /// call to the next.
+    fn copies_differ(&self, offset: u64, len: usize, buffers: &mut [Vec<u8>; 2]) -> Result<Option<bool>> {
         let l = &self.layout;
         let loc = l.locate(offset);
         // Fewer than two copies on disks at hand: nothing to compare, and
@@ -324,16 +326,22 @@ impl<D: ReadAt> Mapped<'_, D> {
             return Ok(None);
         }
         let n = len.min(loc.contiguous as usize);
-        let (mut first, mut other) = (vec![0u8; n], vec![0u8; n]);
+        // Two buffers for every call, not two new ones (zeroed pages each
+        // time in the static build, whose memcmp compares byte by byte: the
+        // CPU of comparing a mirror tier at boot was most of the attach).
+        for b in buffers.iter_mut() {
+            b.resize(n, 0);
+        }
+        let [first, other] = buffers;
         let mut read = 0;
         for copy in 0..l.copies {
             let Some((disk, slab)) = l.physical(loc.column, copy, loc.row) else {
                 continue;
             };
-            let target = if read == 0 { &mut first } else { &mut other };
+            let target = if read == 0 { &mut first[..n] } else { &mut other[..n] };
             match self.pool.read_slab(disk, slab, loc.offset_in_slab, target) {
                 Ok(true) => {
-                    if read > 0 && other != first {
+                    if read > 0 && differ(&first[..n], &other[..n]) {
                         return Ok(Some(true));
                     }
                     read += 1;
@@ -984,6 +992,16 @@ fn same_log_header(a: &[u8], b: &[u8]) -> bool {
     a[..0x24] == b[..0x24] && a[0x30..0x60] == b[0x30..0x60]
 }
 
+/// Whether two copies of a place differ: 4 KiB at a time, without an early
+/// end inside one, which the compiler compares many bytes at once (slice
+/// equality is memcmp, byte by byte in the static musl build).
+fn differ(a: &[u8], b: &[u8]) -> bool {
+    a.len() != b.len()
+        || a.chunks(4096)
+            .zip(b.chunks(4096))
+            .any(|(x, y)| x.iter().zip(y).fold(0u8, |d, (p, q)| d | (p ^ q)) != 0)
+}
+
 /// Reads a cache or journal space, merging the slot areas of its copies;
 /// its header (at byte 0) as the copy chosen ([`Mapped::header`]).
 struct Slots<'a, 'p, D>(&'a Mapped<'p, D>, Vec<u8>);
@@ -1354,6 +1372,7 @@ impl<'p, D: ReadAt> SpaceReader<'p, D> {
         };
         let mut left = budget.unwrap_or(u64::MAX);
         const CHUNK: u64 = 1 << 20;
+        let mut buffers = [Vec::new(), Vec::new()];
         for slab in drt.runs() {
             let Some(start) = slab.checked_mul(SLAB_SIZE).filter(|&s| s < self.size) else {
                 continue;
@@ -1383,7 +1402,7 @@ impl<'p, D: ReadAt> SpaceReader<'p, D> {
                         Lookup::Miss { len } => n = n.min(len.max(1)),
                     }
                 }
-                match m.copies_differ(at, n as usize)? {
+                match m.copies_differ(at, n as usize, &mut buffers)? {
                     Some(differ) => {
                         if differ && out.differ.len() < 5 {
                             out.differ.push(at);

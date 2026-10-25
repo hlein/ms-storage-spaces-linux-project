@@ -3,6 +3,8 @@
 //! SPG-01: the auditor's spb_05, spg03 and spg04): what the guard compares,
 //! what it says it compared, and copies of a log page that disagree.
 
+use std::alloc::{GlobalAlloc, Layout, System};
+use std::cell::Cell;
 use std::fs::File;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -15,6 +17,27 @@ use storage_spaces::io::{Overlay, ReadAt, SparseImage, WriteAt};
 use storage_spaces::ops::scrub_spaces;
 use storage_spaces::report::{Check, Report, Status, Verdict};
 use storage_spaces::{Part, Pool, SpaceReader};
+
+/// Counts the bytes each thread allocated in all (the tests run side by
+/// side: another's are not the measured one's).
+struct Allocations;
+
+thread_local! {
+    static TOTAL: Cell<usize> = const { Cell::new(0) };
+}
+
+unsafe impl GlobalAlloc for Allocations {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        let _ = TOTAL.try_with(|t| t.set(t.get() + layout.size()));
+        unsafe { System.alloc(layout) }
+    }
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        unsafe { System.dealloc(ptr, layout) }
+    }
+}
+
+#[global_allocator]
+static ALLOCATOR: Allocations = Allocations;
 
 fn images(name: &str) -> Vec<SparseImage> {
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures").join(name);
@@ -171,6 +194,28 @@ fn listed_runs_with_one_copy_at_hand_are_not_read() {
     let c = reader.check_dirty_regions(Some(16 << 20)).unwrap().unwrap();
     assert_eq!(c.unreadable, 16 << 20, "{c:?}");
     assert_eq!(one.read.load(Ordering::Relaxed) - before, 0, "bytes read");
+}
+
+/// A two-way mirror whose log lists a run, both disks at hand: its copies
+/// are compared through two buffers, not two new ones for each MiB. Before
+/// 1.3.1 was released, that allocation (zeroed pages each time, with a
+/// byte-wise compare, in the static musl build) took the CPU of comparing
+/// a tiered space's mirror tier at boot: 15.5 s of 28 s for `ntfstier` on
+/// a test VM, where 1.3.0 attached in 4 s (`tools/boot-vm-check.sh`, plan
+/// item 3.17).
+#[test]
+fn listed_runs_are_compared_through_two_buffers() {
+    let images = images("mirror2");
+    let disks: Vec<Overlay<&SparseImage>> = images.iter().map(Overlay::new).collect();
+    let pool = Pool::open(disks.iter().collect::<Vec<_>>()).unwrap();
+    let id = pool.user_spaces().next().unwrap().id();
+    list(&pool, &disks, id, &[0]);
+    let reader = pool.open_space(id).unwrap();
+    let before = TOTAL.with(Cell::get);
+    let c = reader.check_dirty_regions(Some(16 << 20)).unwrap().unwrap();
+    let allocated = TOTAL.with(Cell::get) - before;
+    assert_eq!(c.compared, 16 << 20, "{c:?}");
+    assert!(allocated <= 3 << 20, "{allocated} bytes allocated");
 }
 
 /// A thin mirror whose log lists four unallocated runs (1 GiB) before an

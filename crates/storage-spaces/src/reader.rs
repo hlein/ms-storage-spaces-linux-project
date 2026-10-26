@@ -327,8 +327,10 @@ impl<D: ReadAt> Mapped<'_, D> {
         }
         let n = len.min(loc.contiguous as usize);
         // Two buffers for every call, not two new ones (zeroed pages each
-        // time in the static build, whose memcmp compares byte by byte: the
-        // CPU of comparing a mirror tier at boot was most of the attach).
+        // time in the static build: the CPU of comparing a mirror tier at
+        // boot was most of the attach). They are compared with memcmp: a
+        // fold the compiler widens only when it optimizes took a debug
+        // build past the 30 s a test gives the checks of a space.
         for b in buffers.iter_mut() {
             b.resize(n, 0);
         }
@@ -341,7 +343,7 @@ impl<D: ReadAt> Mapped<'_, D> {
             let target = if read == 0 { &mut first[..n] } else { &mut other[..n] };
             match self.pool.read_slab(disk, slab, loc.offset_in_slab, target) {
                 Ok(true) => {
-                    if read > 0 && differ(&first[..n], &other[..n]) {
+                    if read > 0 && first[..n] != other[..n] {
                         return Ok(Some(true));
                     }
                     read += 1;
@@ -990,16 +992,6 @@ fn drt_page_state(b: &[u8]) -> HeaderCopy {
 /// checksum and the sequence (0x24..0x30).
 fn same_log_header(a: &[u8], b: &[u8]) -> bool {
     a[..0x24] == b[..0x24] && a[0x30..0x60] == b[0x30..0x60]
-}
-
-/// Whether two copies of a place differ: 4 KiB at a time, without an early
-/// end inside one, which the compiler compares many bytes at once (slice
-/// equality is memcmp, byte by byte in the static musl build).
-fn differ(a: &[u8], b: &[u8]) -> bool {
-    a.len() != b.len()
-        || a.chunks(4096)
-            .zip(b.chunks(4096))
-            .any(|(x, y)| x.iter().zip(y).fold(0u8, |d, (p, q)| d | (p ^ q)) != 0)
 }
 
 /// Reads a cache or journal space, merging the slot areas of its copies;

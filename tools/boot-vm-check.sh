@@ -57,7 +57,11 @@ part=$(lsblk -nro NAME,FSTYPE /dev/mapper/ss-ss_ntfstier-ntfstier* 2>/dev/null |
 sudo /usr/sbin/spaces detach ntfstier >/dev/null
 for l in "${loops[@]}"; do sudo losetup -d "$l"; done
 [[ -n $part ]] || { echo "no NTFS partition found in ntfstier" >&2; exit 1; }
-echo "/dev/mapper/$part /mnt/sstest-boot ntfs3 ro,nofail,x-systemd.device-timeout=20s 0 0 $mark" | sudo tee -a /etc/fstab >/dev/null
+# The device timeout the user guide gives for a space's volume: since 1.3.1
+# the attach of this tiered pool compares its mirror tier's listed runs
+# (23-24 s at boot on the 26.10 VM; 1.3.0 4 s), past the 20 s this line
+# waited. The attach's time is the case servers'.
+echo "/dev/mapper/$part /mnt/sstest-boot ntfs3 ro,nofail,x-systemd.device-timeout=60s 0 0 $mark" | sudo tee -a /etc/fstab >/dev/null
 sudo mkdir -p /mnt/sstest-boot
 sudo tee /etc/systemd/system/sstest-boot-loops.service >/dev/null <<'UNIT'
 [Unit]

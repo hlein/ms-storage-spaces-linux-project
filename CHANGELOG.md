@@ -1,6 +1,35 @@
 # Changelog
 
-## Unreleased
+## 1.3.1 (2026-10-27)
+
+The code audit of 2026-10-21: parity reads of runs a disk replacement
+moved; verdicts that called spaces healthy whose records lack extents,
+whose hidden structures or tiers do not hold what the records name, or
+whose mirror tiers' listed runs were never compared; the device-mapper
+mapping of rows whose reads fail; the writers of the write-back cache and
+the parity journal, bounded by their logs and continuing where a load
+ends; management plans bound by the numbers they compute writes from; ReFS
+addresses, rows and checks a hostile volume could bend, the ReFS writer's
+clock and tails, and `refs mount --rw` with names in any case; attach
+under a pool whose checks hang, names as Windows gives them, relative
+paths; locks on a partition's whole disk; servers that answer a panic and
+a signal. Every fuzz target ran 24 hours and the oracles over every corpus
+pool (docs/security.md says what ran; the fuzzing found a checkpoint the
+log writers wrote past its area, fixed here). Checked on Ubuntu 26.10 and
+22.04 (`tools/guard-check.sh`, `tools/mount-vm-check.sh`,
+`tools/package-vm-check.sh` with an upgrade from 1.3.0,
+`tools/multi-vm-check.sh`, `tools/attach-crash-check.sh`,
+`tools/server-check.sh`, `tools/refs-mount-check.sh --rw`, the management
+scripts `tools/mgmt-*.sh`), and across two restarts on 26.10
+(`tools/boot-vm-check.sh`).
+
+Attaching a tiered space whose dirty region log lists runs now reads up to
+1 GiB of each copy of its mirror tier, as for a mirror space, to compare
+them: the boot check's pool, whose log lists two runs, attached in 23-24 s
+at boot on the 26.10 test VM (1.3.0, which compared nothing in a tiered
+space: 4 s), and its volume's fstab line with
+`x-systemd.device-timeout=20s` was not mounted; with the 60 s the user
+guide gives, it is.
 
 ### Fixes
 

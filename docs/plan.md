@@ -768,6 +768,45 @@ rows of thin spaces not allocated yet (M7).
   linuxreflect's `install.sh` installation shadows the package), the management
   scripts too (the corpus one alone: in one run after the others it ran out of
   room on the VM's scratch disk), no boot check (that VM is shared).
+* Release `v1.3.1` (2026-10-27): the code audit of 2026-10-21 (plan of
+  2026-10-22, items 3.0-3.17): parity reads of runs a disk replacement moved
+  (the Windows pool `replacedrun`); verdicts for records that lack extents,
+  hidden structures and tiers that do not hold what their records name, and
+  mirror tiers' listed runs; the device-mapper mapping of rows whose reads
+  fail; slot areas read from every copy; the writers of the write-back cache
+  and the parity journal bounded and continuing where a load ends;
+  management plans bound by the numbers they write from; GF(16) groups, GPT
+  fallbacks, NUL names and spaces of one GUID; ReFS addresses, writer rows,
+  `refs check` on hostile rows, the writer's clock and tails, `refs mount
+  --rw` names and times; attach timing, names and paths, locks on whole
+  disks, servers under panics and signals; fuzzing past the Storage Spaces
+  checksums with the new targets `journal_writer` and `cache_writer`. The
+  campaign (docs/security.md) found a checkpoint the log writers wrote past
+  its area (4a1af62); the VM checks found that a degraded tiered space read
+  its one mirror copy to the read budget (73a2305) and that comparing copies
+  took two new buffers per MiB (498bef1; memcmp again in 4cb362c, which CI's
+  debug-build tests need). Not changed, no test failing
+  (refuted or without a wrong outcome): SPG-02, SPG-03, SPG-04, SCB-03,
+  SCB-05, RFR-02 (the code they describe is not there), SCB-04 as written (no
+  `spaces bench`), RFW-02's duplicate extents and sizes past runs, RFW-03's
+  checkpoints of several clusters, RFW-04 point 3, RFC-01 point 2, RFC-02's
+  buffers, SCA-06, SPB-05's third case, SCB-02's ublk cases, every slab of
+  an extent within its disk, PKG-01 (versions 1.4-1.18 that do not exist).
+  Attaching a tiered space whose log lists runs reads up to 1 GiB of each
+  copy of its mirror tier (the boot check's pool: 23-24 s at boot on the
+  26.10 VM, 1.3.0 4 s). VM checks on the final binaries: on Ubuntu 26.10 (.143)
+  `guard-check` 29 passed, `mount-vm-check` 11, `package-vm-check` 17 (with
+  an upgrade from 1.3.0), `multi-vm-check` 5, `attach-crash-check` 34,
+  `server-check` 6, `refs-mount-check --rw` 7, the management scripts
+  (lifecycle, crash, replace, tiers, corpus) all, and `boot-vm-check` twice,
+  6 each, its fstab line waiting the 60 s the guide gives (the 20 s it had
+  were past the attach of its tiered pool, 23-24 s at boot: 4 of 6 each,
+  where 1.3.0, attaching in 4 s, passes 6). On Ubuntu
+  22.04 (.142) 18, 11, 12, 5, 31, 6 and 7 passed (9 cases skipped where
+  linuxreflect's `install.sh` installation shadows the package or its udev
+  rule is installed), the management scripts too (the corpus one alone:
+  after the others it runs out of room on the VM's scratch disk), no boot
+  check (that VM is shared).
 
 ### Track B (from 2026-10-02)
 

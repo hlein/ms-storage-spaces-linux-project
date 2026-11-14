@@ -719,3 +719,65 @@ fn a_log_away_from_the_starts_seen_is_found_by_the_container_table() {
     assert_eq!((state.region, state.control_page), ((to, to + 0x20000), to + 0x20000));
     assert!(!state.needs_replay());
 }
+
+/// A device that records where it is read.
+struct Reads<'d> {
+    image: &'d SparseImage,
+    at: std::sync::Mutex<std::collections::BTreeSet<u64>>,
+}
+
+impl<'d> Reads<'d> {
+    fn of(image: &'d SparseImage) -> Self {
+        Reads {
+            image,
+            at: Default::default(),
+        }
+    }
+}
+
+impl ReadAt for Reads<'_> {
+    fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> std::io::Result<()> {
+        self.at.lock().unwrap().insert(offset);
+        self.image.read_exact_at(buf, offset)
+    }
+
+    fn size(&self) -> std::io::Result<u64> {
+        self.image.size()
+    }
+}
+
+/// The quick checks find a log where a volume of ReFS 3.7 or 3.14 keeps
+/// it without opening the volume, which reads its whole container table:
+/// 16 000 pages of 4 KiB of a 10.75 TiB volume inside a mirror of two
+/// 12 TB disks, 32 s at every attach (1.3.0 and 1.3.1 opened it first).
+/// They read nothing that opening reads but the boot sector, the
+/// superblock and the checkpoints.
+#[test]
+fn the_log_is_found_without_the_container_table() {
+    for name in ["r314basic4k", "r314basic64k", "r37basic64k", "r37small"] {
+        let (image, offset) = fixture(name);
+        let (unit, _, _) = geometry(&image, offset);
+        let superblock = read(&image, offset + 0x1e * unit, unit as usize);
+        let (list, count) = (le32(&superblock, 0x70), le32(&superblock, 0x74));
+        let mut shared: std::collections::BTreeSet<u64> = (0..count)
+            .map(|i| offset + le64(&superblock, list + 8 * i) * unit)
+            .collect();
+        shared.extend([offset, offset + 0x1e * unit]);
+        let opening = Reads::of(&image);
+        refs::Volume::open(&opening, offset).unwrap();
+        let quick = Reads::of(&image);
+        let found = quick_checks(&quick, offset, "p2", &|o| format!("byte {o:#x}"));
+        assert_eq!(status(&found, "fs.refs.log").status, Status::Ok, "{name}: {found:#?}");
+        let (opening, quick) = (opening.at.into_inner().unwrap(), quick.at.into_inner().unwrap());
+        let tables: Vec<String> = opening
+            .difference(&shared)
+            .filter(|at| quick.contains(at))
+            .map(|at| format!("{at:#x}"))
+            .collect();
+        assert!(
+            tables.is_empty(),
+            "{name}: the quick checks read what opening the volume reads: {}",
+            tables.join(" ")
+        );
+    }
+}

@@ -295,12 +295,26 @@ pub fn quick_checks_in<D: ReadAt + ?Sized>(
     checks.push(if v1 {
         Check::skipped("fs.refs.log", format!("{label}: the log of ReFS 1.x is not read"))
     } else {
-        // Where the volume opens, its container table tells where the log
-        // may be ([`log_state`]): 1.2.2 tried two starts seen only.
-        let containers = crate::Volume::open(dev, offset)
-            .map(|v| v.container_pages())
-            .unwrap_or_default();
-        match log_state(dev, offset, unit, size, current.n, &containers) {
+        // The places the log is found without the container table first:
+        // the volume's first clusters, and after a region of a size seen
+        // from a start seen ([`log_state`] with no containers). Only where
+        // none holds the control page does the volume open, for its
+        // container table, which tells where else the log may be (1.2.2
+        // tried the starts seen only). Opening reads the whole table: 16 000
+        // pages of 4 KiB of a 10.75 TiB volume on a mirror of two 12 TB
+        // disks, 32 s at every attach and again in its server (1.3.0 and
+        // 1.3.1 opened the volume first; its log is where a start seen
+        // finds it).
+        let log = match log_state(dev, offset, unit, size, current.n, &[]) {
+            Err(crate::Error::NotFound(_)) => {
+                let containers = crate::Volume::open(dev, offset)
+                    .map(|v| v.container_pages())
+                    .unwrap_or_default();
+                log_state(dev, offset, unit, size, current.n, &containers)
+            }
+            found => found,
+        };
+        match log {
             Ok(log) if log.needs_replay() => {
                 let newest = log.newest.unwrap();
                 Check::new(

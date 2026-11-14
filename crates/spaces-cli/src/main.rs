@@ -204,6 +204,12 @@ enum Command {
         /// Read a degraded or suspect space anyway (read-only).
         #[arg(long)]
         force: bool,
+        /// Set by spaces attach, which has just checked the space: the
+        /// checks are made again without the reads of their budget (the
+        /// copies of the runs a dirty region log lists, the stripes a parity
+        /// journal lists), which reads make as they go.
+        #[arg(long, hide = true)]
+        checked: bool,
     },
     /// Expose a space as a ublk block device, read-only unless --rw
     /// (foreground; stop with SIGINT/SIGTERM). Needs root and the ublk_drv
@@ -227,6 +233,12 @@ enum Command {
         /// Read a degraded or suspect space anyway (read-only).
         #[arg(long)]
         force: bool,
+        /// Set by spaces attach, which has just checked the space: the
+        /// checks are made again without the reads of their budget (the
+        /// copies of the runs a dirty region log lists, the stripes a parity
+        /// journal lists), which reads make as they go.
+        #[arg(long, hide = true)]
+        checked: bool,
     },
     /// Expose a space as the read-only file MOUNTPOINT/space.img through FUSE
     /// (foreground; stop by unmounting). Attach it with `losetup -r -b SECTOR`.
@@ -247,6 +259,12 @@ enum Command {
         /// Read a degraded or suspect space anyway (read-only).
         #[arg(long)]
         force: bool,
+        /// Set by spaces attach, which has just checked the space: the
+        /// checks are made again without the reads of their budget (the
+        /// copies of the runs a dirty region log lists, the stripes a parity
+        /// journal lists), which reads make as they go.
+        #[arg(long, hide = true)]
+        checked: bool,
     },
     /// Print the pool metadata (database copies and records; cache, parity
     /// journal and dirty region logs of each space), one fact per line.
@@ -396,7 +414,7 @@ fn main() -> Result<()> {
         } => {
             let pool = open_pool_shared(&devices)?;
             let space = find_user_space(&pool, &space)?;
-            check::require(&pool, &devices, space, false, degraded, force)?;
+            check::require(&pool, &devices, space, false, degraded, force, false)?;
             export(&pool, space, &output)
         }
         Command::ServeNbd {
@@ -407,6 +425,7 @@ fn main() -> Result<()> {
             ready_file,
             degraded,
             force,
+            checked,
         } => {
             let pool = if rw {
                 open_pool_rw(&devices)?
@@ -414,7 +433,7 @@ fn main() -> Result<()> {
                 open_pool_shared(&devices)?
             };
             let space = find_user_space(&pool, &space)?;
-            check::require(&pool, &devices, space, rw, degraded, force)?;
+            check::require(&pool, &devices, space, rw, degraded, force, checked)?;
             serve_nbd(&pool, space, &socket, ready_file.as_deref(), rw)
         }
         #[cfg(all(target_os = "linux", feature = "ublk"))]
@@ -425,6 +444,7 @@ fn main() -> Result<()> {
             ready_file,
             degraded,
             force,
+            checked,
         } => {
             let pool: &'static Pool<File> = Box::leak(Box::new(if rw {
                 open_pool_rw(&devices)?
@@ -432,7 +452,7 @@ fn main() -> Result<()> {
                 open_pool_shared(&devices)?
             }));
             let found = find_user_space(pool, &space)?;
-            check::require(pool, &devices, found, rw, degraded, force)?;
+            check::require(pool, &devices, found, rw, degraded, force, checked)?;
             let id = found.id();
             let writer: Option<&'static storage_spaces::SpaceWriter<'static, File>> = if rw {
                 Some(Box::leak(Box::new(open_space_rw(pool, id)?)))
@@ -460,10 +480,11 @@ fn main() -> Result<()> {
             ready_file,
             degraded,
             force,
+            checked,
         } => {
             let pool: &'static Pool<File> = Box::leak(Box::new(open_pool_shared(&devices)?));
             let found = find_user_space(pool, &space)?;
-            check::require(pool, &devices, found, false, degraded, force)?;
+            check::require(pool, &devices, found, false, degraded, force, checked)?;
             let reader = Box::leak(Box::new(open_space(pool, found.id())?));
             fuse::serve(reader, pool.logical_sector_size, &mountpoint, ready_file.as_deref())
         }

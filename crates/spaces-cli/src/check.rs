@@ -221,9 +221,27 @@ fn stopped_report<D>(pool: &Pool<D>, space: &Space, stopped: &Stopped) -> Report
     r
 }
 
+/// What the checks of a server read: all that attach's do, or, when
+/// `checked` (spaces attach has just made them, reading the copies of the
+/// runs a dirty region log lists and the stripes a parity journal lists up
+/// to the read budget), none of the budget's reads. Reads of those places
+/// compare the copies and check the parity as they go; reading them again
+/// before the server is ready took a mirror of two 10 TB disks 34 s, as
+/// long as attach's checks (1.3.1).
+fn server_options(checked: bool) -> Options {
+    if checked {
+        Options {
+            journal_budget: Some(0),
+        }
+    } else {
+        Options::default()
+    }
+}
+
 /// Refuses what the gate refuses for the servers and export: an error
 /// with the report's headline and the reason. (The checks run on this
-/// thread; a panic in them fails the space.)
+/// thread; a panic in them fails the space.) `checked`: the caller has
+/// just made the checks ([`server_options`]).
 pub fn require<D: ReadAt>(
     pool: &Pool<D>,
     paths: &[PathBuf],
@@ -231,10 +249,12 @@ pub fn require<D: ReadAt>(
     rw: bool,
     degraded: bool,
     force: bool,
+    checked: bool,
 ) -> Result<()> {
     let names = names(paths);
+    let options = server_options(checked);
     let report = isolate::caught(|| {
-        let mut r = guard::space_report(pool, space, &names, &Options::default(), &mut |reader, part, names| {
+        let mut r = guard::space_report(pool, space, &names, &options, &mut |reader, part, names| {
             fs_checks(reader, part, names, false)
         });
         r.environment = environment(pool);
@@ -934,6 +954,63 @@ mod tests {
         assert_eq!(pool_deadline_within(None, None), None);
     }
 
+    /// A device that counts the bytes read from it.
+    struct Counted {
+        disk: storage_spaces::io::SparseImage,
+        read: Arc<std::sync::atomic::AtomicU64>,
+    }
+
+    impl ReadAt for Counted {
+        fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> std::io::Result<()> {
+            self.read
+                .fetch_add(buf.len() as u64, std::sync::atomic::Ordering::Relaxed);
+            self.disk.read_exact_at(buf, offset)
+        }
+
+        fn size(&self) -> std::io::Result<u64> {
+            self.disk.size()
+        }
+    }
+
+    /// A server that spaces attach starts (`--checked`) checks the space
+    /// without comparing the copies of the runs its dirty region log lists,
+    /// which attach's checks have just compared: on a mirror of two 10 TB
+    /// disks that took the server 34 s, as long as attach's checks, and
+    /// 1.3.1 gave it 30 s. By hand a server compares them, as attach does.
+    #[test]
+    fn servers_attach_starts_do_not_compare_the_listed_runs_again() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../storage-spaces/tests/fixtures/drtdism");
+        let read = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let disks: Vec<Counted> = (0..)
+            .map_while(|i| File::open(dir.join(format!("disk{i}.fixture"))).ok())
+            .map(|f| Counted {
+                disk: storage_spaces::io::SparseImage::read_from(f).unwrap(),
+                read: Arc::clone(&read),
+            })
+            .collect();
+        let pool = Pool::open(disks).unwrap();
+        let space = pool.user_spaces().next().unwrap();
+        let mut bytes = Vec::new();
+        for checked in [false, true] {
+            let r = guard::space_report(&pool, space, &[], &server_options(checked), &mut |_, _, _| Vec::new());
+            let drl = r.checks.iter().find(|c| c.id == "space.drl").unwrap();
+            assert_eq!(drl.status, storage_spaces::report::Status::Info, "{}", r.to_text());
+            if checked {
+                assert!(drl.summary.contains("nothing compared"), "{}", drl.summary);
+            } else {
+                assert!(drl.summary.contains("compared, the copies agree"), "{}", drl.summary);
+            }
+            assert_eq!(r.verdict(), Verdict::Healthy);
+            bytes.push(read.swap(0, std::sync::atomic::Ordering::Relaxed));
+            require(&pool, &[], space, false, false, false, checked).unwrap();
+            read.store(0, std::sync::atomic::Ordering::Relaxed);
+        }
+        // The budget of 1 GiB of each copy (2 GiB and 76 KiB read); without
+        // it 35 KiB, the metadata and the partition table.
+        assert!(bytes[0] > 2 << 30, "{bytes:?}");
+        assert!(bytes[1] < 1 << 20, "{bytes:?}");
+    }
+
     /// A device that panics on every read once `armed`.
     struct Trap {
         disk: storage_spaces::io::SparseImage,
@@ -967,10 +1044,10 @@ mod tests {
             .collect();
         let pool = Pool::open(disks).unwrap();
         let space = pool.user_spaces().next().unwrap();
-        require(&pool, &[], space, false, false, false).unwrap();
+        require(&pool, &[], space, false, false, false, false).unwrap();
         armed.store(true, Ordering::Relaxed);
         for (degraded, force) in [(false, false), (true, true)] {
-            let e = require(&pool, &[], space, false, degraded, force)
+            let e = require(&pool, &[], space, false, degraded, force, false)
                 .unwrap_err()
                 .to_string();
             assert!(e.contains("FAILED") && e.contains("space.checks"), "{e}");

@@ -895,6 +895,9 @@ fn start_server(unit: &str, kind: &str, paths: &[PathBuf], space: &str, extra: &
         ready.display().to_string(),
     ]);
     args.extend(extra.iter().map(|s| s.to_string()));
+    // The checks of this run (the reports of the pools' children) have
+    // just read what their budget lets them: the server need not again.
+    args.push("--checked".into());
     args.extend(crate::inherited_args());
     let launch = |limits: &[String]| {
         let all: Vec<&str> = head.iter().chain(limits).chain(&args).map(String::as_str).collect();

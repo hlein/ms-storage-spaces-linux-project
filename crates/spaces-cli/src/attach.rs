@@ -757,6 +757,24 @@ fn choose(
     bail!("no usable backend (install dmsetup, or load ublk_drv or nbd)")
 }
 
+/// How long `spaces attach` waits for a read-only server to be ready. The
+/// server opens the pool and checks the space again before it is ready
+/// (`check::require`), reading what the checks of attach read: on a mirror
+/// whose dirty region log lists runs, up to 1 GiB of each copy, 34 s on a
+/// pair of 10 TB disks, which the 30 s of 1.3.1 did not leave it (the
+/// space was not attached). A server that ends is noticed within 2 s, so a
+/// long wait costs nothing then; the time of the run bounds it at boot.
+const SERVER_READY: Duration = Duration::from_secs(300);
+
+/// How long it waits for a read-write server: opening a space read-write
+/// destages its write-back cache first, which can take minutes.
+const SERVER_READY_RW: Duration = Duration::from_secs(3600);
+
+/// The wait for a server: `wait`, never past the time of the run (`left`).
+fn server_wait(wait: Duration, left: Option<Duration>) -> Duration {
+    left.map_or(wait, |left| wait.min(left))
+}
+
 /// Waits for `path` to appear while the systemd unit `unit` runs, at most
 /// `timeout`.
 fn wait_for(path: &Path, unit: &str, timeout: Duration) -> Result<()> {
@@ -764,7 +782,12 @@ fn wait_for(path: &Path, unit: &str, timeout: Duration) -> Result<()> {
     let mut checked = Instant::now();
     while !path.exists() {
         if start.elapsed() > timeout {
-            bail!("timed out waiting for {}", path.display());
+            bail!(
+                "the server was not ready within {} s (no {}; at boot the time of the run, \
+                 SPACES_ATTACH_TIMEOUT, bounds the wait)",
+                timeout.as_secs(),
+                path.display()
+            );
         }
         if checked.elapsed() > Duration::from_secs(2) {
             checked = Instant::now();
@@ -884,10 +907,12 @@ fn start_server(unit: &str, kind: &str, paths: &[PathBuf], space: &str, extra: &
         eprintln!("warning: starting {unit} with limits failed ({e:#}); starting it without");
         launch(&[])?;
     }
-    // Opening a space read-write destages its write-back cache first, which
-    // can take minutes; never past the time of the run.
-    let timeout = Duration::from_secs(if extra.contains(&"--rw") { 3600 } else { 30 });
-    let timeout = crate::check::time_left().map_or(timeout, |left| timeout.min(left));
+    let wait = if extra.contains(&"--rw") {
+        SERVER_READY_RW
+    } else {
+        SERVER_READY
+    };
+    let timeout = server_wait(wait, crate::check::time_left());
     if let Err(e) = wait_for(&ready, unit, timeout) {
         let _ = run("systemctl", &["stop", unit], None);
         let log = run("journalctl", &["-u", unit, "-n", "20", "--no-pager"], None).unwrap_or_default();
@@ -1603,6 +1628,18 @@ mod hardening_tests {
         for p in SERVER_RESTRICTIONS.iter().chain(SERVER_PRIVATE_VIEW) {
             assert!(!p.contains("/var"), "{p}");
         }
+    }
+
+    /// A read-only server has minutes to be ready by hand (1.3.1: 30 s, less
+    /// than the 34 s its checks of a mirror of two 10 TB disks took), and
+    /// no more than the run's time at boot.
+    #[test]
+    fn servers_have_minutes_to_be_ready_within_the_run() {
+        let s = Duration::from_secs;
+        assert_eq!(server_wait(SERVER_READY, None), s(300));
+        assert_eq!(server_wait(SERVER_READY_RW, None), s(3600));
+        assert_eq!(server_wait(SERVER_READY, Some(s(46))), s(46));
+        assert_eq!(server_wait(SERVER_READY, Some(s(0))), s(0));
     }
 }
 

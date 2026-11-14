@@ -1,5 +1,56 @@
 # Changelog
 
+## 1.3.2 (2026-11-14)
+
+A fix of 1.3.0 and 1.3.1 from a user's report: a ReFS volume inside a
+space on hard disks was not attached, its server stopped after 30 s
+waiting for it to be ready, at the upgrade from 1.2.1 and at every attach
+after it, and a boot waited about a minute for it. Checked on the machine
+of the report (Ubuntu 26.10, kernel 7.3) with this release's deb from CI:
+the upgrade from 1.3.1 attached the space in 0.5 s and moved the spaces
+not in use to the new servers (one mounted kept its server, as an upgrade
+says); and by the tests and CI. Not checked: a restart with it, the test
+VMs, long fuzz runs (CI runs every target 30 s).
+
+Not fixed: at shutdown the ublk servers of spaces do not end on SIGTERM,
+and systemd kills them after 90 s, at every shutdown of that machine
+(1.2.1 to 1.3.2; read-only servers, so nothing is lost but the time).
+
+### Fixes
+
+* `fs.refs.log` (the quick checks of `spaces attach`, the servers and
+  `refs mount`) opened the volume before it looked for the log, for the
+  starts of its containers, and opening reads the whole container table:
+  for a 10.75 TiB ReFS 3.14 volume inside a mirror of two 12 TB disks,
+  16 000 reads of 4 KiB, 32 s of the 34 the checks of attach took, and as
+  long again in its server. The log is looked for among the volume's first
+  clusters and after the regions seen from the starts seen first, as 1.2.2
+  did, and the volume opens for its container table only where neither
+  holds the control page. That space attaches in 2.6 s.
+* `spaces attach` waited 30 s for a read-only server to be ready, less
+  than the checks the server makes before it is (they may take 40 s,
+  `SPACES_CHECK_TIMEOUT`): 300 s now, within the time of the run as before
+  (`SPACES_ATTACH_TIMEOUT` at boot), and the message says how long it
+  waited. A server that ends is noticed within 2 s, as before.
+* The servers `spaces attach` starts no longer compare the copies of the
+  runs a mirror's dirty region log lists, or check the stripes a parity
+  journal lists, again (up to 1 GiB of each copy): attach's checks of the
+  same run have just read them, and reads of those places compare and
+  check as they go. A server started by hand checks the space whole, as
+  before.
+* `Cargo.lock`: rustix 1.1.6 (RUSTSEC-2026-0486, in functions `refs` does
+  not call), async-executor 1.14.1 (1.14.0 was yanked).
+
+### Testing
+
+* `servers_have_minutes_to_be_ready_within_the_run`,
+  `servers_attach_starts_do_not_compare_the_listed_runs_again` (a
+  server's checks of the fixture `drtdism` read 2 GiB without
+  `--checked`, 35 KiB with it) and, in `crates/refs/tests/health.rs`,
+  `the_log_is_found_without_the_container_table` (the quick checks read
+  nothing of what opening the volume reads but the boot sector, the
+  superblock and the checkpoints; 1.3.1 read the tables).
+
 ## 1.3.1 (2026-10-27)
 
 The code audit of 2026-10-21: parity reads of runs a disk replacement

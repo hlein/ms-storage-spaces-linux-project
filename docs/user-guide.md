@@ -99,7 +99,8 @@ on gets its run all the same (1.2.2 started the one unit again, which only
 joined the run going on, and the pool of the late disk stayed detached). A
 run has 80 s (`SPACES_ATTACH_TIMEOUT`) after its 30 s of waiting for udev,
 within the units' start timeout of 120 s: what it does not get to, it
-names, and the next run attaches it. At shutdown the servers of spaces stop
+names, and the next run attaches it. A server has 5 minutes to be ready
+within that time (1.3.1 gave it 30 s, less than the checks it makes). At shutdown the servers of spaces stop
 after the volumes on them are unmounted (1.2.2 stopped both at once). To attach by hand only: after
 `contrib/install.sh`, remove `/etc/udev/rules.d/69-storage-spaces.rules`;
 with the packages, whose rule is
@@ -565,6 +566,9 @@ volume in a space attached with `--degraded` or `--force` mounts only with
   missed writes, before Windows repaired the space) make the space
   suspect, and reads of those places fail (`--unclean-parity data` reads
   the highest copy).
+* A server checks its space again before it is ready; one `spaces attach`
+  starts leaves the reads of `space.journal` and `space.drl` to the
+  checks attach has just made (since 1.3.2; started by hand it makes them).
 * For all three, the header on every copy of its mirror: a damaged copy
   (another valid) is degraded, copies that disagree suspect, none valid
   failed; a header zero everywhere is a structure never written (a note).

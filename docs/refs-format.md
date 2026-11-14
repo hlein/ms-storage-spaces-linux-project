@@ -1085,9 +1085,12 @@ ReFS write a checkpoint that covers the log (**verified**).
   after one of 1 GiB). Nothing found so far points at it; the region it
   names confirms a candidate. `refs` looks among the first clusters, then
   at the first cluster of each of the 64 containers that come first in
-  the container table (where the volume opens: the guard's quick checks
-  open it for that), then after regions of the sizes seen from the starts
-  seen. Until 1.3 it tried the start of container 7 and the two starts
+  the container table, then after regions of the sizes seen from the starts
+  seen. The guard's quick checks look among the first clusters and after
+  those regions first, and open the volume for its container table only
+  where neither holds the control page (1.3.0 and 1.3.1 opened it first:
+  reading the whole table of a 10.75 TiB volume on two hard disks, 16 000
+  pages of 4 KiB, took 32 s at every attach). Until 1.3 it tried the start of container 7 and the two starts
   only, and no region of 256 MiB: ReFS 3.1's log was not found (the guard
   skipped it), nor one of 3.4 away from page 0x24000 (test
   `a_log_away_from_the_starts_seen_is_found_by_the_container_table`, a

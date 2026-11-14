@@ -807,6 +807,25 @@ rows of thin spaces not allocated yet (M7).
   rule is installed), the management scripts too (the corpus one alone:
   after the others it runs out of room on the VM's scratch disk), no boot
   check (that VM is shared).
+* Release `v1.3.2` (2026-11-14): a fix of 1.3.0 and 1.3.1 from a user's
+  report (Ubuntu 26.10, kernel 7.3; a 10.75 TiB ReFS 3.14 volume inside a
+  two-way mirror of two 12 TB hard disks, its dirty region log listing one
+  run): the space was not attached after the upgrade from 1.2.1 (its server
+  stopped after 30 s, before it was ready), nor at any attach after. strace
+  of `spaces check --space` showed 16 072 reads of 4 KiB: `fs.refs.log`
+  opened the volume, reading its whole container table, before it looked
+  for the log (974d5a1 gave the servers 300 s; ebc3c07 looks where the log
+  is first; 388848a spares the servers attach starts the budgeted reads of
+  its checks; 86d7bc5 rustix 1.1.6 for RUSTSEC-2026-0486). On that machine
+  `spaces attach --space` of the mirror, cold: 1.3.1 not attached, with
+  974d5a1 68 s, with all of them 2.6 s. The release's deb from CI (PR #1)
+  installed over 1.3.1 there: the mirror attached in 0.5 s, the spaces not
+  in use on the new servers, a mounted one kept its server. Tests: 533
+  passed. Not done: a restart with it, the VM checks (the test VMs were not
+  reachable), long fuzz runs and the oracles. Open: the ublk servers do not
+  end on SIGTERM at shutdown, killed after 90 s (1.2.1 to 1.3.2, on that
+  machine; since 1.3.0 after journald stops, so the journal does not show
+  it).
 
 ### Track B (from 2026-10-02)
 
